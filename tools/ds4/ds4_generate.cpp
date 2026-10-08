@@ -77,6 +77,9 @@ struct Args {
     bool chunk_mmq = false;      // --chunk-mmq: prompt chunks' streamed experts through MMQ (int8 tensor cores)
     bool chunk_prestage = false; // --chunk-prestage: stream layer l+1's experts while layer l computes
     float skip_miss = 0.0f;      // --skip-miss T: drop a VRAM-miss expert whose weight < T x the token's weight sum
+    std::string saliency;        // --saliency F: REAP calibration - chunked prefill writes per-expert saliency to F
+    std::string prune;           // --prune F: "layer expert" lines never routed (REAP pruning, tools/ds4/reap_prune.py)
+    float prune_penalty = 0.0f;  // --prune-penalty X: soft pruning - selection bias -X instead of the hard mask
     bool f16_q8 = false;         // --f16-q8: compressor / indexer F16 matrices as Q8_0 (VRAM + bandwidth)
     int mtp_keep = 0;            // --mtp-keep K: the MTP draft computes only its K heaviest routed experts (0 = all)
     bool comp_q8 = false;        // --comp-q8: the compressed-row K caches (comp) as Q8_0 instead of F32 (s22 (b))
@@ -145,6 +148,9 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
         else if (k == "--chunk-prestage") a.chunk_prestage = true;
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
+        else if (k == "--saliency") a.saliency = next();
+        else if (k == "--prune") a.prune = next();
+        else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
         else if (k == "--f16-q8") a.f16_q8 = true;
         else if (k == "--mtp-keep") a.mtp_keep = std::atoi(next().c_str());
         else if (k == "--comp-q8") a.comp_q8 = true;
@@ -281,6 +287,30 @@ int main(int argc, char** argv) {
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prestage = a.chunk_prestage;
     mc.skip_miss = a.skip_miss;
+    // REAP (ported from strata-glm, 2026-10-09): --saliency calibrates on a chunked prompt; --prune FILE masks the
+    // listed experts out of routing (selection bias -1e30; the mixing weights renormalise over the kept top-k) and
+    // out of the VRAM cache and arena.  --prune-penalty X makes it soft: bias -X, a pruned expert still wins when the
+    // router prefers it by more than X (then it is read from the file).  The hash-routed layers are never pruned.
+    mc.saliency = !a.saliency.empty();
+    if (mc.saliency && a.prefill_chunk <= 0) { std::fprintf(stderr, "ds4_generate: --saliency needs --prefill-chunk\n"); return 2; }
+    const int64_t NXP = dense.geom().n_expert, NLP = dense.n_layer(), NHASH = (int64_t) dense.geom().hash_layer_count;
+    std::vector<char> pruned;
+    int64_t n_pruned = 0;
+    if (!a.prune.empty()) {
+        pruned.assign((size_t) (NLP * NXP), 0);
+        std::FILE * pf = std::fopen(a.prune.c_str(), "r");
+        if (!pf) { std::fprintf(stderr, "ds4_generate: cannot open %s\n", a.prune.c_str()); return 2; }
+        long l, e;
+        while (std::fscanf(pf, "%ld %ld", &l, &e) == 2)
+            if (l >= NHASH && l < NLP && e >= 0 && e < NXP && !pruned[(size_t) (l * NXP + e)]) {
+                pruned[(size_t) (l * NXP + e)] = 1;
+                ++n_pruned;
+            }
+        std::fclose(pf);
+        std::fprintf(stderr, "prune: %lld (layer, expert) pairs %s (%s)\n", (long long) n_pruned,
+                     a.prune_penalty > 0 ? "penalised" : "masked out of routing", a.prune.c_str());
+        if (a.prune_penalty <= 0) mc.exclude = pruned;   // soft pruning keeps them seedable (they can still be routed)
+    }
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only &&
         !(defer_seed ? tier.build_arena_from_routes(a.profile, 512, err) : tier.seed_from_routes(a.profile, err))) {
@@ -318,13 +348,19 @@ int main(int argc, char** argv) {
     bool timing = false;
     // one token through every layer; returns false on any engine error
     std::vector<float> rb((size_t) tier.geom().n_experts);
+    // the selection-only bias: the prune mask/penalty, + route_bias on the experts resident in VRAM right now
+    auto set_bias = [&]() {
+        for (int l = 0; l < n_layer; ++l) {
+            for (int64_t e = 0; e < (int64_t) rb.size(); ++e)
+                rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * NXP + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
+                               : (a.route_bias != 0.0f && !mc.cpu_only && tier.resident(l, e)) ? a.route_bias : 0.0f;
+            dense.set_route_bias(l, rb.data());
+        }
+    };
+    if (n_pruned > 0) set_bias();
     auto step = [&](int tid, int pos) -> bool {
         pos += a.pos_offset;
-        if (a.route_bias != 0.0f && !mc.cpu_only)
-            for (int l = 0; l < n_layer; ++l) {   // the residency the cache has NOW (admissions move it per token)
-                for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
-                dense.set_route_bias(l, rb.data());
-            }
+        if (a.route_bias != 0.0f && !mc.cpu_only) set_bias();   // the residency the cache has NOW (admissions move it)
         if (!dense.begin_token(tid)) return false;
         for (int l = 0; l < n_layer; ++l) {
             double t0 = timing ? now_ms() : 0, t1;
@@ -398,11 +434,7 @@ int main(int argc, char** argv) {
     std::vector<float> w_n((size_t) (top_k * NT)), routed_n((size_t) (n_embd * NT));
     auto step_n = [&](const int* toks, int n, int pos0) -> bool {
         pos0 += a.pos_offset;
-        if (a.route_bias != 0.0f && !mc.cpu_only)
-            for (int l = 0; l < n_layer; ++l) {
-                for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
-                dense.set_route_bias(l, rb.data());
-            }
+        if (a.route_bias != 0.0f && !mc.cpu_only) set_bias();
         if (!dense.begin_tokens(toks, n)) return false;
         for (int l = 0; l < n_layer; ++l) {
             double t0 = timing ? now_ms() : 0, t1;
@@ -504,6 +536,18 @@ int main(int argc, char** argv) {
         }
         tier.release_chunk();
         dense.prefill_release();
+        if (!a.saliency.empty()) {   // [i32 n_layer][i32 n_expert][f64 sum x L*E][i64 count x L*E] (reap_prune.py)
+            const std::vector<double> & ss = tier.saliency_sum();
+            const std::vector<int64_t> & sc = tier.saliency_count();
+            std::FILE * sf = std::fopen(a.saliency.c_str(), "wb");
+            if (!sf || ss.empty()) { std::fprintf(stderr, "ds4_generate: cannot write saliency %s\n", a.saliency.c_str()); return 1; }
+            const int32_t hdr[2] = { (int32_t) (ss.size() / (size_t) NXP), (int32_t) NXP };
+            std::fwrite(hdr, 4, 2, sf);
+            std::fwrite(ss.data(), 8, ss.size(), sf);
+            std::fwrite(sc.data(), 8, sc.size(), sf);
+            std::fclose(sf);
+            std::fprintf(stderr, "saliency: %s (%zu entries)\n", a.saliency.c_str(), ss.size());
+        }
         const double t_seed = now_ms();
         if (defer_seed && !tier.seed_from_routes(a.profile, err)) {
             std::fprintf(stderr, "ds4_generate: profile: %s\n", err.c_str());
