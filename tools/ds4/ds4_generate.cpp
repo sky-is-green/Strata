@@ -463,6 +463,9 @@ int main(int argc, char** argv) {
     tier.reset_stats();
     const double t_pf0 = now_ms();
     double nll = 0;
+    // DS4_PPL_DUMP=F: every scored position's NLL as f32, in prompt order (per-domain ppl of a concatenated prompt)
+    std::FILE * nll_f = std::getenv("DS4_PPL_DUMP") ? std::fopen(std::getenv("DS4_PPL_DUMP"), "wb") : nullptr;
+    auto nll_put = [&](double v) { if (nll_f) { const float f = (float) v; std::fwrite(&f, 4, 1, nll_f); } };
     int n_scored = 0;
     std::vector<float> first_logits;   // chunked prefill: the prompt's last row (the decode state holds no token yet)
     if (a.prefill_chunk > 0) {
@@ -519,7 +522,9 @@ int main(int argc, char** argv) {
                         const float mx = *std::max_element(l, l + nv);
                         double z = 0;
                         for (int v = 0; v < nv; ++v) z += std::exp((double) (l[v] - mx));
-                        nll += (std::log(z) + mx) - l[prompt[c0 + (size_t) (r0 + r) + 1]];
+                        const double d = (std::log(z) + mx) - l[prompt[c0 + (size_t) (r0 + r) + 1]];
+                        nll += d;
+                        nll_put(d);
                         ++n_scored;
                     }
                 }
@@ -569,7 +574,9 @@ int main(int argc, char** argv) {
             const float mx = *std::max_element(l, l + nv);
             double z = 0;
             for (int v = 0; v < nv; ++v) z += std::exp((double) (l[v] - mx));
-            nll += (std::log(z) + mx) - l[prompt[i + 1]];
+            const double d = (std::log(z) + mx) - l[prompt[i + 1]];
+            nll += d;
+            nll_put(d);
             ++n_scored;
         }
         static const bool vtrace = std::getenv("DS4_VRAM_TRACE") != nullptr;   // free VRAM per prefill step
@@ -583,6 +590,7 @@ int main(int argc, char** argv) {
         }
         if (vtrace && il_mtp >= 0) std::fprintf(stderr, "[vram] pos %zu after MTP:   %.0f MiB free\n", i, vfree());
     }
+    if (nll_f) std::fclose(nll_f);
     if (a.ppl && n_scored)
         std::fprintf(stderr, "ppl: %d positions, mean NLL %.5f, perplexity %.4f\n", n_scored, nll / n_scored,
                      std::exp(nll / n_scored));
