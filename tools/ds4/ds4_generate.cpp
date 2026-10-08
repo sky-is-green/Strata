@@ -290,7 +290,7 @@ int main(int argc, char** argv) {
     // REAP (ported from strata-glm, 2026-10-09): --saliency calibrates on a chunked prompt; --prune FILE masks the
     // listed experts out of routing (selection bias -1e30; the mixing weights renormalise over the kept top-k) and
     // out of the VRAM cache and arena.  --prune-penalty X makes it soft: bias -X, a pruned expert still wins when the
-    // router prefers it by more than X (then it is read from the file).  The hash-routed layers are never pruned.
+    // router prefers it by more than X, and is then read from the file tier (NVMe) on demand.  The hash-routed layers are never pruned.
     mc.saliency = !a.saliency.empty();
     if (mc.saliency && a.prefill_chunk <= 0) { std::fprintf(stderr, "ds4_generate: --saliency needs --prefill-chunk\n"); return 2; }
     const int64_t NXP = dense.geom().n_expert, NLP = dense.n_layer(), NHASH = (int64_t) dense.geom().hash_layer_count;
@@ -309,7 +309,9 @@ int main(int argc, char** argv) {
         std::fclose(pf);
         std::fprintf(stderr, "prune: %lld (layer, expert) pairs %s (%s)\n", (long long) n_pruned,
                      a.prune_penalty > 0 ? "penalised" : "masked out of routing", a.prune.c_str());
-        if (a.prune_penalty <= 0) mc.exclude = pruned;   // soft pruning keeps them seedable (they can still be routed)
+        // hard or soft, a pruned expert takes no VRAM slot and no arena space: soft-pruned ones live on the file
+        // tier (NVMe) and are read on demand when the router still picks them (s37: prune deeper, pay only for use)
+        mc.exclude = pruned;
     }
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only &&
