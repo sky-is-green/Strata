@@ -86,6 +86,24 @@ forces it either way); that is why 4-bit costs barely more than 8-bit here. At 2
 GB of VRAM, i.e. a few hundred more expert slots. `--comp-host` keeps the cache in pinned RAM (zero-copy reads); it
 works, but at 256K it costs ~3 ms/token for +62 slots - only worth it beyond ~512K.
 
+**Adaptive expert pruning (2026-10-09, experimental)**
+
+`--prune LIST --prune-penalty 0.5 --arena-adapt`: a REAP-scored list of the least useful 25% of experts (calibrated on
+English + Chinese + code) is kept out of VRAM and RAM and left on NVMe; the router can still pick one when it wants it
+by more than the penalty, and a picked expert is promoted into the RAM arena (least-recently-used out), so the
+experts a conversation actually needs move in. On held-out text (9.6K tokens, per-domain perplexity vs unpruned):
+
+| | code / English / Chinese | German | French / Japanese / Portuguese (never calibrated) | all | decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| hard prune 25% | -1.0 to +1.2% | +72% | +7 to +115% | +25.6% | 19.3 tok/s |
+| **soft 25% + adapt** | -1.4 to +0.9% | +3.9% | -0.3 to +0.8% | **+0.3%** | **17.25 tok/s** |
+| random 25% (control) | +17 to +29% | +40% | +6 to +35% | +20.7% | 18.9 tok/s |
+| unpruned | - | - | - | - | 15.71 tok/s |
+
+Calibration: `ds4_generate --prefill-chunk 4096 --chunk-mmq --saliency sal.bin` on a mixed prompt
+(`tools/ds4/make_reap_prompts.py`), then `tools/ds4/reap_prune.py sal.bin --frac 0.25 -o prune.txt`. The saliency
+accumulator and `reap_prune.py` come from the Strata-GLM work. Details: [FINDINGS s37](docs/ds4/FINDINGS.md).
+
 The first token's logits match llama.cpp's (same top-1; KL 0.03-0.10, which is the difference between the GPU's and
 the CPU's 8-bit activation rounding).
 
@@ -144,6 +162,7 @@ Useful flags: `--slots N|auto` (VRAM expert cache), `--arena-gib` (pinned RAM ar
 `--pcie F` (share of misses sent over PCIe), `--pf-b` (predicted prefetch per layer), `--dense-requant q4_k|q5_k|q6_k`,
 `--vram-lru` (misses take the layer's least-recently-used VRAM slot), `--arena-skip-resident` (the VRAM-seeded
 experts stay out of the RAM arena), `--prefill-chunk N` / `--chunk-mmq` / `--chunk-prestage` (prefill),
+`--prune F` / `--prune-penalty X` / `--saliency F` / `--arena-adapt` (adaptive expert pruning, see above),
 `--comp-type f32|q8_0|q5_0|q4_0|iq4_nl` / `--icomp-q8` / `--comp-rot 0|1` / `--comp-host` (compressed KV cache,
 see above), `--pos-offset N` (decode-timing probe at a deep position, no prefill), `--route-bias D` and
 `--skip-miss T` (lossy, see below), `--mtp FILE [--verify]` (DeepSeek-V4's MTP draft head:
