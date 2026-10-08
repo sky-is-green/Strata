@@ -43,6 +43,7 @@ def main():
     ap.add_argument("--frac", type=float)
     ap.add_argument("--fit-gb", type=float)
     ap.add_argument("--keep-layers", default="0-2", help="e.g. 3-8: never prune these layers")
+    ap.add_argument("--random", type=int, default=None, help="control: prune the same count per layer at random (seed)")
     ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
     s, c = load(a.sal)
@@ -54,6 +55,9 @@ def main():
         keep = set(range(lo, hi + 1))
     score = np.where(c > 0, s / np.maximum(c, 1), 0.0)
     order = {l: np.argsort(score[l], kind="stable") for l in routed}
+    if a.random is not None:
+        rng = np.random.default_rng(a.random)
+        order = {l: rng.permutation(E) for l in routed}
 
     def kept_bytes(frac):
         n = int(round(frac * E))
