@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-10 ~08:20 by `strata-ds4-gpu`.
+**Last updated:** 2026-10-10 ~09:00 by `strata-ds4-gpu`.
 **Read order:** this file → [V41_PLAN.md](V41_PLAN.md) (design, V4→V4.1 deltas, all research) →
 [V41_FEASIBILITY.md](V41_FEASIBILITY.md) (sizes, speed estimates) → [RESEARCH_2026-10-09.md](RESEARCH_2026-10-09.md)
 (community ideas) → `../../V41_PLAN`-adjacent [../../RESEARCH](../RESEARCH_2026-10-09.md).
@@ -40,30 +40,33 @@ before touching any file under `src/` or `include/`.
 >   `setsid nohup bash tools/v41/fetch_sequence2.sh &` if no `fetch_v41`/`curl` is running and shards are missing.
 > - Worktree `~/AI/Strata-DS4-up`: `git status` - the PTQ1_0 GPU work may still be uncommitted there (§In flight).
 >
-> **3. Continue** with §Next steps.  Immediate items: (a)/(b) PTQ1_0 GPU test + head smoke DONE 2026-10-10; (c) when layers 0-39 + head are done: `v41_alloc.py --layers
-> 0-39 --per-proj --out .../alloc_full.json`, report the tier map to Mal in plain terms; (d) then GSQ refinement +
-> the second (quantize) pass, GGUF writer, V4.1 engine port, validation vs an all-Q2_0 control.
+> **3. Continue** with §Next steps.  Built 2026-10-10: PTQ1_0 GPU (all 9 tier pairs in the grouped kernel), GGUF
+> writer, quantize pass + driver (§Export pipeline).  When calibration layers 0-39 + head are done: `v41_alloc.py
+> --layers 0-39 --per-proj --out /media/Crucial1TB/v41-calib/alloc_full.json`, report the tier map to Mal in plain
+> terms, then run the export (§Export pipeline, with Mal's GPU OK).  Meanwhile: the V4.1 engine port (§Next steps 5).
 
 ---
 
-## Status snapshot (2026-10-10 ~08:00)
+## Status snapshot (2026-10-10 ~09:00)
 
 | item | state |
 |---|---|
-| Download | 43/48 verified (1-41 on Crucial1TB, 47 Crucible, 48 Team CX2); 42-46 in flight, ~10 min/shard (~1 h) |
+| Download | **complete**: 48/48 verified (1-46 on Crucial1TB, 47 Crucible, 48 Team CX2) |
 | Calibration | **running** on the agentic corpus: layers 0-2 done, ~11.5 min/layer (Engram layers 1/14 ~2x), ~7 h of GPU left. `v41calib status` |
 | Calibration data | agentic-first corpus, 32 x 8192 tokens (§Calibration pipeline); old Pile run archived in `v41-calib/old-pile2048/` (biased stats: damp 0.01) |
 | GPTQ damping | **1.0** (layer-8 sweep; 0.01 overfit) |
 | Layer-0 tier map (new corpus) | per-proj: 383 ptq1 / 140 q2_0 / 245 q3_k slots @ 2.25 bpw, proxy -39% vs all-Q2_0; per-expert 190/114/80, -24%; down proj = 68% of an expert's Q2 error; 3 rarely-routed experts floored at q2_0 |
 | Engine | `deepseek4` = upstream Strata `fb58e0db` merged (`cc55d4c9`) + fork isolation (`20618210`): p600 ppl 10.47, decode 19.55 tok/s (pre-merge 16.8-17.3) |
 | `head` gate | built (`5d99832d`), wired into `calib_layers.sh` after layer 39; CPU smoke passed (`e567a476`) |
-| PTQ1_0 ternary | CPU done (`50e9428d`); GPU grouped-expert kernels done + tested (`4a403b15`) |
-| GSQ refinement / quantize pass / GGUF writer / V4.1 engine port | not started |
+| GGUF writer | **built + tested** (`70f81b03`, `d020b910`): `v41_gguf.py`, in-place expert mode, independent checker |
+| Quantize pass | **built, CPU-smoked** (`d020b910`): `v41_quant.py` + `quant_layers.sh`; not run on the GPU yet |
+| PTQ1_0 ternary | CPU done (`50e9428d`); GPU grouped-expert kernels done + tested (`4a403b15`); all 9 tier pairs through `native_expert_grouped` PASS (`cc26cb5d`) |
+| GSQ refinement / V4.1 engine port | not started (GSQ: optional, plugs in where v41_quant calls GPTQ) |
 | GitHub | nothing pushed today; `Indras-Mirror/Strata-MiMo` **deleted** at Mal's request (local `~/AI/Strata-MiMo` kept, 10 unpushed commits) |
 
 ---
 
-## In flight (2026-10-10 ~08:00) - check each of these first
+## In flight (2026-10-10 ~09:00) - check each of these first
 
 1. **Calibration driver** `calib_layers.sh 0 39` (pid in `/media/Crucial1TB/v41-calib/driver.pid`), detached via
    `calibctl`. Logs: `v41-calib/calib.log`, `v41-calib/logs/LNN.log`. It was started from the copy of
@@ -81,7 +84,9 @@ before touching any file under `src/` or `include/`.
    N=4); fixed in `e567a476` (batch default = largest divisor of N <= 4096/S; the real 32 x 8192 run is unchanged).
    Redo: `V41_WORK=<tmp> HF_DATASETS_OFFLINE=1 python3 tools/v41/v41_calib.py prep --n 4 --seq 256 && ... init &&
    OMP_NUM_THREADS=4 ... layer 0 --device cpu --gptq-experts 0 && ... head --layer 1 --device cpu`.
-4. **Download** `fetch_sequence2.sh` (pid 891182) + `fetch_v41.sh` (shards 42-46).
+4. **Download: complete** (48/48 verified 2026-10-10 ~08:20).  **Quant-pass CPU smoke** (scratch, gone after a
+   reboot): `v41_quant.py` layers 0 (q2_0) and 1 (ptq1, Engram layer) + head on a 4x256 workdir; layer 0 passed
+   (in-place fill + checker PASS).  Redo recipe = the commit message of `d020b910` + §Export pipeline.
 5. **strata-glm** is merging upstream into GLM (branch `glm-upstream`, worktree `~/AI/Strata-GLM-um`), taking DS4's
    shared-file resolution (`cc55d4c9`/`20618210`) and moving its LoRA kernels into `src/kernels/cuda/fork/`.  GLM keeps
    its own `native_expert.cpp` (no PTQ1_0 - Mal's call), so that one shared file will differ.
@@ -163,6 +168,42 @@ before touching any file under `src/` or `include/`.
   allocation proxy treats layers as equally important (validate end-to-end: ppl/KL needs shard 43 = head).
 
 ---
+
+## Export pipeline (built 2026-10-10; run after the full tier map)
+
+```
+48 HF shards (read only) --quantize pass, layer by layer (GPU)--> experts written IN PLACE into shard 1 of the GGUF
+                                                                   (holes laid out first by the writer)
+```
+1. Tier map: `python3 tools/v41/v41_alloc.py --layers 0-39 --per-proj --out /media/Crucial1TB/v41-calib/alloc_full.json`.
+2. Lay out the final file (CPU, ~10 min, ~10 GB written; the rest is holes until filled):
+   `python3 tools/v41/v41_gguf.py --out "/media/mal/SSD NVME/<dir>/V41-GSQ.gguf" --rtn-map .../alloc_full.json
+   --experts-in-place --no-engram` -> `V41-GSQ.gguf` + `V41-GSQ.gguf.experts.json` (with --no-engram it is one plain
+   file, no split).  Size at the all-Q2_0 budget: 151.8 GiB; SSD NVME had 163 GiB free (2026-10-10) - nothing else
+   goes there first.
+3. Quantize pass (GPU, ~4-5 h estimated, measure): `tools/v41/quant_layers.sh /media/Crucial1TB/v41-quant-mixed 0 39
+   -- --map .../alloc_full.json --gguf "<the file>"`.  Per-layer lock (strata-glm slots in), resumable, STOP file
+   (`touch <qwork>/STOP`), ends with the head gate on the QUANTIZED chain (stats/head_L40.json in the qwork).
+4. All-Q2_0 control: `quant_layers.sh /media/Crucial1TB/v41-quant-q2 0 39 -- --tier q2_0 --no-write` (head
+   numbers only, writes no weights).  Mal's rule: the mixed file ships only if its held-out per-domain ppl beats
+   this control's (and compare both with the teacher's head_L40.json from the calibration run).  If it loses:
+   lay out an all-Q2_0 file (`--rtn q2_0 --experts-in-place`) and rerun step 3 with `--tier q2_0 --gguf`.
+5. Check: `python3 tools/v41/tests/check_v41_gguf.py <file> --fp4 8 --layers 0-39` (layout, dense vs source,
+   every layer's sampled experts decoded vs FP4 - a hole decodes to rel ~1) and `v41_gguf.py --verify <file>
+   --rtn-map ... --experts-in-place`.
+6. Engram: **NOT copied** (Mal 2026-10-10: no 203 GB copy).  The engine port reads the Engram rows straight from
+   the HF shards 47 (layer 1, on Crucible = USB SATA SSD) and 48 (layer 14, Team CX2): row = 256 B at
+   `embed.weight` + r*256, scale = 8 B at `embed.scale` + r*8 (2 reads per row, 96 per token, prefetched at token
+   start).  KEEP shards 47/48.  Measure Crucible's latency at layer 1 (early in the token: little time to hide
+   it); if slow, move that one table (~94 GiB) to a faster SSD.  `v41_gguf.py` without --no-engram still writes a
+   264-B-row Engram shard 2 (DwarfStar's format) if one is ever wanted.
+
+Formats (`v41_formats.py`, bit-exact vs ggml / ptq1_0.cpp): Q8_0 34 B/32, Q2_0 18 B/64, Q3_K 110 B/256, PTQ1_0
+28 B/128.  Expert layout in the GGUF: a role whose 384 experts share a type is the usual `blk.L.ffn_<role>_exps.weight`;
+mixed -> `blk.L.ffn_<role>_exps.<q2_0|q3_k|ptq1_0>.weight` (experts of that type, id order) + I32
+`blk.L.ffn_exps_{gu,down}_type[384]` (slot = rank among the experts of the same type).  Gate+up share a type.
+Dense: DwarfStar's names/types (`deepseek41_quantize.py` @fc80bd6): Q8_0 attention / shared / head (rel 5.4e-3 vs
+FP8), F16 embedding / compressor / indexer / Engram wkv, F32 norms / router / mHC.  mtp.* (DSpark) not exported yet.
 
 ## Goal (Mal's decisions — all made)
 
@@ -287,7 +328,11 @@ needs **shard 48**. Layer 0 needs no engram at all.
 | `cc55d4c9`,`497dbd47` | **upstream Strata merged** (graft merge, 8 conflicts) | CPU parity (ptq1_0_test, pool_tasks_test 168 bitwise, q8k identical, iq_avx2_parity 0 fail, ds4_geometry, test_ds4_moe 15/15); dense gate bit-identical 63/63; p600 ppl 10.41 / 19.29 tok/s |
 | `20618210` | fork isolation (fork/*.cuh, tools/ds4/cmake/fork.cmake, ds4_guard.hpp) | same CPU gates + dense gate bit-identical; p600 ppl 10.47 / 19.55 tok/s |
 | `2a4254d8`,`d564238a` | `docs/UPSTREAM_SYNC.md` (process, gates, isolation rules) | — |
-| `5d99832d` | `v41_calib.py head` + end-of-chain head gate in `calib_layers.sh` | CPU smoke pending shard 43 |
+| `5d99832d`,`e567a476` | `v41_calib.py head` + end-of-chain head gate in `calib_layers.sh`; batch default divides N | CPU smoke (4x256, head on L1) runs end to end |
+| `4a403b15`,`cc26cb5d` | PTQ1_0 in the grouped-expert CUDA kernels (dot, Fmt<143>, dequant, row bytes) | `ptq1_0_cuda_test`: dequant bit-exact, mmvq 9.9e-8, `native_expert_grouped` all 9 Q2_0/Q3_K/PTQ1_0 pairs rel <= 1.6e-5 |
+| `d52f57ca` | `v41_formats.py` block encoders/decoders | `tests/test_v41_formats.py` 6/6 bit-exact vs ggml + ptq1_0.cpp (builds `tests/fmt_ref.cpp`) |
+| `70f81b03` | `v41_gguf.py` writer + `v41_gguf_meta.py` (DwarfStar metadata port) | full dry run claims every source tensor; 2-layer real file, synthetic mixed tiers: --verify 68/68 + `check_v41_gguf.py` PASS |
+| `d020b910` | `v41_quant.py`, `quant_layers.sh`, writer `--experts-in-place`, cmd_layer hooks | CPU smoke quant L0 (q2_0); in-place file + fill: check PASS, Q2_0 rel 0.413 vs FP4 |
 ### Facts established (measured, or read from source)
 - **V4.1 has NO per-head q RMS norm** (V4 does). JigSawPT's port erroneously kept it → fluent text but layer-39
   correlation 0.78 vs reference. Do **not** add it.
@@ -300,7 +345,12 @@ needs **shard 48**. Layer 0 needs no engram at all.
   (ternary 0.443 / Q2 0.378 / Q3 0.183 relative); FP4 training gives every expert the same per-32 distribution.
   ⇒ Allocation must come from **calibration**: activation-weighted (GPTQ/GSQ) error × REAP saliency.
 - `transformers` has no `deepseek_v41` (only `v4`) → the reference is DeepSeek's own `model.py` + our torch kernels.
-- Strata's native expert kernels already run Q2_0, Q2_K, Q3_K, IQ2_XXS, IQ1_M; PTQ1_0 is CPU-only so far.
+- Strata's native expert kernels run Q2_0, Q2_K, Q3_K, IQ2_XXS, IQ1_M, and (2026-10-10) PTQ1_0 on CPU and GPU.
+- **Engine port must teach `include/strata/artifact/gguf_reader.hpp` type 143** (`ggml_type_name` / `block_geometry`:
+  128 elems, 28 B, "PTQ1_0") - today it would size PTQ1_0 tensors as 0 bytes.  Shared upstream file: keep the edit
+  isolated per docs/UPSTREAM_SYNC.md.  Its tensor-name check (`check_ds4_model`) is V4's; V4.1 needs its own.
+- A mixed-tier layer = up to 9 `native_expert_grouped` calls (one per gu/down type pair present), each with its
+  own `NativeExpertLayout`; the engine's per-layer single expert stride (`Ds4GgufBlobs`) must become per-expert.
 - The vendored ggml (`third_party/llama.cpp`) has `GGML_TYPE_COUNT = 43`: **type 143 must never reach ggml**
   (it would read past the traits table). CPU path wraps it via a local traits object in `native_expert.cpp`.
 - PTQ1_0 = id 143 in llama-tq and ik_llama.cpp (#2550). Block = 28 B: `qs[0..15]` 5 trits/byte (values m+16n),
@@ -318,7 +368,8 @@ needs **shard 48**. Layer 0 needs no engram at all.
    held-out ppl in the single digits on web/code and a sane top-1 (~0.5-0.7) - a broken layer anywhere shows up as a
    ppl far off.  Then `v41_alloc.py --layers 0-39 --per-proj` for the full map (cross-check rarely-routed experts
    against smalinin's V4.1 imatrix).
-2. **GSQ refinement at the chosen tier** (screening already gives the GPTQ init and the tier per expert). Quantizer modules from
+2. **Quantize pass — BUILT** (§Export pipeline; GPTQ at the chosen tier).  **GSQ refinement** (optional, plugs in
+   where `v41_quant.quant()` calls GPTQ) (screening already gives the GPTQ init and the tier per expert). Quantizer modules from
    `~/AI/gsq-rco/GSQ/src/quantization` (2-bit grid = Q2_0 group 64; ternary group 128 = PTQ1_0; 3-bit → project onto
    Q3_K). Record each expert's activation-weighted error at all three widths (GPTQ init is cheap; run GSQ refinement
    only at the chosen width) → RCO-lite knapsack on `error × saliency` under the exact byte budget → second pass at the
@@ -329,9 +380,8 @@ needs **shard 48**. Layer 0 needs no engram at all.
    `weight_bytes`, dispatch) with q8_1 activations: per 128-block, 4 q8_1 sub-blocks, dp4a of `(digit-1)` with q8.
    Reference: llama-tq `ggml/src/ggml-cuda/mmvq-ptq1_0.cuh` (MIT). Then the FWHT op for rotated tensors, then prefill
    (dequant → fp16 GEMM is exact for ternary). Later: R8 row-interleaved CPU repack (ik #2564: 3.4×).
-4. **GGUF writer**: `deepseek41` names as in pfeifferj's header (`blk.N.ffn_{gate,up,down}_exps`,
-   `attn_q_a/q_b/kv/output_a/output_b`, `engram_embd/wkv/q/k`, `hc_attn_*`, …), per-tensor types, rotation flags;
-   engram copied as raw FP8 rows + scales (or Q8_0). Validate by loading in DwarfStar / pfeifferj's runtime if possible.
+4. **GGUF writer — DONE** (§Export pipeline).  Open: rotation flags (if Hadamard is used), mtp.* (DSpark) export,
+   a load test in DwarfStar for the dense half (their loader will refuse our expert types).
 5. **Strata-DS4 V4.1 port** (V41_PLAN.md "Plan B"): loader; dense half (single-pass HC, ratio 0/2/1 compressors,
    kv/index source sharing, two-level indexer, fp4 compressed KV, **no q norm**); engram op with prefetch;
    384-expert tier (Q2_0 / Q3_K / PTQ1_0); then DSpark. Golden numbers from step 1.
