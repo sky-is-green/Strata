@@ -319,7 +319,7 @@ def expert_f(x, W1, W3, W2, g, lim):
     return (F.silu(gate) * up * g) @ W2.T
 
 
-def screen_expert(exp, xe, ge, fit, lim, min_fit):
+def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
     """GPTQ + RTN at every tier on the fit tokens, output error on the held-out tokens.  Returns a stats dict."""
     W1 = K.dequant_fp4_weight(exp.w1.weight, exp.w1.scale)
     W3 = K.dequant_fp4_weight(exp.w3.weight, exp.w3.scale)
@@ -337,18 +337,22 @@ def screen_expert(exp, xe, ge, fit, lim, min_fit):
     else:                               # too few tokens for a Hessian: weight-space importance only
         H1 = torch.eye(D, device=xe.device); H2 = torch.eye(W2.shape[1], device=xe.device)
         st["lowdata"] = True
-    Qg1, Qr1 = G.quantize_stack([W1, W3], H1, TIERS, do_gptq=do_gptq)
-    Qg2, Qr2 = G.quantize_stack([W2], H2, TIERS, do_gptq=do_gptq)
-    Qg1, Qg2 = (Qg1, Qg2) if do_gptq else (Qr1, Qr2)
-    if len(xv):
-        Y = expert_f(xv, W1, W3, W2, gv, lim)
-        st["y_energy"] = float(Y.square().sum())
-        err = lambda q1, q3, q2: float((expert_f(xv, q1, q3, q2, gv, lim) - Y).square().sum())
+    if not len(xv):
+        return st
+    Y = expert_f(xv, W1, W3, W2, gv, lim)
+    st["y_energy"] = float(Y.square().sum())
+    err = lambda q1, q3, q2: float((expert_f(xv, q1, q3, q2, gv, lim) - Y).square().sum())
+    for di, damp in enumerate(damps):   # several damps (sweep): keys after the first get an "@damp" suffix
+        sfx = "" if di == 0 else f"@{damp:g}"
+        Qg1, Qr1 = G.quantize_stack([W1, W3], H1, TIERS, damp=damp, do_gptq=do_gptq)
+        Qg2, Qr2 = G.quantize_stack([W2], H2, TIERS, damp=damp, do_gptq=do_gptq)
+        Qg1, Qg2 = (Qg1, Qg2) if do_gptq else (Qr1, Qr2)
         for t in TIERS:
-            st[f"e_{t}"] = err(Qg1[t][0], Qg1[t][1], Qg2[t][0])                 # whole expert at tier t (GPTQ)
-            st[f"egu_{t}"] = err(Qg1[t][0], Qg1[t][1], W2)                      # gate+up only
-            st[f"edn_{t}"] = err(W1, W3, Qg2[t][0])                             # down only
-            st[f"rtn_{t}"] = err(Qr1[t][0], Qr1[t][1], Qr2[t][0])               # RTN control
+            st[f"e_{t}{sfx}"] = err(Qg1[t][0], Qg1[t][1], Qg2[t][0])            # whole expert at tier t (GPTQ)
+            st[f"egu_{t}{sfx}"] = err(Qg1[t][0], Qg1[t][1], W2)                 # gate+up only
+            st[f"edn_{t}{sfx}"] = err(W1, W3, Qg2[t][0])                        # down only
+            if di == 0:
+                st[f"rtn_{t}"] = err(Qr1[t][0], Qr1[t][1], Qr2[t][0])          # RTN control
     return st
 
 
@@ -430,8 +434,8 @@ def cmd_layer(a):
             out = blk.ffn.experts[ex](xe, ge)
             Y.index_add_(0, tok, out.float())
             st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
-            if not a.no_gptq and ex < a.gptq_experts:
-                st.update(screen_expert(blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, a.min_fit))
+            if not a.no_gptq and ex < a.gptq_experts and ex % a.expert_stride == 0:
+                st.update(screen_expert(blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, a.min_fit, a.damps))
             stats[ex] = st
             if ex % 64 == 63:
                 log(f"layer {L}: experts {ex + 1}/{NE} ({time.time() - t2:.0f} s)")
@@ -440,6 +444,12 @@ def cmd_layer(a):
             Y[c:c + 65536] += blk.ffn.shared_experts(X[c:c + 65536])
         log(f"layer {L}: MoE{'' if a.no_gptq else ' + GPTQ screening'} in {time.time() - t2:.0f} s")
 
+        if a.screen_only:               # sweep run: stats only, the h chain is left alone
+            json.dump({"summary": {"layer": L, "damps": a.damps, "expert_stride": a.expert_stride,
+                                   "seconds": round(time.time() - t0, 1)}, "experts": stats},
+                      open(wpath("stats", f"L{L:02d}_{a.screen_only}.json"), "w"))
+            log(f"layer {L}: screen-only '{a.screen_only}' done in {time.time() - t0:.0f} s")
+            return
         # ---- finish the block, write layer L+1's input
         h_out = h_memmap(L + 1, "w+", N, S)
         for i0 in range(0, N, B):
@@ -458,7 +468,7 @@ def cmd_layer(a):
         summ = {"layer": L, "tokens": T, "n_eval_tok": int(is_eval_tok.sum()), "routed_energy": routed_energy,
                 "h_rms_out": float(xo.float().square().mean().sqrt()),
                 "load_cv": float(counts.std() / counts.mean()), "unused_experts": int((counts == 0).sum()),
-                "seconds": round(time.time() - t0, 1), "tiers": TIERS, "min_fit": a.min_fit}
+                "seconds": round(time.time() - t0, 1), "tiers": TIERS, "min_fit": a.min_fit, "damps": a.damps}
         os.makedirs(wpath("stats"), exist_ok=True)
         json.dump({"summary": summ, "experts": stats}, open(wpath("stats", f"L{L:02d}.json"), "w"))
     if a.gc and L >= 1:
@@ -478,6 +488,11 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-gptq", action="store_true"); p.add_argument("--gptq-experts", type=int, default=NE); p.add_argument("--min-fit", type=int, default=32)
     p.add_argument("--gc", action="store_true", help="delete h/L-1 after success")
+    p.add_argument("--damp", dest="damps", type=lambda v: [float(x) for x in v.split(",")], default=[1.0],
+                   help="GPTQ damping (x mean diag H); a comma list sweeps, extra ones stored as e_<tier>@<damp>")
+    p.add_argument("--expert-stride", type=int, default=1, help="screen every K-th expert only")
+    p.add_argument("--screen-only", default=None, metavar="TAG",
+                   help="write stats/LNN_TAG.json only; no h/pre/shared/route output, no --gc")
     a = ap.parse_args()
     {"prep": cmd_prep, "init": cmd_init, "layer": cmd_layer}[a.cmd](a)
 
