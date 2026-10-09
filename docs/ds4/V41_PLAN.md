@@ -131,3 +131,11 @@ V4.1 runtimes:
 - Others: rexlunae/ds4-convert (streaming safetensors -> deepseek41 GGUF), helgard-orlm (8 GB GPU, 1.6 tok/s
   disk-only), 05yuki (dual EPYC + 2x 5070 Ti), vcruz305 (llama.cpp deepseek41 conversion recipe), pfeifferj's
   runtime patch (oracle).
+
+## First data (2026-10-09, shard_check.py on layer 0)
+Layer 0 validates clean (2,334 tensors, 0 issues).  Weight-space round-to-nearest error, 256 sampled rows per matrix:
+ternary 0.443, Q2 0.378, Q3 0.183 (relative), and **the same for every one of the 384 experts to +-0.001** (p5-p95)
+and every projection.  The FP4-native experts all have the same per-32 value distribution, so **weight-only
+priors cannot rank experts** - the mixed-tier allocation has to come from calibration: activation-weighted
+(GPTQ/GSQ) error per expert x REAP saliency.  Q3 halves the Q2 error; ternary costs +17% over Q2 before
+calibration-aware solving.
