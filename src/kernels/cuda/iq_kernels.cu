@@ -37,20 +37,7 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
-// byte-aligned (MXFP4's 17-byte blocks): llama.cpp's get_int_b1
-__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
-    const uint8_t* x8 = (const uint8_t*) x;
-    int x32 = x8[4 * i32 + 0] << 0;
-    x32 |= x8[4 * i32 + 1] << 8;
-    x32 |= x8[4 * i32 + 2] << 16;
-    x32 |= x8[4 * i32 + 3] << 24;
-    return x32;
-}
-// E8M0 (MXFP4's shared block exponent) -> float: 2^(e-127); e == 0 is the denormal 2^-127 (llama.cpp's
-// ggml_cuda_e8m0_to_fp32)
-__device__ __forceinline__ float e8m0_to_fp32(uint8_t e) {
-    return __uint_as_float(e == 0 ? 0x00400000u : (uint32_t) e << 23);
-}
+#include "fork/fork_helpers.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -327,102 +314,7 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 // Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
 // gopinath87607), which agree with llama.cpp and with each other.
 constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q4_1 = 2, VDR_Q4_0 = 2, VDR_Q8_0 = 2, VDR_Q6_K = 1;
-// Q2_K (DeepSeek-V4's down projections): llama.cpp's vec_dot_q2_K_q8_1 (vecdotq.cuh), VDR_Q2_K_Q8_1_MMVQ = 1.
-constexpr int VDR_Q2_K = 1;
-
-__device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(int v, const int* __restrict__ u,
-                                                             const uint8_t* __restrict__ scales,
-                                                             const half2& dm2, const float* __restrict__ d8) {
-    float sumf_d = 0.0f;
-    float sumf_m = 0.0f;
-#pragma unroll
-    for (int i = 0; i < QR2_K; ++i) {
-        const int sc = scales[2 * i];
-        const int vi = (v >> (2 * i)) & 0x03030303;
-        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF));
-        int m = sc >> 4;
-        m |= m << 8;
-        m |= m << 16;
-        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0);   // the min times the sum of the QUANTIZED activations
-    }
-    const float2 dm2f = __half22float2(dm2);
-    return dm2f.x * sumf_d - dm2f.y * sumf_m;
-}
-__device__ __forceinline__ float vec_dot_q2_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
-                                                   const int& kbx, const int& iqs) {
-    const block_q2_K* bq2_K = (const block_q2_K*) vbq + kbx;
-    const int bq8_offset = QR2_K * (iqs / QI8_1);
-    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
-    const uint8_t* scales = bq2_K->scales + scale_offset;
-    const int v = get_int_b4(bq2_K->qs, iqs);
-    int u[QR2_K];
-    float d8[QR2_K];
-#pragma unroll
-    for (int i = 0; i < QR2_K; ++i) {
-        u[i] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
-    }
-    return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
-}
-
-// Q3_K (MiMo-V2.6-Flash GSQ-RCO's gate/up/down on some layers): llama.cpp's vec_dot_q3_K_q8_1 (vecdotq.cuh),
-// VDR_Q3_K_Q8_1_MMVQ = 1.  The high-bit mask is inverted so a clear bit subtracts 4.
-constexpr int VDR_Q3_K = 1;
-__device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(const int& vl, const int& vh, const int* __restrict__ u,
-                                                             const uint8_t* __restrict__ scales, const int& scale_offset,
-                                                             const float& d3, const float* __restrict__ d8) {
-    float sumf = 0.0f;
-#pragma unroll
-    for (int i = 0; i < QR3_K; ++i) {
-        const int isc = scale_offset + 2 * i;
-        const int isc_low = isc % (QK_K / 32);
-        const int sc_shift_low = 4 * (isc / (QK_K / 32));
-        const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xF;
-        const int isc_high = isc % (QK_K / 64);
-        const int sc_shift_high = 2 * (isc / (QK_K / 64));
-        const int sc_high = ((scales[(QK_K / 32) + isc_high] >> sc_shift_high) & 3) << 4;
-        const int sc = (sc_low | sc_high) - 32;
-        const int vil = (vl >> (2 * i)) & 0x03030303;
-        const int vih = ((vh >> i) << 2) & 0x04040404;
-        const int vi = __vsubss4(vil, vih);
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc);
-    }
-    return d3 * sumf;
-}
-__device__ __forceinline__ float vec_dot_q3_K_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
-                                                   const int& kbx, const int& iqs) {
-    const block_q3_K* bq3_K = (const block_q3_K*) vbq + kbx;
-    const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
-    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
-    const float d = __half2float(bq3_K->d);
-    const int vl = get_int_b2(bq3_K->qs, iqs);
-    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K / 2)) >> bq8_offset;
-    int u[QR3_K];
-    float d8[QR3_K];
-#pragma unroll
-    for (int i = 0; i < QR3_K; ++i) {
-        u[i] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
-    }
-    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
-}
-
-// MXFP4 (MiMo's source-format down projections on 3 layers): llama.cpp's vec_dot_mxfp4_q8_1 (vecdotq.cuh),
-// VDR_MXFP4_Q8_1_MMVQ = 2.  kvalues_mxfp4 holds the e2m1 values doubled, hence the 0.5.
-constexpr int VDR_MXFP4 = 2;
-__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
-                                                    const int& kbx, const int& iqs) {
-    const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
-    const int* q8 = (const int*) bq8_1->qs + iqs;
-    int sumi = 0;
-#pragma unroll
-    for (int l = 0; l < VDR_MXFP4; ++l) {
-        const int2 v = get_int_from_table_16(get_int_b1(bq4->qs, iqs + l), kvalues_mxfp4);
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
-    }
-    return e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds) * sumi;
-}
+#include "fork/fork_vecdot.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 
 __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
                                                              const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
@@ -698,12 +590,6 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
-template<> struct Fmt<10> { static constexpr int qk = 256, ipb = QI2_K / VDR_Q2_K, step = VDR_Q2_K;
-    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_K_q8_1(v, y, kbx, iqs); } };
-template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K / VDR_Q3_K, step = VDR_Q3_K;
-    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
-template<> struct Fmt<39> { static constexpr int qk = 32, ipb = QI_MXFP4 / VDR_MXFP4, step = VDR_MXFP4;
-    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -730,11 +616,7 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #endif
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
-// Fork formats, kept out of upstream's lists above so those stay verbatim (fewer merge conflicts): Q2_K (10,
-// DeepSeek-V4 down), Q3_K (11, MiMo GSQ-RCO), MXFP4 (39, MiMo outliers).  Each use site expands the _FORK list too.
-#define STRATA_GU_FMTS_FORK(X) X(10) X(11)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(39)
-#define STRATA_MMVQ_FMTS_FORK(X) X(10)
+#include "fork/fork_fmt.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1354,36 +1236,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     }
 }
 
-// native_gu_kernel with gate and up in DIFFERENT formats (MiMo-V2.6-Flash GSQ-RCO picks a format per tensor).  A
-// warp's row is a gate row or an up row; with n_ff % GU_ROWS == 0 a whole block is one or the other, so the branch is
-// block-uniform.  Same per-row arithmetic as native_gu_kernel<T> for each half.
-template<int TG, int TU>
-__global__ void __launch_bounds__(256) native_gu_mixed_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                              const int32_t* __restrict__ grp_start,
-                                                              const int32_t* __restrict__ n_groups,
-                                                              const int32_t* __restrict__ ent_tok,
-                                                              const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                              float* __restrict__ gate, float* __restrict__ up) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * GU_ROWS + warp;             // 0 .. 2*n_ff
-    if (row >= 2 * L.n_ff) return;
-    const bool is_up = row >= L.n_ff;
-    const int r = is_up ? row - (int) L.n_ff : row;
-    const size_t off = is_up ? L.up_off + (size_t) r * L.up_row : (size_t) r * L.gu_row;
-    const int xb = (int) (L.n_embd / 32);
-    const int ng = *n_groups;
-    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
-        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + off;
-        const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        for (int e = e0; e < e1; ++e) {
-            const block_q8_1* x = xq + (size_t) ent_tok[e] * xb;
-            const float s = is_up ? row_dot<TU>(wr, x, (int) (L.n_embd / Fmt<TU>::qk), lane)
-                                  : row_dot<TG>(wr, x, (int) (L.n_embd / Fmt<TG>::qk), lane);
-            if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s;
-        }
-    }
-}
-
+#include "fork/fork_gu_mixed.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 // native_gu_kernel with the group's entries taken GRP_NC at a time, each weight part decoded once per pass.
 // A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4, and a split window
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
@@ -1817,30 +1670,6 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
-// Q2_K (DeepSeek-V4's down projections): ggml's dequantize_row_q2_K.  Thread tid writes 8 of the block's 256
-// values: 16-value groups, four 2-bit quants per uint8, the low scale nibble for the quant and the high one for
-// the min.  QK_K/16 = 16 groups, QK_K/4 = 64 quant bytes per block.
-template<typename dst_t>
-__device__ void dq_q2_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
-    const block_q2_K* x = (const block_q2_K*) vx + ibs;
-    const float d = (float) x->dm.x;
-    const float dmin = (float) x->dm.y;
-    const int v0 = 8 * tid;   // thread tid writes the 8 values [8*tid, 8*tid + 8) of the 256
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int v = v0 + i;
-        const int n = v & 128;               // the block's two 128-value qs halves (qs base 32 per half)
-        const int rem = v & 127;
-        const int j = rem >> 5;              // 0..3, the 2-bit quant shift 2*j
-        const int half = (rem >> 4) & 1;     // the low or high 16 of that 32-value q window
-        const int l = v & 15;
-        const int is = (n >> 7) * 8 + 2 * j + half;
-        const uint8_t sc = x->scales[is];
-        const int q = (x->qs[(n >> 7) * 32 + l + 16 * half] >> (2 * j)) & 3;
-        yy[v] = cvt<dst_t>(d * (sc & 0xF) * q - dmin * (sc >> 4));
-    }
-}
-
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template<typename dst_t>
 __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2036,21 +1865,7 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
 }
 
-// MXFP4 (MiMo's down projections on 3 layers): ggml's dequantize_row_mxfp4 - 32-value blocks, low nibbles are values
-// 0..15, high nibbles 16..31, value = kvalues_mxfp4[q] * 2^(e-127) / 2.  Same thread layout as dq_iq4_nl.
-template<typename dst_t>
-__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
-    const block_mxfp4* x = (const block_mxfp4*) vx + ibs * (QK_K / QK_MXFP4);
-    const int64_t il = tid / 8, ib = tid % 8;
-    dst_t* y = yy + 32 * ib + 4 * il;
-    const uint8_t* q4 = x[ib].qs + 4 * il;
-    const float d = e8m0_to_fp32(x[ib].e) * 0.5f;
-    for (int j = 0; j < 4; ++j) {
-        y[j + 0] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]);
-        y[j + 16] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] >> 4]);
-    }
-}
-
+#include "fork/fork_dq.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
 template<typename dst_t>
 __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -3006,23 +2821,7 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
-NativeExpertLayout native_expert_layout3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) {
-    NativeExpertLayout L = native_expert_layout(gate_type, d_type, n_embd, n_ff);
-    if (up_type == gate_type) return L;
-    L.up_type = up_type;
-    L.up_row = iq_row_bytes(up_type, n_embd);
-    L.down_off = L.up_off + (size_t) n_ff * L.up_row;
-    L.bytes = L.down_off + (size_t) n_embd * L.d_row;
-    return L;
-}
-
-bool native_expert_supported3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
-    if (gate_type == up_type) return native_expert_supported(gate_type, d_type, n_embd, n_ff);
-    const bool pair = (gate_type == 10 && up_type == 11) || (gate_type == 11 && up_type == 10);
-    return pair && native_expert_supported(gate_type, d_type, n_embd, n_ff) &&
-           native_expert_supported(up_type, d_type, n_embd, n_ff) && n_ff % GU_ROWS == 0;
-}
-
+#include "fork/fork_layout.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
@@ -3838,24 +3637,5 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/down");
 }
 
-// out[t][i] = sum_k w[t*K + k] * parts[(t*K + k)][i] - the prompt chunk's top-k mix on the card (MiMo prefill), so
-// only n rows come back instead of n*K.  Summed in k order, like the host loop it replaces.
-__global__ void weighted_rows_sum_kernel(const float* __restrict__ parts, const float* __restrict__ w, int K,
-                                         int64_t H, int64_t n, float* __restrict__ out) {
-    const int64_t total = n * H;
-    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (int64_t) gridDim.x * blockDim.x) {
-        const int64_t t = q / H, i = q - t * H;
-        float acc = 0.0f;
-        for (int k = 0; k < K; ++k) acc += w[t * K + k] * parts[(t * K + k) * H + i];
-        out[q] = acc;
-    }
-}
-
-void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream) {
-    const int64_t total = n * H;
-    const unsigned blocks = (unsigned) std::min<int64_t>((total + 255) / 256, 65535);
-    weighted_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, n, out);
-    check("weighted_rows_sum");
-}
-
+#include "fork/fork_weighted_sum.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 }  // namespace strata::kernels

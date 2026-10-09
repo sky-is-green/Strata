@@ -244,10 +244,6 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
   add_test(NAME gguf_split_test COMMAND gguf_split_test)
-  # DSV4 geometry + full tensor map (header mmap only; the real-file part skips without $DS4_GGUF/argv[1])
-  add_executable(ds4_geometry_test tests/core/ds4_geometry_test.cpp)
-  target_link_libraries(ds4_geometry_test PRIVATE strata_artifact)
-  add_test(NAME ds4_geometry_test COMMAND ds4_geometry_test $ENV{DS4_GGUF})
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
@@ -1144,17 +1140,8 @@ if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(GGML_STATIC ON CACHE BOOL "" FORCE)
-  # ggml's own CUDA backend is off unless asked for: the DS4 dense half (tools/ds4/ds4_dense) runs its graphs on a
-  # ggml backend and needs ggml-cuda to run them on the GPU (-DSTRATA_GGML_CUDA=ON, build-ds4-gpu).
-  option(STRATA_GGML_CUDA "Build ggml's CUDA backend too (for the DS4 dense half on the GPU)" OFF)
-  if(STRATA_GGML_CUDA)
-    set(GGML_CUDA ON CACHE BOOL "" FORCE)
-    # ggml defaults CUDA graphs OFF when it is not llama.cpp's own build; without them the DS4 dense half's ~17k tiny
-    # kernels per token run at launch-overhead speed (measured: 97 ms/token of attention, 2.1M cudaLaunchKernel)
-    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
-  else()
-    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
-  endif()
+  set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ggml_cuda.cmake OPTIONAL)   # fork: STRATA_GGML_CUDA
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -1201,13 +1188,8 @@ if(STRATA_NATIVE_EXPERTS)
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ptq1_0.cpp)
+                                           src/kernels/cpu/kq_avx1.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(STRATA_BUILD_TESTS)   # PTQ1_0 ternary rows (DeepSeek-V4.1 mixed tier): layout vs llama-tq's reference, dot parity
-    add_executable(ptq1_0_test tests/cpu/ptq1_0_test.cpp)
-    target_link_libraries(ptq1_0_test PRIVATE strata_kernels_cpu)
-    add_test(NAME ptq1_0_test COMMAND ptq1_0_test)
-  endif()
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
@@ -1285,9 +1267,8 @@ if(STRATA_NATIVE_EXPERTS)
     # follows eddoursul/Strata 7706c1b); q6_k is HIP only
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
     if(STRATA_MMQ_KQUANTS)
-      # q2_k / q3_k / mxfp4: MiMo-V2.6-Flash experts are Q2_K/Q3_K (prompt-chunk MMQ instances; without them the
-      # dispatch cases in moe_mmq.cu fail to link). Ported from branch mimo.
-      list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1 q2_k q3_k mxfp4)
+      list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
+      list(APPEND _strata_mmq_cuda_types q2_k q3_k mxfp4)   # fork: DS4 Q2_K / MiMo Q3_K, MXFP4 experts
       if(STRATA_Q6K_EXPERTS OR STRATA_HIP_GFX906)   # UD-Q6_K_XL gate/up (docs/UNSLOTH_Q6.md),
         list(APPEND _strata_mmq_cuda_types q6_k)    #   and gfx906: moe_mmq.cu calls it under __HIPCC__
       endif()
@@ -1408,25 +1389,6 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
-    if(NOT STRATA_HIP_GFX906)
-      # DS4 phase 2 gate: one real DeepSeek-V4 expert (gate/up IQ2_XXS, down Q2_K) through the CPU pool and the
-      # GPU native MMVQ path, against ggml's dequantizer + an F32 matmul.  The 0731 artifact comes from
-      # argv[1]/$DS4_GGUF; without it the binary prints "skipped" and exits 0.  --cpu-only runs no CUDA.
-      add_executable(ds4_expert_parity src/kernels/ds4_expert_parity.cpp)
-      target_include_directories(ds4_expert_parity PRIVATE ${_strata_gpu_include_directories})
-      target_link_libraries(ds4_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
-      if(STRATA_BUILD_TESTS)
-        add_test(NAME ds4_expert_parity COMMAND ds4_expert_parity "$ENV{DS4_GGUF}")
-      endif()
-      # DS4 phase 4a: the DeepSeek-V4 expert engine replayed on recorded routes (tools/ds4/moe_replay.cpp).
-      # It links the real machinery - strata_engine's ExpertCache, the CPU ExpertPool, the native grouped
-      # kernels, PinnedArena - and drives them from ds4routes.bin.  --correctness --cpu-only needs no GPU.
-      add_executable(ds4_moe_replay tools/ds4/moe_replay.cpp tools/ds4/moe_gap.cu)
-      target_include_directories(ds4_moe_replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${_strata_gpu_include_directories})
-      target_link_libraries(ds4_moe_replay PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact
-        ${_strata_gpu_runtime_target})
-    endif()
     if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
       # Unsloth UD-Q4_K_XL's three expert pairs (and Q8_0 alone, its embedding) on synthetic ggml-quantized weights
       # at 2560/640: GPU and CPU experts against the float reference, GPU dequantizers against to_float.
@@ -1582,17 +1544,5 @@ if(STRATA_HIP_GFX906)
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()
 
-# ---- ds4 reference forward pass (Phase 3) ---------------------------------
-# tools/ds4 is not part of the engine, but ds4_ref is the Phase-3 correctness oracle: a plain CPU ggml
-# graph that emits golden_dump-format activations for tools/ds4/compare_golden.py.  CPU-only, no CUDA.
-if(TARGET ggml-cpu)
-  add_executable(ds4_ref tools/ds4/ds4_ref.cpp)
-  target_include_directories(ds4_ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(ds4_ref PRIVATE ggml ggml-cpu ggml-base)
-endif()
-
-# ---- ds4 decode engine (Phase 4b proper) ---------------------------------
-# Each engine slice owns exactly one of these files (conductor plan 2026-10-06); OPTIONAL so a missing one is fine.
-include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_dense.cmake OPTIONAL)
-include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_moe.cmake OPTIONAL)
-include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_engine.cmake OPTIONAL)
+# Strata-DS4 fork targets (docs/UPSTREAM_SYNC.md)
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/fork.cmake OPTIONAL)
