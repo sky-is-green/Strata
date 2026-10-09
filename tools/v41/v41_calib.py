@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+"""v41_calib.py - layer-streaming calibration forward + per-expert GPTQ tier screening, DeepSeek-V4.1-Flash.
+
+Runs DeepSeek's own model.py (on tools/v41/torch_kernels) ONE LAYER AT A TIME straight from the HF safetensors, so a
+layer can be processed as soon as its shard has downloaded.  State between layers lives in WORK:
+  tokens.npy [N,S] int32, hashes.npy [N,S,2,24] int64 (engram n-gram ids), meta.json (domain + fit/eval per sequence)
+  h/LNN.bin  [N,S,4,5120] bf16  hyper-connection stream entering layer NN (engram NOT yet added)
+  pre/LNN.npy [N,S,4] f32       pre_mix for layer NN's attention (= previous FFN's hc_mixes)
+  shared/LNN.pt                 SharedAttentionRuntime per batch (compressed KV / index keys / top-k / candidates)
+  route/LNN.npz                 routing (indices int16, weights f16) for every token
+  stats/LNN.json                per-expert screening: REAP saliency, token counts, held-out output error per tier
+Per layer (`layer L`): attention half for every batch -> MoE expert-major over ALL tokens (each FP4 expert dequantized
+once; exactly the reference Expert.forward) -> per-expert GPTQ at ptq1/q2_0/q3_k + RTN control -> hc_post -> h/L+1.
+Screening error = ||f(x; W) - f(x; Q)||^2 summed over HELD-OUT sequences (GPTQ fits on the others), gate weight
+included, same fp32 math for teacher and student (so it is weight damage only, not act-quant noise).
+
+  v41_calib.py prep  [--n 128 --seq 2048]       tokenize the calibration mix + engram hashes (CPU)
+  v41_calib.py init                             h/L00 from the embedding (shard 2)
+  v41_calib.py layer L [--no-gptq] [--batch 2]  one layer (GPU; run under tools/ds4/memguard.sh)
+Env: V41_WORK (default /media/Crucial1TB/v41-calib).
+"""
+import argparse, glob, hashlib, json, mmap, os, struct, sys, time
+from collections import defaultdict
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REF = os.path.expanduser("~/AI/gsq-rco/dsv41-inference")
+sys.path[:0] = [os.path.join(HERE, "torch_kernels"), REF, HERE]
+import model as M  # noqa: E402
+import kernel as K  # noqa: E402  (our torch stand-in)
+import v41_gptq as G  # noqa: E402
+
+MAIN = "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
+DIRS = [MAIN, "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
+        "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]
+WORK = os.environ.get("V41_WORK", "/media/Crucial1TB/v41-calib")
+D, HC, NE, TOPK = 5120, 4, 384, 6
+TIERS = list(G.TIERS)
+BF16 = torch.bfloat16
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def wpath(*p):
+    return os.path.join(WORK, *p)
+
+
+def shard_file(name):
+    """Verified local path of a shard (by its .ok marker), else None."""
+    for d in DIRS:
+        p = os.path.join(d, name)
+        if os.path.exists(p + ".ok"):
+            return p
+    return None
+
+
+def weight_map():
+    return json.load(open(os.path.join(MAIN, "model.safetensors.index.json")))["weight_map"]
+
+
+def st_header(path):
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        h = json.loads(f.read(n))
+    h.pop("__metadata__", None)
+    return h, 8 + n
+
+
+def model_args(batch, seq):
+    """DeepSeek's inference-format config (field names = ModelArgs).  The HF config.json in the model dir uses the
+    transformers schema - feeding it to ModelArgs silently leaves the TINY defaults - so it is only cross-checked."""
+    cfg = json.load(open(os.path.join(REF, "config.json")))
+    unknown = set(cfg) - set(M.ModelArgs.__dataclass_fields__)
+    assert not unknown, f"config keys ModelArgs does not know: {unknown}"
+    args = M.ModelArgs(**cfg)
+    hf = json.load(open(os.path.join(MAIN, "config.json")))
+    hf = hf.get("text_config", hf)
+    for mine, theirs in [("dim", "hidden_size"), ("n_layers", "num_hidden_layers"), ("n_routed_experts", None),
+                         ("moe_inter_dim", "moe_intermediate_size"), ("n_activated_experts", "num_experts_per_tok"),
+                         ("compress_ratios", None), ("kv_source_layers", "kv_source_layer_ids"),
+                         ("index_source_layers", "index_source_layer_ids"), ("swiglu_limit", None),
+                         ("route_scale", "routed_scaling_factor"), ("engram_num_embeddings", None),
+                         ("engram_compressed_vocab_size", None), ("candidate_source_layer", "candidate_source_layer_id"),
+                         ("window_size", "sliding_window"), ("norm_eps", "rms_norm_eps"), ("head_dim", None)]:
+        a_, b_ = getattr(args, mine), hf[theirs or mine]
+        assert (list(a_) if isinstance(a_, (list, tuple)) else a_) == b_, (mine, a_, b_)
+    args.max_batch_size, args.max_seq_len = batch, seq
+    return args
+
+
+# ---------------------------------------------------------------------------------------------------------- prep
+def _cjk_ratio(t):
+    s = [c for c in t if not c.isspace()]
+    if not s:
+        return 0.0, 0.0
+    cjk = sum("\u4e00" <= c <= "\u9fff" for c in s)
+    kana = sum("\u3040" <= c <= "\u30ff" for c in s)
+    return cjk / len(s), kana / len(s)
+
+
+def _local_texts():
+    """Repo code + zh/de/es prose from local files, deduplicated.  fr/ja/pt are deliberately excluded (held out)."""
+    code, zh, eu, seen = [], [], [], set()
+
+    def add(lst, p):
+        try:
+            t = open(p, encoding="utf-8").read()
+        except Exception:
+            return
+        h = hashlib.sha1(t.encode()).hexdigest()
+        if h not in seen and len(t) > 2000:
+            seen.add(h); lst.append(t)
+    for pat in ["~/AI/Strata-DS4/src/**/*.cpp", "~/AI/Strata-DS4/src/**/*.cu", "~/AI/Strata-DS4/tools/**/*.py",
+                "~/AI/QuetzaCodetl/src/**/*.ts", "~/AI/Odin/mcp-server/*.js"]:
+        for p in sorted(glob.glob(os.path.expanduser(pat), recursive=True)):
+            add(code, p)
+    for p in sorted(glob.glob(os.path.expanduser("~/AI/*/*.md")) + glob.glob(os.path.expanduser("~/AI/*/docs/*.md"))
+                    + glob.glob(os.path.expanduser("~/AI/*/docs/**/*.md"), recursive=True)):
+        if os.path.getsize(p) < 3000 or "node_modules" in p:
+            continue
+        try:
+            t = open(p, encoding="utf-8").read()
+        except Exception:
+            continue
+        c, k = _cjk_ratio(t[:20000])
+        if c > 0.25 and k < 0.02:
+            add(zh, p)
+        elif os.path.basename(p) in ("README.de.md", "README.es.md"):
+            add(eu, p)
+    return code, zh, eu
+
+
+def cmd_prep(a):
+    import datasets
+    from transformers import AutoTokenizer
+    os.makedirs(WORK, exist_ok=True)
+    tok = AutoTokenizer.from_pretrained(MAIN)
+    BOS, EOS = tok.bos_token_id, tok.eos_token_id
+    S, rng = a.seq, np.random.default_rng(0)
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    pile = datasets.load_dataset("NeelNanda/pile-10k", split="train")
+    by = defaultdict(list)
+    for i in rng.permutation(len(pile)):
+        r = pile[int(i)]
+        by[r["meta"]["pile_set_name"]].append(r["text"])
+
+    def chat(t):  # StackExchange "Q:\n\n..\n\nA:\n\n.." -> DeepSeek non-thinking chat turn
+        if "\nA:\n" not in t:
+            return None
+        q, ans = t.split("\nA:\n", 1)
+        q = q.replace("Q:\n", "", 1).strip()
+        return f"<｜User｜>{q}<｜Assistant｜></think>{ans.strip()}<｜end▁of▁sentence｜>"
+
+    code_local, zh, eu = _local_texts()
+    web_sets = ["Pile-CC", "OpenWebText2", "Wikipedia (en)", "HackerNews", "USPTO Backgrounds", "FreeLaw",
+                "Enron Emails", "OpenSubtitles", "Books3", "BookCorpus2", "Ubuntu IRC"]
+    sci_sets = ["PubMed Abstracts", "PubMed Central", "ArXiv", "NIH ExPorter", "DM Mathematics"]
+    pools = {
+        "web": [t for s in web_sets for t in by[s]],
+        "sci": [t for s in sci_sets for t in by[s]],
+        "chat": [c for c in map(chat, by["StackExchange"]) if c],
+        "code": by["Github"][:400] + code_local,
+        "zh": zh, "de_es": eu,
+    }
+    for k in ("web", "sci", "code", "zh", "de_es"):
+        rng.shuffle(pools[k])
+    want = {"web": 56, "sci": 10, "chat": 16, "code": 24, "zh": 14, "de_es": 8}
+    scale = a.n / sum(want.values())
+    want = {k: max(1, round(v * scale)) for k, v in want.items()}
+
+    def pack(texts, n):
+        seqs, cur = [], [BOS]
+        for t in texts:
+            special = t.startswith("<｜User｜>")
+            ids = tok.encode(t, add_special_tokens=False)[: S - 1]
+            if not special:
+                ids = ids + [EOS]
+            while ids:
+                room = S - len(cur)
+                cur += ids[:room]; ids = ids[room:]
+                if len(cur) == S:
+                    seqs.append(cur); cur = [BOS]
+                    if len(seqs) == n:
+                        return seqs
+                    ids = ids[: S // 2]  # a long document continues once into the next sequence, then moves on
+        return seqs
+    seqs, doms = [], []
+    for k, n in want.items():
+        got = pack(pools[k], n)
+        log(f"prep: {k}: {len(got)}/{n} sequences ({len(pools[k])} texts)")
+        seqs += got; doms += [k] * len(got)
+    short = a.n - len(seqs)
+    if short > 0:  # a domain ran dry: fill with more web text
+        got = pack(pools["web"][len(pools["web"]) // 2:], short)
+        seqs += got; doms += ["web"] * len(got)
+    seqs, doms = seqs[: a.n], doms[: a.n]
+    # held-out split: every 4th sequence of each domain
+    is_eval, cnt = [], defaultdict(int)
+    for d_ in doms:
+        is_eval.append(cnt[d_] % 4 == 3); cnt[d_] += 1
+    tokens = np.array(seqs, dtype=np.int32)
+    np.save(wpath("tokens.npy"), tokens)
+    json.dump({"n": len(seqs), "seq": S, "domains": doms, "is_eval": is_eval}, open(wpath("meta.json"), "w"))
+    # engram n-gram hash ids for every position (depend on token ids only)
+    args = model_args(len(seqs), S)
+    layout = M.EngramLayout.from_args(args)
+    hs = M.NgramHashState(args, layout, tok)
+    with torch.inference_mode():
+        hashes = hs(torch.from_numpy(tokens).long(), 0)
+    np.save(wpath("hashes.npy"), hashes.numpy())
+    log(f"prep: {tokens.shape} tokens, {sum(is_eval)} eval sequences, hashes {tuple(hashes.shape)} "
+        f"max id {int(hashes.max())} (tables {args.engram_num_embeddings})")
+
+
+# ---------------------------------------------------------------------------------------------------------- init
+def h_memmap(L, mode, N, S):
+    os.makedirs(wpath("h"), exist_ok=True)
+    return np.memmap(wpath("h", f"L{L:02d}.bin"), dtype=np.int16, mode=mode, shape=(N, S, HC, D))
+
+
+def cmd_init(a):
+    tokens = np.load(wpath("tokens.npy"))
+    N, S = tokens.shape
+    from safetensors import safe_open
+    with safe_open(shard_file("model-00002-of-00048.safetensors"), "pt") as f:
+        emb = f.get_tensor("embed.weight")
+    assert emb.dtype == BF16 and emb.shape[1] == D, (emb.dtype, emb.shape)
+    out = h_memmap(0, "w+", N, S)
+    for i in range(N):
+        e = emb[torch.from_numpy(tokens[i]).long()]                        # [S, D]
+        out[i] = e.unsqueeze(1).expand(S, HC, D).contiguous().view(torch.int16).numpy()
+    out.flush()
+    pre = np.zeros((N, S, HC), np.float32); pre[..., 0] = 1.0
+    os.makedirs(wpath("pre"), exist_ok=True)
+    np.save(wpath("pre", "L00.npy"), pre)
+    log(f"init: h/L00 {N}x{S} from the embedding")
+
+
+# ---------------------------------------------------------------------------------------------------------- layer
+class MemmapEngramEmbedding(nn.Module):
+    """Drop-in for model.ParallelEngramEmbedding: rows read from the shard on disk (the 98 GB table never loads).
+    Same math: fp8 row * its E8M0 scale per 32, to bf16."""
+    SRC = None  # (path, weight name, scale name) - set before the Block is built
+
+    def __init__(self, num_embeddings, dim):
+        super().__init__()
+        path, wn, sn = self.SRC
+        h, base = st_header(path)
+        (wa, wb), (sa, sb) = h[wn]["data_offsets"], h[sn]["data_offsets"]
+        assert h[wn]["shape"] == [num_embeddings, dim] and h[wn]["dtype"] == "F8_E4M3", h[wn]
+        assert h[sn]["shape"] == [num_embeddings, dim // 32] and h[sn]["dtype"] == "F8_E8M0", h[sn]
+        self.w = np.memmap(path, np.uint8, "r", offset=base + wa, shape=(num_embeddings, dim))
+        self.s = np.memmap(path, np.uint8, "r", offset=base + sa, shape=(num_embeddings, dim // 32))
+        for m in (self.w, self.s):
+            m._mmap.madvise(mmap.MADV_RANDOM)
+        self.dim, self.bytes_read, self.rows = dim, 0, 0
+
+    def forward(self, indices):
+        dev = indices.device
+        u, inv = np.unique(indices.reshape(-1).cpu().numpy(), return_inverse=True)
+        w = torch.from_numpy(np.ascontiguousarray(self.w[u])).to(dev).view(torch.float8_e4m3fn).float()
+        s = torch.from_numpy(np.ascontiguousarray(self.s[u])).to(dev).to(torch.int32)
+        s = torch.ldexp(torch.ones_like(s, dtype=torch.float32), s - 127)
+        v = (w.view(len(u), -1, 32) * s.unsqueeze(-1)).view(len(u), self.dim).to(BF16)
+        self.rows += len(u)
+        return v[torch.from_numpy(inv.reshape(-1)).to(dev)].view(*indices.shape, self.dim)
+
+
+def load_block(blk, L):
+    """Copy layer L's tensors from the shards into the Block (no TP convert; wo_a dequantized like convert.py)."""
+    from safetensors import safe_open
+    wm = weight_map()
+    pre = f"layers.{L}."
+    names = [k for k in wm if k.startswith(pre)]
+    params = dict(blk.named_parameters())
+    loaded, by_file = set(), defaultdict(list)
+    for k in names:
+        by_file[wm[k]].append(k)
+    for fn, ks in by_file.items():
+        path = shard_file(fn)
+        assert path, f"{fn} not downloaded/verified yet (needed for layer {L})"
+        with safe_open(path, "pt") as f:
+            for k in ks:
+                rel = k[len(pre):]
+                if rel.startswith("engram.embed.") or rel == "attn.wo_a.scale":
+                    continue
+                t = f.get_tensor(k)
+                if rel == "attn.wo_a.weight":
+                    s = f.get_tensor(k.replace(".weight", ".scale")).float()
+                    bo, bi = t.shape[0] // s.shape[0], t.shape[1] // s.shape[1]
+                    t = (t.float().unflatten(0, (-1, bo)).unflatten(-1, (-1, bi)) * s[:, None, :, None]).flatten(2, 3).flatten(0, 1)
+                p = params[rel]
+                assert tuple(p.shape) == tuple(t.shape), (k, p.shape, t.shape)
+                if p.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu, torch.float4_e2m1fn_x2):
+                    assert t.element_size() == 1, (k, t.dtype)
+                    p.data.view(torch.uint8).copy_(t.view(torch.uint8))
+                else:
+                    p.data.copy_(t.to(p.dtype))
+                loaded.add(rel)
+    missing = set(params) - loaded
+    assert not missing, f"layer {L}: params not in checkpoint: {sorted(missing)[:10]}"
+    return len(loaded)
+
+
+SHARED = ("compress_kv", "index_k", "topk_idxs", "candidates")
+
+
+def expert_f(x, W1, W3, W2, g, lim):
+    """fp32 SwiGLU expert with the training clamps and the routing weight (as Expert.forward, no act quant)."""
+    gate = x @ W1.T
+    up = x @ W3.T
+    if lim > 0:
+        up = up.clamp(-lim, lim); gate = gate.clamp(max=lim)
+    return (F.silu(gate) * up * g) @ W2.T
+
+
+def screen_expert(exp, xe, ge, fit, lim, min_fit):
+    """GPTQ + RTN at every tier on the fit tokens, output error on the held-out tokens.  Returns a stats dict."""
+    W1 = K.dequant_fp4_weight(exp.w1.weight, exp.w1.scale)
+    W3 = K.dequant_fp4_weight(exp.w3.weight, exp.w3.scale)
+    W2 = K.dequant_fp4_weight(exp.w2.weight, exp.w2.scale)
+    xf, gf = xe[fit].float(), ge[fit].float()
+    xv, gv = xe[~fit].float(), ge[~fit].float()
+    st = {"n_fit": int(fit.sum()), "n_eval": int((~fit).sum())}
+    if st["n_eval"] == 0:              # nothing held out: measure on the fit tokens (flagged)
+        xv, gv, st["eval_on_fit"] = xf, gf, True
+    do_gptq = st["n_fit"] >= min_fit
+    if do_gptq:
+        H1 = xf.T @ xf
+        a = F.silu((xf @ W1.T).clamp(max=lim)) * (xf @ W3.T).clamp(-lim, lim) * gf
+        H2 = a.T @ a
+    else:                               # too few tokens for a Hessian: weight-space importance only
+        H1 = torch.eye(D, device=xe.device); H2 = torch.eye(W2.shape[1], device=xe.device)
+        st["lowdata"] = True
+    Qg1, Qr1 = G.quantize_stack([W1, W3], H1, TIERS, do_gptq=do_gptq)
+    Qg2, Qr2 = G.quantize_stack([W2], H2, TIERS, do_gptq=do_gptq)
+    Qg1, Qg2 = (Qg1, Qg2) if do_gptq else (Qr1, Qr2)
+    if len(xv):
+        Y = expert_f(xv, W1, W3, W2, gv, lim)
+        st["y_energy"] = float(Y.square().sum())
+        err = lambda q1, q3, q2: float((expert_f(xv, q1, q3, q2, gv, lim) - Y).square().sum())
+        for t in TIERS:
+            st[f"e_{t}"] = err(Qg1[t][0], Qg1[t][1], Qg2[t][0])                 # whole expert at tier t (GPTQ)
+            st[f"egu_{t}"] = err(Qg1[t][0], Qg1[t][1], W2)                      # gate+up only
+            st[f"edn_{t}"] = err(W1, W3, Qg2[t][0])                             # down only
+            st[f"rtn_{t}"] = err(Qr1[t][0], Qr1[t][1], Qr2[t][0])               # RTN control
+    return st
+
+
+def cmd_layer(a):
+    L = a.layer
+    meta = json.load(open(wpath("meta.json")))
+    tokens = np.load(wpath("tokens.npy"))
+    N, S = tokens.shape
+    B = a.batch
+    assert N % B == 0
+    dev = a.device
+    torch.set_default_dtype(BF16)
+    args = model_args(B, S)
+    layout = M.EngramLayout.from_args(args)
+    t0 = time.time()
+    if L in args.engram_layer_ids:
+        e = args.engram_layer_ids.index(L)
+        MemmapEngramEmbedding.SRC = (shard_file(weight_map()[f"layers.{L}.engram.embed.weight"]),
+                                     f"layers.{L}.engram.embed.weight", f"layers.{L}.engram.embed.scale")
+        M.ParallelEngramEmbedding = MemmapEngramEmbedding
+        hashes = np.load(wpath("hashes.npy"), mmap_mode="r")
+    with torch.device(dev):
+        blk = M.Block(L, args, layout)
+    n = load_block(blk, L)
+    torch.set_default_device(dev)
+    log(f"layer {L}: {n} tensors loaded ({time.time() - t0:.0f} s), ratio {args.compress_ratios[L]}, "
+        f"engram {blk.engram is not None}, kv_src {blk.attn.is_kv_source}, idx_src {blk.attn.is_index_source}")
+
+    h_in = h_memmap(L, "r", N, S)
+    pre_in = np.load(wpath("pre", f"L{L:02d}.npy"))
+    sp = wpath("shared", f"L{L:02d}.pt")
+    shared = torch.load(sp) if os.path.exists(sp) else [dict.fromkeys(SHARED) for _ in range(N // B)]
+    resid = torch.empty((N, S, HC, D), dtype=BF16, device="cpu")
+    X = torch.empty((N * S, D), dtype=BF16, device=dev)
+    post = torch.empty((N, S, HC), dtype=torch.float32, device=dev)
+    comb = torch.empty((N, S, HC, HC), dtype=torch.float32, device=dev)
+    nxt = torch.empty((N, S, HC), dtype=torch.float32, device=dev)
+    t1 = time.time()
+    with torch.inference_mode():
+        for bi, i0 in enumerate(range(0, N, B)):
+            i1 = i0 + B
+            for k in SHARED:
+                v = shared[bi][k]
+                setattr(M.shared_attn, k, None if v is None else v.to(dev))
+            x = torch.from_numpy(np.asarray(h_in[i0:i1])).to(dev).view(BF16)
+            pm = torch.from_numpy(pre_in[i0:i1]).to(dev)
+            if blk.engram is not None:
+                x = blk.engram(x, torch.from_numpy(np.asarray(hashes[i0:i1, :, e, :])).to(dev), None)
+            residual = x
+            attn_pre, attn_post, attn_comb = blk.hc_mixes(x, blk.hc_attn_fn, blk.hc_attn_scale, blk.hc_attn_base)
+            y = blk.attn(blk.attn_norm(blk.hc_pre(x, pm)), 0)
+            x = blk.hc_post(y, residual, attn_post, attn_comb)
+            ffn_pre, post[i0:i1], comb[i0:i1] = blk.hc_mixes(x, blk.hc_ffn_fn, blk.hc_ffn_scale, blk.hc_ffn_base)
+            nxt[i0:i1] = ffn_pre
+            X[i0 * S:i1 * S] = blk.ffn_norm(blk.hc_pre(x, attn_pre)).view(-1, D)
+            resid[i0:i1] = x.cpu()
+            shared[bi] = {k: (None if getattr(M.shared_attn, k) is None else getattr(M.shared_attn, k).clone().cpu())
+                          for k in SHARED}
+        assert torch.isfinite(X).all(), "non-finite MoE input"
+        log(f"layer {L}: attention half {N}x{S} in {time.time() - t1:.0f} s"
+            + (f", engram rows read {blk.engram.embed.rows:,}" if blk.engram is not None else ""))
+
+        # ---- MoE, expert-major over every token (reference Gate / Expert / shared expert)
+        t2 = time.time()
+        T = N * S
+        wts = torch.empty((T, TOPK), dtype=torch.float32, device=dev)
+        idx = torch.empty((T, TOPK), dtype=torch.int64, device=dev)
+        for c in range(0, T, 65536):
+            wts[c:c + 65536], idx[c:c + 65536] = blk.ffn.gate(X[c:c + 65536])
+        is_eval_tok = torch.tensor(meta["is_eval"], device=dev).repeat_interleave(S)
+        Y = torch.zeros((T, D), dtype=torch.float32, device=dev)
+        stats, lim = {}, args.swiglu_limit
+        for ex in range(NE):
+            tok, slot = torch.where(idx == ex)
+            if len(tok) == 0:
+                stats[ex] = {"n": 0}
+                continue
+            xe, ge = X[tok], wts[tok, slot, None]
+            out = blk.ffn.experts[ex](xe, ge)
+            Y.index_add_(0, tok, out.float())
+            st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
+            if not a.no_gptq and ex < a.gptq_experts:
+                st.update(screen_expert(blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, a.min_fit))
+            stats[ex] = st
+            if ex % 64 == 63:
+                log(f"layer {L}: experts {ex + 1}/{NE} ({time.time() - t2:.0f} s)")
+        routed_energy = float(Y.square().sum())
+        for c in range(0, T, 65536):
+            Y[c:c + 65536] += blk.ffn.shared_experts(X[c:c + 65536])
+        log(f"layer {L}: MoE{'' if a.no_gptq else ' + GPTQ screening'} in {time.time() - t2:.0f} s")
+
+        # ---- finish the block, write layer L+1's input
+        h_out = h_memmap(L + 1, "w+", N, S)
+        for i0 in range(0, N, B):
+            i1 = i0 + B
+            y = Y[i0 * S:i1 * S].view(B, S, D).to(BF16)
+            xo = blk.hc_post(y, resid[i0:i1].to(dev), post[i0:i1], comb[i0:i1])
+            assert torch.isfinite(xo).all(), f"non-finite output, batch {i0}"
+            h_out[i0:i1] = xo.view(torch.int16).cpu().numpy()
+        h_out.flush()
+        np.save(wpath("pre", f"L{L + 1:02d}.npy"), nxt.cpu().numpy())
+        os.makedirs(wpath("shared"), exist_ok=True)
+        torch.save(shared, wpath("shared", f"L{L + 1:02d}.pt"))
+        os.makedirs(wpath("route"), exist_ok=True)
+        np.savez(wpath("route", f"L{L:02d}.npz"), idx=idx.to(torch.int16).cpu().numpy(), w=wts.half().cpu().numpy())
+        counts = torch.bincount(idx.flatten(), minlength=NE).float()
+        summ = {"layer": L, "tokens": T, "n_eval_tok": int(is_eval_tok.sum()), "routed_energy": routed_energy,
+                "h_rms_out": float(xo.float().square().mean().sqrt()),
+                "load_cv": float(counts.std() / counts.mean()), "unused_experts": int((counts == 0).sum()),
+                "seconds": round(time.time() - t0, 1), "tiers": TIERS, "min_fit": a.min_fit}
+        os.makedirs(wpath("stats"), exist_ok=True)
+        json.dump({"summary": summ, "experts": stats}, open(wpath("stats", f"L{L:02d}.json"), "w"))
+    if a.gc and L >= 1:
+        for p in (wpath("h", f"L{L - 1:02d}.bin"),):
+            if os.path.exists(p):
+                os.remove(p)
+    log(f"layer {L}: done in {time.time() - t0:.0f} s; load CV {summ['load_cv']:.3f}, unused {summ['unused_experts']}, "
+        f"out rms {summ['h_rms_out']:.3f}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prep"); p.add_argument("--n", type=int, default=128); p.add_argument("--seq", type=int, default=2048)
+    sub.add_parser("init")
+    p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=2)
+    p.add_argument("--device", default="cuda")
+    p.add_argument("--no-gptq", action="store_true"); p.add_argument("--gptq-experts", type=int, default=NE); p.add_argument("--min-fit", type=int, default=32)
+    p.add_argument("--gc", action="store_true", help="delete h/L-1 after success")
+    a = ap.parse_args()
+    {"prep": cmd_prep, "init": cmd_init, "layer": cmd_layer}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
