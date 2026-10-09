@@ -41,3 +41,25 @@ __device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] >> 4]);
     }
 }
+
+// PTQ1_0 (143): a QK_K "ibs" unit is two 128-weight blocks; thread tid writes the 8 values [8*tid, 8*tid + 8),
+// which sit in one block.  Trit t of byte b = ((uint8)(b * 3^t) * 3) >> 8 (digit 0..2), value (digit - 1) * d.
+template<typename dst_t>
+__device__ void dq_ptq1_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const strata_block_ptq1_0* x = (const strata_block_ptq1_0*) vx + 2 * ibs + (tid >> 4);
+    const float d = __half2float(x->d);
+    const int e0 = (8 * tid) & 127;
+    dst_t* y = yy + 8 * tid;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int e = e0 + i;
+        uint8_t b;
+        int t;
+        if (e < 80) { b = x->qs[e & 15]; t = e >> 4; }
+        else if (e < 120) { b = x->qs[16 + ((e - 80) & 7)]; t = (e - 80) >> 3; }
+        else { b = x->qh[(e - 120) & 1]; t = (e - 120) >> 1; }
+        const int p3 = t == 0 ? 1 : t == 1 ? 3 : t == 2 ? 9 : t == 3 ? 27 : 81;
+        const int digit = ((int) (uint8_t) (b * p3) * 3) >> 8;
+        y[i] = cvt<dst_t>(d * (float) (digit - 1));
+    }
+}

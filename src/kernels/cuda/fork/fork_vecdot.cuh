@@ -99,3 +99,81 @@ __device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq
     }
     return e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds) * sumi;
 }
+
+// PTQ1_0 (type 143, llama-tq's group-128 ternary, 1.75 bpw; layout: include/strata/kernels/cpu/ptq1_0.hpp):
+// {-1,0,+1}*d, 5 trits per byte in qs[0..23], 4 in qh[0..1], fp16 d.  Element order: qs[m] (m < 16) trit t is
+// element 16t + m; qs[16+m] trit t is 80 + 8t + m; qh[h] trit t is 120 + 2t + h.  Trit t of byte b is
+// ((uint8)(b * 3^t) * 3) >> 8, a digit {0,1,2}.
+// The dot is llama-tq's vec_dot_ptq1_0_q8_1 (github.com/LL4nc33/llama-tq @52a37aec, ggml/src/ggml-cuda/vecdotq.cuh,
+// MIT): the whole 128-weight block per call, digits {0,1,2} through dp4a, the -1 folded in as
+// sum((q-1)*a) = sum(q*a) - sum(a) per q8_1 sub-block.
+constexpr int QK_PTQ1_0 = 128;
+struct strata_block_ptq1_0 {
+    uint8_t qs[24];
+    uint8_t qh[2];
+    half d;
+};
+static_assert(sizeof(strata_block_ptq1_0) == 28, "PTQ1_0 block is 28 bytes");
+
+__device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                     const int& kbx, const int& iqs) {
+    const strata_block_ptq1_0* bq = (const strata_block_ptq1_0*) vbq + kbx;
+    int sumi[4] = {0, 0, 0, 0};
+    int sumu[4] = {0, 0, 0, 0};
+    const uint32_t* qs32 = (const uint32_t*) bq->qs;   // 28-byte blocks of a 4-aligned row: 4-aligned
+    // qs[0..15]: element t*16 + m for trit t of byte m
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t packed = qs32[w];
+        uint32_t v_lo = __byte_perm(packed, 0, 0x4140);   // [b0, 0, b1, 0]
+        uint32_t v_hi = __byte_perm(packed, 0, 0x4342);   // [b2, 0, b3, 0]
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3u, w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int e = t * 16 + 4 * w;
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            const int q = __byte_perm(w_lo, w_hi, 0x7531);
+            sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+            sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+    // qs[16..23]: element 80 + t*8 + m
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+        const uint32_t packed = qs32[4 + w];
+        uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+        uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3u, w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int e = 80 + t * 8 + 4 * w;
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            const int q = __byte_perm(w_lo, w_hi, 0x7531);
+            sumi[e >> 5] = ggml_cuda_dp4a(q, u, sumi[e >> 5]);
+            sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+    // qh[0..1]: element 120 + t*2 + h
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        uint32_t v = bq->qh[h];
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = v * 3;
+            const int q = (int) (w >> 8);
+            v = w & 0xFF;
+            const int e = 120 + t * 2 + h;
+            const int a = (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
+            sumi[e >> 5] += q * a;
+            sumu[e >> 5] += a;
+        }
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[iqs + k].ds) * (float) (sumi[k] - sumu[k]);
+    return __half2float(bq->d) * acc;
+}

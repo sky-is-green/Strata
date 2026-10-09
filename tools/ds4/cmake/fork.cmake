@@ -40,6 +40,14 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     ${_strata_gpu_runtime_target})
 endif()
 
+if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND TARGET strata_kernels)
+  # PTQ1_0 ternary on the GPU (iq_mmvq / iq_dequant_f16, type 143) against the CPU kernels; skips without a device
+  add_executable(ptq1_0_cuda_test tests/cuda/ptq1_0_cuda_test.cpp)
+  target_include_directories(ptq1_0_cuda_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(ptq1_0_cuda_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME ptq1_0_cuda_test COMMAND ptq1_0_cuda_test)
+endif()
+
 # ---- ds4 reference forward pass (Phase 3) ---------------------------------
 # tools/ds4 is not part of the engine, but ds4_ref is the Phase-3 correctness oracle: a plain CPU ggml
 # graph that emits golden_dump-format activations for tools/ds4/compare_golden.py.  CPU-only, no CUDA.
