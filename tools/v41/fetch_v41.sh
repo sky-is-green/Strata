@@ -18,6 +18,8 @@ for f in json.load(open('.tree.json')):
     oid=(f.get('lfs') or {}).get('oid','')
     print(f"{f['path']}\t{f.get('size',0)}\t{oid}")
 PY
+[ -n "${ONLY:-}" ] && { grep -E -- "$ONLY" .files.tsv > .files.f || true; mv .files.f .files.tsv; }
+[ -n "${SKIP:-}" ] && { grep -v -E -- "$SKIP" .files.tsv > .files.f || true; mv .files.f .files.tsv; }
 need=$(awk -F'\t' '{s+=$2} END{printf "%.0f", s}' .files.tsv)
 have=$(du -sb . | cut -f1); free=$(df -B1 --output=avail . | tail -1)
 echo "$(date '+%F %T') $REPO: $(wc -l < .files.tsv) files, $((need/1000000000)) GB total, $((have/1000000000)) GB here, $((free/1000000000)) GB free"
