@@ -1,10 +1,13 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-09 ~22:55 by `strata-ds4-gpu`.
+**Last updated:** 2026-10-10 ~07:45 by `strata-ds4-gpu`.
 **Read order:** this file → [V41_PLAN.md](V41_PLAN.md) (design, V4→V4.1 deltas, all research) →
 [V41_FEASIBILITY.md](V41_FEASIBILITY.md) (sizes, speed estimates) → [RESEARCH_2026-10-09.md](RESEARCH_2026-10-09.md)
 (community ideas) → `../../V41_PLAN`-adjacent [../../RESEARCH](../RESEARCH_2026-10-09.md).
 **Repo:** `~/AI/Strata-DS4`, branch `deepseek4`. Local only — ahead of the public `ds4/main` at `924516a`.
+**Since 2026-10-10 `deepseek4` contains upstream Strata (merge `cc55d4c9`, upstream `fb58e0db`)**; pulling upstream is a
+plain `git merge upstream/main` — read [../UPSTREAM_SYNC.md](../UPSTREAM_SYNC.md) (process, gates, fork-isolation rules)
+before touching any file under `src/` or `include/`.
 **Nothing from this work is pushed;** push only when Mal says.
 
 ---
@@ -26,11 +29,11 @@
 > **3. Run the per-shard check on any newly verified shard:** `tools/v41/shard_check.py` (see §Built). Cheap, CPU-only,
 > but its weight-space errors do NOT rank experts (all identical) — validation only.
 >
-> **4. Continue the pipeline.** The calibration runner + GPTQ screening is BUILT and running (§Calibration pipeline):
-> check `tail /media/Crucial1TB/v41-calib/calib.log`; if the driver died, re-run
-> `setsid nohup bash tools/v41/calib_layers.sh 0 39 > /media/Crucial1TB/v41-calib/driver.out 2>&1 &` (resumes).
-> Run `python3 tools/v41/v41_alloc.py --layers 0-N` on finished layers for the tier map.  Next: GSQ refinement at
-> the chosen tier, the PTQ1_0 CUDA kernel, the GGUF writer, the Strata port (§Next steps).
+> **4. Continue the pipeline.** The calibration run is controlled with `tools/v41/calibctl.sh` (alias `v41calib`):
+> `v41calib status` (layers done, current layer, ETA) / `start` (resumes; done layers are skipped) / `stop` (after the
+> current layer) / `stop-now` / `log`.  **Mal decides when the GPU is used** — do not start it without his OK, and give
+> strata-glm GPU windows (stop after a layer, relay them, resume on their "GPU free").  Run
+> `python3 tools/v41/v41_alloc.py --layers 0-N [--per-proj]` on finished layers for the tier map.  Next: §Next steps.
 >
 > **Rules:** work solo (no conductor workers); measure before concluding; commit each verified step (Co-Authored-By
 > trailer); no pushes without Mal's OK. Never kill processes by a `pgrep -f` pattern that matches your own command
@@ -38,14 +41,16 @@
 
 ---
 
-## Status snapshot (2026-10-09 23:40)
+## Status snapshot (2026-10-10 07:45)
 
 | item | state |
 |---|---|
-| Download | shards 1–10 + 47 verified, 11–16 in flight, then 48 (~2 h), then 17–46. Tokenizer + index fetched separately (in the model dir with `.ok`) |
-| Calibration + GPTQ screening | **BUILT + GATED** (`2e442b20`, `317ef99a`): bit-exact vs DeepSeek's `Block.forward` on layers 0/1. Real run **queued**: `calib_layers.sh 0 39` (detached, pid 1591034), waits on the GPU lock + 38 GiB RAM + each shard |
-| Calibration data | `/media/Crucial1TB/v41-calib/`: 128 x 2048 tokens (web 61 / code 24 / chat 16 / zh 14 / sci 10 / de-es 3), 30 held-out sequences; fr/ja/pt never used (reserved for validation) |
-| Allocation map | `v41_alloc.py` ready; run it on whatever layers have stats (see §Calibration pipeline) |
+| Download | 42/48 shards verified (1-40 on Crucial1TB, 47 Crucible, 48 Team CX2); 41-46 in flight (~1 h) |
+| Calibration (chain on the agentic corpus) | **running**, layers 0-1 done, ~11.5 min/layer (Engram layers 1/14 ~2x), ~7.5 h of GPU left. `v41calib status` |
+| Calibration data | **agentic-first corpus** (2026-10-10): 32 x 8192 tokens = agentic_long 10 (Mal's Claude Code / Quetza session transcripts, secrets scrubbed) / agent 5 / code 6 / reason 4 / web 2 / zh 3 / chat 1 / multi 1; 6 held-out sequences; all chat/agent text rendered by DeepSeek's own V4.1 encoder. Old Pile 128x2048 run archived in `v41-calib/old-pile2048/` |
+| GPTQ damping | **1.0** (was 0.01: GPTQ overfit experts with fewer fit tokens than the 5120-wide Hessian and lost to RTN at depth; layer-8 sweep) |
+| Layer-0 map (new corpus) | per-proj: 383 ptq1 / 140 q2_0 / 245 q3_k slots at 2.25 bpw, proxy -39% vs all-Q2_0; down proj = 68% of an expert's Q2 error |
+| Engine | `deepseek4` = upstream Strata merged + fork isolation (`20618210`); p600 ppl 10.47, decode 19.5 tok/s (pre-merge 16.8-17.3) |
 | PTQ1_0 ternary | CPU done + tested (`50e9428d`); GPU kernel not started |
 | GSQ output pack | not started; target `/media/mal/SSD NVME` (163 GiB free) |
 
@@ -56,11 +61,16 @@
 - `tools/v41/v41_calib.py` — DeepSeek's `model.py` run **one layer at a time** straight from the HF shards.
   **Use DeepSeek's inference `config.json` (`~/AI/gsq-rco/dsv41-inference/config.json`)**: the HF one in the model dir
   is the transformers schema and silently leaves ModelArgs at its TINY defaults (caught; now cross-checked by assert).
-  - `prep` (CPU): tokenizes the mix (Pile-10k web/sci/Github, StackExchange as `<｜User｜>q<｜Assistant｜></think>a`,
-    local repo code, CJK .md files as zh, README.de/es), BOS per sequence, every 4th sequence per domain held out;
-    engram hash ids for all positions -> `hashes.npy` (needs the tokenizer: compressed vocab 99,092 checked).
+  - `tools/v41/build_corpus.py` (CPU, ~1 min) -> `v41-calib/corpus/*.jsonl`: session transcripts (Claude Code /
+    Quetza / GLM jsonl; longest prefix <= 8191 tokens; secrets scrubbed value-by-value; tool results clipped) and
+    antirez/ds4's 4690 imatrix prompts (V4 DSML parsed back into calls), all rendered by `dsv41_encoding.py`
+    (DeepSeek's V4.1 encoder, vendored: DSML tags have a LEADING SPACE in V4.1).  References + their provenance:
+    `docs/ds4/calib-refs/README.md`.
+  - `prep --n 32 --seq 8192 --corpus v41-calib/corpus` (CPU): packs the agentic-first mix (old Pile mix without
+    `--corpus`), BOS per sequence, stratified ~1/4 held out per domain; engram hash ids -> `hashes.npy`.
   - `init` (CPU): embedding (shard 2) -> `h/L00.bin` (10 GiB bf16, [128,2048,4,5120]).
-  - `layer L` (GPU, ~20 GB VRAM, ~20-25 GiB RAM): attention half for every batch (B=2) -> gate -> **expert-major**
+  - `layer L` (GPU, ~20 GB VRAM, ~20-25 GiB RAM): attention half per batch of ~4K tokens (1 x 8192; 2 x 8192 ran
+    out of the 24 GB card), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` -> gate -> **expert-major**
     MoE (each FP4 expert's reference `Expert.forward` once over all its tokens) -> **per-expert GPTQ** at
     ptq1/q2_0/q3_k (+RTN control) fitted on the 98 fit sequences, **error measured on the 30 held-out ones**:
     `e_<tier>` whole expert, `egu_<tier>` gate+up only, `edn_<tier>` down only, `rtn_<tier>`; plus REAP saliency
@@ -70,6 +80,9 @@
 - `tools/v41/v41_gptq.py` — exact-format grids: PTQ1_0 `{-1,0,1}·d`/128, Q2_0 `{-1,0,1,2}·d`/64 (d fp16, sign
   free), Q3_K `(q-4)·d·(sc-32)`/16 (fp16 d per 256, 6-bit sc).  Static diag(H)-weighted scale search (11 clip ratios x
   both signs), then stacked multi-tier GPTQ (no act-order).  Everything it outputs is exactly representable.
+- `tools/v41/calibctl.sh` (alias `v41calib`) drives `calib_layers.sh`: start/stop/stop-now/status/log; a layer is
+  done when `stats/LNN.json` exists; `STOP` file checked between layers; first start runs `init`.  `--damp` takes a
+  comma list for sweeps (`--screen-only TAG --expert-stride K` writes `stats/LNN_TAG.json` without touching the chain).
 - `tools/v41/calib_layers.sh FROM TO` — one memguard'd GPU block per layer behind `ds4-gpu.lock` (strata-glm slots in
   between), shard-gated (layer L = shard L+3; 47 for L=1, 48 for L=14), resumable, `--gc` keeps only 2 h files.
   Log `/media/Crucial1TB/v41-calib/calib.log`, per layer `logs/LNN.log`.  Restart = re-run the same command.
@@ -243,9 +256,12 @@ needs **shard 48**. Layer 0 needs no engram at all.
 
 - **b33:** DS4 V4 decodes 21.2 tok/s at both 256K and 512K (`--pos-offset` probe, `iq4_nl` KV); soft-prune neutral in
   the short probe — **needs a real 64K-document run** (prefill + decode, unpruned vs pruned).
-- **Strata upstream v0.1.41 merge:** worktree `~/AI/Strata-DS4-0141` (branch `ds4-on-0141`), 8 files / 14 hunks;
-  graft recipe in `RESEARCH_2026-10-09.md`; Mal undecided (full merge vs cherry-pick the q8_1 clamp fixes
-  #606/#1448).
+- **Strata upstream merge: DONE 2026-10-10** (Mal: keep tracking upstream).  Upstream main `fb58e0db` merged
+  (`cc55d4c9`), fork code isolated into `src/kernels/cuda/fork/` + `tools/ds4/cmake/` (`20618210`); gates in
+  `bench/upstream-merge-2026-10-10/`.  The old `~/AI/Strata-DS4-0141` worktree is obsolete.  Upstream features that
+  live in the Qwen engine path (Foresight swap / router look-ahead prefetch, prefill CPU share, MMVQ_IL rows table,
+  --expert-cache-per-layer) are worth porting into the DS4 path as ideas.  GLM is doing the same merge (branch
+  `glm-upstream`) and takes DS4's shared-file resolution.
 - **Ideas queued for DS4** (`RESEARCH_2026-10-09.md`): rank-gated `--arena-adapt` admission, persisted expert state,
   elastic KV / 32K VRAM KV window for 512K, adaptive MTP draft length, batched NVMe reads.
 - **MiMo-Audio 7B** was deleted at Mal's request (sources: `~/AI/Strata-MiMo/docs/mimo/MODEL_FILES.md`). He wants it
