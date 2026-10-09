@@ -63,7 +63,7 @@ import json, glob, sys
 w, n = sys.argv[1], int(sys.argv[2])
 secs = [json.load(open(p))["summary"].get("seconds", 0) for p in sorted(glob.glob(f"{w}/stats/L[0-9][0-9].json"))]
 if secs:
-    m = sum(secs[-5:]) / len(secs[-5:])
+    m = sorted(secs)[len(secs) // 2]   # median: the two Engram layers (1, 14) run ~2x and would skew a mean
     print(f"time per layer ~{m / 60:.1f} min; remaining {40 - n} layers ~{(40 - n) * m / 3600:.1f} h of GPU time")
 EOF
   tail -3 "$W/calib.log" | sed 's/^/  log: /'
