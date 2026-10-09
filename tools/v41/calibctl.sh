@@ -61,10 +61,13 @@ status)
   python3 - "$W" "$n" <<'EOF'
 import json, glob, sys
 w, n = sys.argv[1], int(sys.argv[2])
-secs = [json.load(open(p))["summary"].get("seconds", 0) for p in sorted(glob.glob(f"{w}/stats/L[0-9][0-9].json"))]
-if secs:
-    m = sorted(secs)[len(secs) // 2]   # median: the two Engram layers (1, 14) run ~2x and would skew a mean
-    print(f"time per layer ~{m / 60:.1f} min; remaining {40 - n} layers ~{(40 - n) * m / 3600:.1f} h of GPU time")
+done = {int(p[-7:-5]): json.load(open(p))["summary"].get("seconds", 0) for p in sorted(glob.glob(f"{w}/stats/L[0-9][0-9].json"))}
+ENGRAM = (1, 14)   # these layers also read the Engram tables: ~2x a normal layer
+normal = sorted(v for k, v in done.items() if k not in ENGRAM) or sorted(done.values())
+if normal:
+    m = normal[len(normal) // 2]
+    rest = sum((2 if L in ENGRAM else 1) * m for L in range(40) if L not in done)
+    print(f"time per layer ~{m / 60:.1f} min (Engram layers 1, 14 ~2x); remaining {40 - len(done)} layers ~{rest / 3600:.1f} h of GPU time")
 EOF
   tail -3 "$W/calib.log" | sed 's/^/  log: /'
   ;;
