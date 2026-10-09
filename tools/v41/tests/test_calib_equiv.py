@@ -13,7 +13,7 @@ L = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 dev = sys.argv[2] if len(sys.argv) > 2 else "cpu"
 tokens = np.load(C.wpath("tokens.npy"))
 N, S = tokens.shape
-B = 2
+B = max(1, 4096 // S)   # the same per-batch rule as v41_calib layer (shared attention state is per batch)
 torch.set_default_dtype(torch.bfloat16)
 args = C.model_args(B, S)
 layout = C.M.EngramLayout.from_args(args)
