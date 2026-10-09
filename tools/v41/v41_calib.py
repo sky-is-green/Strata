@@ -391,7 +391,7 @@ def cmd_layer(a):
     meta = json.load(open(wpath("meta.json")))
     tokens = np.load(wpath("tokens.npy"))
     N, S = tokens.shape
-    B = a.batch
+    B = a.batch or max(1, 4096 // S)   # ~4K tokens per attention batch (2 x 2048 or 1 x 8192 fit a 24 GB card)
     assert N % B == 0
     dev = a.device
     torch.set_default_dtype(BF16)
@@ -515,7 +515,7 @@ def main():
     p = sub.add_parser("prep"); p.add_argument("--n", type=int, default=128); p.add_argument("--seq", type=int, default=2048)
     p.add_argument("--corpus", default=None, help="build_corpus.py output dir (agentic-first V4.1 mix)")
     sub.add_parser("init")
-    p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=2)
+    p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=0, help="sequences per attention batch (0: ~4K tokens)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-gptq", action="store_true"); p.add_argument("--gptq-experts", type=int, default=NE); p.add_argument("--min-fit", type=int, default=32)
     p.add_argument("--gc", action="store_true", help="delete h/L-1 after success")

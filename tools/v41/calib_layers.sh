@@ -45,7 +45,7 @@ for L in $(seq "$1" "$2"); do
   stopped "$L"
   log "layer $L: start"
   echo "$L running" > "$W/current"
-  MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- nice -n 5 python3 tools/v41/v41_calib.py layer "$L" --gc ${EXTRA:-} \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- nice -n 5 python3 tools/v41/v41_calib.py layer "$L" --gc ${EXTRA:-} \
     > "$W/logs/L$N.log" 2>&1
   rc=$?
   log "layer $L: rc=$rc $(grep -E 'done in|Error|error' "$W/logs/L$N.log" | tail -1)"
