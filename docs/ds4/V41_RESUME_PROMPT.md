@@ -1,6 +1,10 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-10 ~09:05 by `strata-ds4-gpu`.
+
+**09:01 UPDATE:** calibration is ARMED, not stopped: `v41calib start-when-idle` (driver waits until the GPU lock is free +
+VRAM <3 GB for 15 min straight, i.e. strata-glm finished, then runs layers 7-39 + head unattended; CUDA OOM retries a layer
+2x). Check `v41calib status` / calib.log before doing anything; do NOT `start` again while it shows RUNNING.
 **Read order:** this file → [V41_PLAN.md](V41_PLAN.md) (design, V4→V4.1 deltas, all research) →
 [V41_FEASIBILITY.md](V41_FEASIBILITY.md) (sizes, speed estimates) → [RESEARCH_2026-10-09.md](RESEARCH_2026-10-09.md)
 (community ideas) → `../../V41_PLAN`-adjacent [../../RESEARCH](../RESEARCH_2026-10-09.md).

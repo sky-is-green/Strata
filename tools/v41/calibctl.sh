@@ -2,6 +2,7 @@
 # calibctl.sh - start / stop / check the V4.1 per-layer calibration run (alias: v41calib).
 #   v41calib start [FROM TO]  start (or resume) in the background, detached from the terminal; default layers 0..39.
 #                             Done layers are skipped, so `start` after any stop simply continues.
+#   v41calib start-when-idle  same, but the first layer waits until the GPU lock + VRAM stay free 15 min (IDLE_MIN)
 #   v41calib stop             graceful: finish the layer that is running, then exit (or exit at once if waiting)
 #   v41calib stop-now         kill the running layer immediately; that layer reruns from scratch on the next start
 #   v41calib status           running? which layer, progress, layers done, time per layer, ETA
@@ -16,7 +17,8 @@ running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
 done_layers() { for f in "$W"/stats/L[0-9][0-9].json; do [ -f "$f" ] || continue; n=${f##*/L}; echo $((10#${n%.json})); done | sort -n | tr '\n' ' '; }
 
 case "${1:-status}" in
-start)
+start|start-when-idle)
+  [ "$1" = start-when-idle ] && export IDLE_MIN=${IDLE_MIN:-15}
   if running; then echo "already running (driver pid $(cat "$PIDF")) - see: v41calib status"; exit 1; fi
   rm -f "$W/STOP"
   setsid nohup bash "$REPO/tools/v41/calib_layers.sh" "${2:-0}" "${3:-39}" >> "$W/logs/driver.log" 2>&1 < /dev/null &
@@ -75,6 +77,6 @@ log)
   tail -n 20 -f "$W/calib.log"
   ;;
 *)
-  sed -n 2,9p "$0"; exit 2
+  sed -n 2,10p "$0"; exit 2
   ;;
 esac
