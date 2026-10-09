@@ -53,8 +53,11 @@ Every conflict in the first merge was in an upstream file we had edited; our eng
 4. **Identical shared files across our forks.**  DS4 and GLM take the same resolution of every shared file, so
    neither fork re-resolves the other's drift.
 
-Footprint after the first merge (`git diff upstream/main --diff-filter=M --numstat -- src include CMakeLists.txt
-tools/*.py`): 21 upstream files, +727 / -90 lines, mostly `iq_kernels.cu` (fork GPU formats), `native_mmvq.cu`,
-`CMakeLists.txt` (fork targets) and `gguf_reader.hpp`.  Next isolation steps: fork GPU formats into a separate
-`.cuh`, fork CMake targets into `tools/<fork>/cmake/*.cmake`, DS4 GGUF accessors into a fork header, the DS4
-tokenizer pre-split into a subclass under `tools/ds4/`.
+Footprint (`git diff upstream/main --diff-filter=M --numstat -- src include CMakeLists.txt tools/*.py`): after the
+first merge 21 upstream files +727 / -90; after the isolation pass (`20618210`) +327 / -87.  Where fork code lives:
+`src/kernels/cuda/fork/*.cuh` (GPU formats/kernels, one `#include` each in `iq_kernels.cu` / `native_mmvq.cu`),
+`tools/ds4/cmake/fork.cmake` + `ggml_cuda.cmake` (every fork target; the root CMakeLists.txt has 5 added lines and no
+changed upstream line), `include/strata/artifact/ds4_guard.hpp`.  What stays inside upstream files on purpose: the
+SwiGLU clamp and per-model row widths in the CPU/GPU expert kernels (behaviour; default no-op), small switch-case
+additions for the fork formats, and two generic improvements worth offering upstream as PRs (the I16/I32/I64/MXFP4
+GGUF type entries, the tokenizer's multi-pattern pre-split).
