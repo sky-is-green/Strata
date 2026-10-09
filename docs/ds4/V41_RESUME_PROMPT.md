@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-10 ~08:00 by `strata-ds4-gpu`.
+**Last updated:** 2026-10-10 ~08:20 by `strata-ds4-gpu`.
 **Read order:** this file → [V41_PLAN.md](V41_PLAN.md) (design, V4→V4.1 deltas, all research) →
 [V41_FEASIBILITY.md](V41_FEASIBILITY.md) (sizes, speed estimates) → [RESEARCH_2026-10-09.md](RESEARCH_2026-10-09.md)
 (community ideas) → `../../V41_PLAN`-adjacent [../../RESEARCH](../RESEARCH_2026-10-09.md).
@@ -40,8 +40,7 @@ before touching any file under `src/` or `include/`.
 >   `setsid nohup bash tools/v41/fetch_sequence2.sh &` if no `fetch_v41`/`curl` is running and shards are missing.
 > - Worktree `~/AI/Strata-DS4-up`: `git status` - the PTQ1_0 GPU work may still be uncommitted there (§In flight).
 >
-> **3. Continue** with §Next steps.  Immediate items: (a) PTQ1_0 GPU test result -> commit, fast-forward
-> `deepseek4`; (b) the `head` CPU smoke test (§In flight); (c) when layers 0-39 + head are done: `v41_alloc.py --layers
+> **3. Continue** with §Next steps.  Immediate items: (a)/(b) PTQ1_0 GPU test + head smoke DONE 2026-10-10; (c) when layers 0-39 + head are done: `v41_alloc.py --layers
 > 0-39 --per-proj --out .../alloc_full.json`, report the tier map to Mal in plain terms; (d) then GSQ refinement +
 > the second (quantize) pass, GGUF writer, V4.1 engine port, validation vs an all-Q2_0 control.
 
@@ -57,8 +56,8 @@ before touching any file under `src/` or `include/`.
 | GPTQ damping | **1.0** (layer-8 sweep; 0.01 overfit) |
 | Layer-0 tier map (new corpus) | per-proj: 383 ptq1 / 140 q2_0 / 245 q3_k slots @ 2.25 bpw, proxy -39% vs all-Q2_0; per-expert 190/114/80, -24%; down proj = 68% of an expert's Q2 error; 3 rarely-routed experts floored at q2_0 |
 | Engine | `deepseek4` = upstream Strata `fb58e0db` merged (`cc55d4c9`) + fork isolation (`20618210`): p600 ppl 10.47, decode 19.55 tok/s (pre-merge 16.8-17.3) |
-| `head` gate | built (`5d99832d`), wired into `calib_layers.sh` after layer 39; CPU smoke test pending shard 43 |
-| PTQ1_0 ternary | CPU done (`50e9428d`); **GPU kernel written, building/testing in `~/AI/Strata-DS4-up` (uncommitted)** |
+| `head` gate | built (`5d99832d`), wired into `calib_layers.sh` after layer 39; CPU smoke passed (`e567a476`) |
+| PTQ1_0 ternary | CPU done (`50e9428d`); GPU grouped-expert kernels done + tested (`4a403b15`) |
 | GSQ refinement / quantize pass / GGUF writer / V4.1 engine port | not started |
 | GitHub | nothing pushed today; `Indras-Mirror/Strata-MiMo` **deleted** at Mal's request (local `~/AI/Strata-MiMo` kept, 10 unpushed commits) |
 
@@ -69,30 +68,18 @@ before touching any file under `src/` or `include/`.
 1. **Calibration driver** `calib_layers.sh 0 39` (pid in `/media/Crucial1TB/v41-calib/driver.pid`), detached via
    `calibctl`. Logs: `v41-calib/calib.log`, `v41-calib/logs/LNN.log`. It was started from the copy of
    `calib_layers.sh` BEFORE the head step was added, so after layer 39 run `v41calib start` again (head only).
-2. **PTQ1_0 GPU work (uncommitted, worktree `~/AI/Strata-DS4-up`, branch `ds4-upstream` = `deepseek4` + these):**
-   - `src/kernels/cuda/fork/fork_vecdot.cuh`: `strata_block_ptq1_0` (28 B) + `vec_dot_ptq1_0_q8_1` (port of llama-tq's
-     generic dot @52a37aec, MIT: whole 128-block per call, digits {0,1,2} via dp4a, -1 folded as sum(q*a) - sum(a)).
-   - `fork_fmt.cuh`: `Fmt<143>{qk 128, ipb 1, step 0}`; 143 added to `STRATA_{GU,D,MMVQ}_FMTS_FORK`.
-   - `fork_dq.cuh`: `dq_ptq1_0` (QK_K unit = 2 blocks, thread writes 8 values; trit t of byte b =
-     ((uint8)(b*3^t)*3)>>8).
-   - `iq_kernels.cu`: 3 one-line hooks (dq_dispatch case 143, `is_iq` hook, `iq_row_bytes` case 143).
-   - `tests/cuda/ptq1_0_cuda_test.cpp` + target in `tools/ds4/cmake/fork.cmake`: dequant f16 bit-exact vs
-     `ptq1_0_dequant`; `iq_mmvq(143)` vs an exact double reference from the same integers, 5120/2304 x 96, 1/2/4
-     columns, tolerance 2e-5 of max|out|.  **First run (08:01): dequant f16 bit-exact (16384/16384) = layout and trit
-     decoding are right; mmvq off by ~2e-4 relative = the TEST's reference used an fp32 activation scale while the
-     kernel reads it as fp16 from `block_q8_1.ds` - reference fixed (rounds d to fp16), rerun pending.**  If the rerun
-     still fails, compare against `ptq1_0_vec_dot_q8_0` on the CPU per block.  Committed as WIP on `ds4-upstream`
-     (NOT on `deepseek4` until the test passes).  Build clean; run it with
-     `flock ~/.quetza-data/conductor/ds4-gpu.lock ~/AI/Strata-DS4-up/build-gpu/ptq1_0_cuda_test` (needs the GPU for
-     ~1 s; the flock makes it wait for a gap between calibration layers).  If PASS: commit on `ds4-upstream`, then
-     `git -C ~/AI/Strata-DS4 merge --ff-only ds4-upstream`.  Not yet done: the grouped expert path
-     (`native_expert_grouped` with a 143 layout - it compiles through the FORK lists but is untested), a faster
-     4-part (ipb 4) dot for the 2304-wide down rows (ipb 1 leaves lanes idle: 18 blocks per row vs 32 lanes).
+2. **PTQ1_0 GPU: DONE + PASSED (`4a403b15`, on `deepseek4`).** `ptq1_0_cuda_test`: dequant f16 bit-exact
+   (16384/16384); `iq_mmvq(143)` worst 9.9e-8 relative vs the exact reference (the first run's ~2e-4 "fail" was the
+   test's fp32 activation scale; the kernel reads fp16).  Pieces: `strata_block_ptq1_0` + `vec_dot_ptq1_0_q8_1`
+   (fork_vecdot.cuh, llama-tq @52a37aec MIT), `Fmt<143>` in the FORK lists (fork_fmt.cuh), `dq_ptq1_0` (fork_dq.cuh),
+   3 hooks in iq_kernels.cu.  Rerun: `flock ~/.quetza-data/conductor/ds4-gpu.lock ~/AI/Strata-DS4-up/build-gpu/ptq1_0_cuda_test`.
+   **Still open:** `native_expert_grouped` with a 143 layout (compiles, untested); a 4-part (ipb 4) dot for the
+   2304-wide down rows (ipb 1 leaves lanes idle: 18 blocks per row vs 32 lanes).
    - Reference sources kept in `docs/ds4/calib-refs/llama-tq/` (`mmvq-ptq1_0.cuh` planar kernel, `vecdotq.cuh`).
-3. **`head` CPU smoke test** (scratch, may be gone after a reboot): `/tmp/claude-1000/.../scratchpad/headsmoke/run.sh`
-   waits for shard 43's `.ok`, then on a 4 x 256 Pile workdir runs prep/init/layer 0 (CPU) and `head --layer 1
-   --device cpu`; log `run.log`.  Only checks the code path (head on layer 1's output = meaningless ppl).  To redo by
-   hand: `V41_WORK=<tmpdir> HF_DATASETS_OFFLINE=1 python3 tools/v41/v41_calib.py prep --n 4 --seq 256 && ... init &&
+3. **`head` CPU smoke: PASSED 2026-10-10 08:08** (4 x 256 Pile workdir, layer 0 on CPU, `head --layer 1`; ppl ~1e7 is
+   expected on layer 1's output - code path only).  The first try died on `assert N % B == 0` (default batch 16 vs
+   N=4); fixed in `e567a476` (batch default = largest divisor of N <= 4096/S; the real 32 x 8192 run is unchanged).
+   Redo: `V41_WORK=<tmp> HF_DATASETS_OFFLINE=1 python3 tools/v41/v41_calib.py prep --n 4 --seq 256 && ... init &&
    OMP_NUM_THREADS=4 ... layer 0 --device cpu --gptq-experts 0 && ... head --layer 1 --device cpu`.
 4. **Download** `fetch_sequence2.sh` (pid 891182) + `fetch_v41.sh` (shards 42-46).
 5. **strata-glm** is merging upstream into GLM (branch `glm-upstream`, worktree `~/AI/Strata-GLM-um`), taking DS4's
