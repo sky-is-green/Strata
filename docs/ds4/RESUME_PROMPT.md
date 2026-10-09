@@ -1,3 +1,6 @@
+## RESUME HERE (2026-10-09 ~18:40) - the active work is DeepSeek-V4.1: read docs/ds4/V41_RESUME_PROMPT.md
+(handoff + paste-able prompt).  DS4 V4 open items are listed at its end.
+
 ## RESUME HERE (2026-10-09 ~17:15) - box shut down 06:09, NONE of the s37 plan ran yet
 Read `docs/ds4/RESEARCH_2026-10-09.md` (Infernix + Strata 0.1.41 ideas ranked for DS4).  Top picks before the GPU
 probes: rank-gated `--arena-adapt` admission (fixes topic-switch thrash), saving the adapted expert set as a warm-start
