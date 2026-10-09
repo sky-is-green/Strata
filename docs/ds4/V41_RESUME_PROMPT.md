@@ -2,7 +2,12 @@
 
 **Last updated:** 2026-10-10 ~09:05 by `strata-ds4-gpu`.
 
-**09:01 UPDATE:** calibration is ARMED, not stopped: `v41calib start-when-idle` (driver waits until the GPU lock is free +
+**09:04 UPDATE (supersedes 09:01):** the WHOLE chain runs unattended: `v41allday` (tools/v41/all_day.sh + alldayctl.sh,
+start|status|stop|log): calibration 7-39 + head -> v41_alloc tier map -> GGUF layout on SSD NVME/AI/V41-GSQ -> GSQ quant pass
+(mixed, in place) + its head gate.  All-Q2_0 control SKIPPED (Mal).  Resumable: rerun `v41allday start` after a failure/stop.
+Log /media/Crucial1TB/v41-calib/allday.log.
+
+(old) **09:01:** calibration is ARMED, not stopped: `v41calib start-when-idle` (driver waits until the GPU lock is free +
 VRAM <3 GB for 15 min straight, i.e. strata-glm finished, then runs layers 7-39 + head unattended; CUDA OOM retries a layer
 2x). Check `v41calib status` / calib.log before doing anything; do NOT `start` again while it shows RUNNING.
 **Read order:** this file → [V41_PLAN.md](V41_PLAN.md) (design, V4→V4.1 deltas, all research) →
