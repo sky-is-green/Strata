@@ -1,3 +1,10 @@
+## RESUME HERE (2026-10-09 ~17:15) - box shut down 06:09, NONE of the s37 plan ran yet
+Read `docs/ds4/RESEARCH_2026-10-09.md` (Infernix + Strata 0.1.41 ideas ranked for DS4).  Top picks before the GPU
+probes: rank-gated `--arena-adapt` admission (fixes topic-switch thrash), saving the adapted expert set as a warm-start
+profile, upstream-style elastic K/V / 32K VRAM KV window for 512K, adaptive MTP draft length.  Upstream v0.1.41 sync:
+worktree `~/AI/Strata-DS4-0141` (branch `ds4-on-0141`), 8 files / 14 conflict hunks, recipe in the research doc -
+Mal undecided between full merge and cherry-picking (q8_1 clamp fixes #606/#1448 are the must-haves).
+
 ## RESUME HERE (2026-10-09 ~06:10, after s36-s37) - read FINDINGS **s37** then s36, s35
 **Adaptive expert pruning works (s37).**  REAP saliency (ported from strata-glm) + **soft** pruning: 25% of experts
 (en+zh+code calibration) are kept out of VRAM and the RAM arena, stay routable with `--prune-penalty 0.5`, are read
