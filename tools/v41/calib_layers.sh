@@ -52,3 +52,11 @@ for L in $(seq "$1" "$2"); do
   [ $rc -eq 0 ] || exit $rc
 done
 log "layers $1..$2 finished"
+if [ "$2" = 39 ] && [ -f "$W/stats/L39.json" ] && [ ! -f "$W/stats/head_L40.json" ]; then   # end-of-chain gate
+  until flock -n "$LOCK" true && [ "$(awk '/^MemAvailable:/{print int($2/1048576)}' /proc/meminfo)" -ge "$NEED" ]; do
+    stopped 40; sleep 30; done
+  log "head: final norm + head on h/L40"
+  MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- nice -n 5 python3 tools/v41/v41_calib.py head \
+    > "$W/logs/head.log" 2>&1
+  log "head: rc=$? $(grep -E 'ALL/eval|Error' "$W/logs/head.log" | tail -1)"
+fi

@@ -509,12 +509,63 @@ def cmd_layer(a):
         f"out rms {summ['h_rms_out']:.3f}")
 
 
+def cmd_head(a):
+    """End-of-chain gate: last layer's hc_pre (pre/L.npy mix) -> final norm -> head on h/L (default 40 = after the
+    last block), next-token NLL / top-1 accuracy per domain and fit/held-out.  A broken layer anywhere in the chain
+    shows up here as a ppl far from the model's (Transformer.forward: h = hc_pre(h, pre_mix); head(norm(h)))."""
+    from safetensors import safe_open
+    meta = json.load(open(wpath("meta.json")))
+    tokens = np.load(wpath("tokens.npy"))
+    N, S = tokens.shape
+    L, dev = a.layer, a.device
+    torch.set_default_dtype(BF16)
+    args = model_args(1, S)
+    wm = weight_map()
+    with torch.device(dev):
+        norm = M.RMSNorm(D, args.norm_eps)
+    with safe_open(shard_file(wm["norm.weight"]), "pt") as f:
+        norm.weight.data.copy_(f.get_tensor("norm.weight"))
+    with safe_open(shard_file(wm["head.weight"]), "pt") as f:
+        W = f.get_tensor("head.weight").to(dev, torch.float32)       # ParallelHead keeps fp32
+    h_in = h_memmap(L, "r", N, S)
+    pre = np.load(wpath("pre", f"L{L:02d}.npy"))
+    res = {}
+    t0 = time.time()
+    with torch.inference_mode():
+        for i in range(N):
+            x = torch.from_numpy(np.asarray(h_in[i:i + 1])).to(dev).view(BF16)
+            pm = torch.from_numpy(pre[i:i + 1]).to(dev)
+            y = norm(torch.sum(pm.unsqueeze(-1) * x.float(), dim=2).to(BF16))[0]     # [S, D]
+            tgt = torch.from_numpy(tokens[i, 1:].astype(np.int64)).to(dev)
+            nll, hit = 0.0, 0
+            for c in range(0, S - 1, 1024):
+                lg = y[c:min(c + 1024, S - 1)].float() @ W.T
+                t = tgt[c:c + lg.shape[0]]
+                nll += float(F.cross_entropy(lg, t, reduction="sum"))
+                hit += int((lg.argmax(-1) == t).sum())
+            key = (meta["domains"][i], "eval" if meta["is_eval"][i] else "fit")
+            r = res.setdefault(key, [0.0, 0, 0])
+            r[0] += nll; r[1] += hit; r[2] += S - 1
+    out = {f"{d}/{k}": {"ppl": float(np.exp(v[0] / v[2])), "top1": v[1] / v[2], "tokens": v[2]} for (d, k), v in sorted(res.items())}
+    for k in ("fit", "eval"):
+        tot = [sum(v[j] for (d, kk), v in res.items() if kk == k) for j in range(3)]
+        if tot[2]:
+            out[f"ALL/{k}"] = {"ppl": float(np.exp(tot[0] / tot[2])), "top1": tot[1] / tot[2], "tokens": tot[2]}
+    os.makedirs(wpath("stats"), exist_ok=True)
+    json.dump({"layer": L, "seconds": round(time.time() - t0, 1), "by_domain": out},
+              open(wpath("stats", f"head_L{L:02d}.json"), "w"), indent=1)
+    for k, v in out.items():
+        log(f"head L{L}: {k:22s} ppl {v['ppl']:9.3f}  top1 {v['top1']:.3f}  ({v['tokens']} tokens)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prep"); p.add_argument("--n", type=int, default=128); p.add_argument("--seq", type=int, default=2048)
     p.add_argument("--corpus", default=None, help="build_corpus.py output dir (agentic-first V4.1 mix)")
     sub.add_parser("init")
+    p = sub.add_parser("head"); p.add_argument("--layer", type=int, default=40, help="h/L to read (40 = after the last block)")
+    p.add_argument("--device", default="cuda")
     p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=0, help="sequences per attention batch (0: ~4K tokens)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-gptq", action="store_true"); p.add_argument("--gptq-experts", type=int, default=NE); p.add_argument("--min-fit", type=int, default=32)
@@ -525,7 +576,7 @@ def main():
     p.add_argument("--screen-only", default=None, metavar="TAG",
                    help="write stats/LNN_TAG.json only; no h/pre/shared/route output, no --gc")
     a = ap.parse_args()
-    {"prep": cmd_prep, "init": cmd_init, "layer": cmd_layer}[a.cmd](a)
+    {"prep": cmd_prep, "init": cmd_init, "layer": cmd_layer, "head": cmd_head}[a.cmd](a)
 
 
 if __name__ == "__main__":
