@@ -391,7 +391,7 @@ def cmd_layer(a):
     meta = json.load(open(wpath("meta.json")))
     tokens = np.load(wpath("tokens.npy"))
     N, S = tokens.shape
-    B = a.batch or max(1, 4096 // S)   # ~4K tokens per attention batch (2 x 2048 or 1 x 8192 fit a 24 GB card)
+    B = a.batch or next(b for b in range(max(1, 4096 // S), 0, -1) if N % b == 0)   # ~4K tokens per attention batch (2 x 2048 or 1 x 8192 fit a 24 GB card), dividing N
     assert N % B == 0
     dev = a.device
     torch.set_default_dtype(BF16)
