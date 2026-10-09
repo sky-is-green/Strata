@@ -340,13 +340,31 @@ def load_block(blk, L):
 SHARED = ("compress_kv", "index_k", "topk_idxs", "candidates")
 
 
+ROWS = int(os.environ.get("V41_ROWS", "32768"))   # token rows per GPU call for a hot expert (OOM retries halve it)
+
+
 def expert_f(x, W1, W3, W2, g, lim):
-    """fp32 SwiGLU expert with the training clamps and the routing weight (as Expert.forward, no act quant)."""
+    """fp32 SwiGLU expert with the training clamps and the routing weight (as Expert.forward, no act quant).
+    Rows are independent: done ROWS at a time so a hot expert never needs a whole-batch intermediate."""
+    if len(x) > ROWS:
+        return torch.cat([expert_f(x[c:c + ROWS], W1, W3, W2, g[c:c + ROWS], lim) for c in range(0, len(x), ROWS)])
     gate = x @ W1.T
     up = x @ W3.T
     if lim > 0:
         up = up.clamp(-lim, lim); gate = gate.clamp(max=lim)
     return (F.silu(gate) * up * g) @ W2.T
+
+
+def act_hessians(xf, W1, W3, gf, lim):
+    """H1 = x^T x, H2 = a^T a (a = gated SwiGLU activation), accumulated ROWS at a time."""
+    H1 = torch.zeros((xf.shape[1], xf.shape[1]), dtype=torch.float32, device=xf.device)
+    H2 = torch.zeros((W1.shape[0], W1.shape[0]), dtype=torch.float32, device=xf.device)
+    for c in range(0, len(xf), ROWS):
+        x, g = xf[c:c + ROWS], gf[c:c + ROWS]
+        H1 += x.T @ x
+        a = F.silu((x @ W1.T).clamp(max=lim)) * (x @ W3.T).clamp(-lim, lim) * g
+        H2 += a.T @ a
+    return H1, H2
 
 
 def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
@@ -361,9 +379,7 @@ def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
         xv, gv, st["eval_on_fit"] = xf, gf, True
     do_gptq = st["n_fit"] >= min_fit
     if do_gptq:
-        H1 = xf.T @ xf
-        a = F.silu((xf @ W1.T).clamp(max=lim)) * (xf @ W3.T).clamp(-lim, lim) * gf
-        H2 = a.T @ a
+        H1, H2 = act_hessians(xf, W1, W3, gf, lim)
     else:                               # too few tokens for a Hessian: weight-space importance only
         H1 = torch.eye(D, device=xe.device); H2 = torch.eye(W2.shape[1], device=xe.device)
         st["lowdata"] = True
@@ -463,7 +479,7 @@ def cmd_layer(a):
                 continue
             xe, ge = X[tok], wts[tok, slot, None]
             # chunked: a hot expert (88K tokens at layer 6) OOMs the 24 GB card in one call; rows are independent
-            out = torch.cat([blk.ffn.experts[ex](xe[c:c + 32768], ge[c:c + 32768]) for c in range(0, len(tok), 32768)])
+            out = torch.cat([blk.ffn.experts[ex](xe[c:c + ROWS], ge[c:c + ROWS]) for c in range(0, len(tok), ROWS)])
             st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
             if hook is not None:        # v41_quant: quantize this expert; its output replaces the teacher's
                 out, extra = hook(L, ex, blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, out)

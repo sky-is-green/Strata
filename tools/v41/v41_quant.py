@@ -155,9 +155,7 @@ class Layer:
         n_fit = int(fit.sum())
         do = n_fit >= a.min_fit and ex < a.gptq_experts
         if do:
-            H1 = xf.T @ xf
-            act = torch.nn.functional.silu((xf @ W1.T).clamp(max=lim)) * (xf @ W3.T).clamp(-lim, lim) * gf
-            H2 = act.T @ act
+            H1, H2 = C.act_hessians(xf, W1, W3, gf, lim)
         else:
             H1 = torch.eye(C.D, device=xe.device)
             H2 = torch.eye(W2.shape[1], device=xe.device)

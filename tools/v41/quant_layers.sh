@@ -31,16 +31,22 @@ for L in $(seq "$FROM" "$TO"); do
       log "layer $L: input h/L$N.bin missing - cannot resume here (rerun from an earlier layer)"; exit 1
     fi
   fi
-  echo "$L waiting-gpu" > "$W/current"
-  gpu_wait "$L"
-  stopped "$L"
-  log "layer $L: start"
-  echo "$L running" > "$W/current"
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- \
-    nice -n 5 $Q layer "$L" --qwork "$W" --gc "$@" > "$W/logs/L$N.log" 2>&1
-  rc=$?
-  log "layer $L: rc=$rc $(grep -E 'quant L|done in|Error|error' "$W/logs/L$N.log" | tail -2 | tr '\n' ' ')"
-  [ $rc -eq 0 ] || exit $rc
+  for try in 1 2 3 4 5; do
+    rows=$((32768 >> (try - 1)))          # CUDA OOM: retry with half the rows per GPU call (V41_ROWS), up to 5 tries
+    echo "$L waiting-gpu" > "$W/current"
+    gpu_wait "$L"
+    stopped "$L"
+    log "layer $L: start (try $try, V41_ROWS=$rows)"
+    echo "$L running" > "$W/current"
+    V41_ROWS=$rows PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- \
+      nice -n 5 $Q layer "$L" --qwork "$W" --gc "$@" > "$W/logs/L$N.log" 2>&1
+    rc=$?
+    log "layer $L: rc=$rc $(grep -E 'quant L|done in|Error|error' "$W/logs/L$N.log" | tail -2 | tr '\n' ' ')"
+    [ $rc -eq 0 ] && break
+    grep -q "OutOfMemoryError\|CUDA out of memory" "$W/logs/L$N.log" || exit $rc
+    [ "$try" = 5 ] && { log "layer $L: OOM 5 times - giving up"; exit $rc; }
+    cp "$W/logs/L$N.log" "$W/logs/L$N.oom$try.log"; log "layer $L: OOM - retrying in 2 min with half the rows"; sleep 120
+  done
 done
 log "layers $FROM..$TO finished"
 if [ "$TO" = 39 ] && [ -f "$W/stats/L39.json" ] && [ ! -f "$W/stats/head_L40.json" ]; then

@@ -9,7 +9,7 @@
 #   shared GPU lock AND MemAvailable >= NEED_GIB, then runs under memguard (which holds the lock for that layer
 #   only, so strata-glm can slot in between layers).  Stops on failure.
 #   Also waits for <3 GB VRAM in use.  IDLE_MIN=N: the first layer starts only after the lock + GPU have stayed free
-#   N minutes (calibctl start-when-idle: wait for strata-glm to finish).  A CUDA OOM retries the layer twice (5 min apart).
+#   N minutes (calibctl start-when-idle: wait for strata-glm to finish).  A CUDA OOM retries the layer up to 4 more times, halving V41_ROWS each time.
 #   Log: $V41_WORK/calib.log (+ one log per layer in $V41_WORK/logs/).   Env: NEED_GIB=38 MAX_GIB=44 IDLE_MIN=0 EXTRA=""
 set -u
 cd /home/mal/AI/Strata-DS4
@@ -41,7 +41,8 @@ for L in $(seq "$1" "$2"); do
     if ! ok "$f"; then log "layer $L: waiting for $f"; echo "$L waiting-shard" > "$W/current"
       until ok "$f"; do stopped "$L"; sleep 60; done; fi
   done
-  for try in 1 2 3; do
+  for try in 1 2 3 4 5; do
+    rows=$((32768 >> (try - 1)))          # V41_ROWS per try: 32768, 16384, 8192, 4096, 2048
     echo "$L waiting-gpu" > "$W/current"
     if [ "$IDLE" -gt 0 ]; then log "layer $L: waiting for the GPU lock to stay free ${IDLE} min (strata-glm idle)"; fi
     free_since=""
@@ -56,17 +57,17 @@ for L in $(seq "$1" "$2"); do
     done
     IDLE=0                   # only the first layer waits for a sustained-idle GPU; later layers interleave per the lock
     stopped "$L"
-    log "layer $L: start (try $try)"
+    log "layer $L: start (try $try, V41_ROWS=$rows)"
     echo "$L running" > "$W/current"
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- nice -n 5 python3 tools/v41/v41_calib.py layer "$L" --gc ${EXTRA:-} \
+    V41_ROWS=$rows PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True MEMGUARD_ALLOW_COMFY=0 bash tools/ds4/memguard.sh "$MAX" "$NEED" -- nice -n 5 python3 tools/v41/v41_calib.py layer "$L" --gc ${EXTRA:-} \
       > "$W/logs/L$N.log" 2>&1
     rc=$?
     log "layer $L: rc=$rc $(grep -E 'done in|Error|error' "$W/logs/L$N.log" | tail -1)"
     [ $rc -eq 0 ] && break
     # unattended runs: a CUDA OOM (e.g. another process took VRAM) gets 2 more tries after a pause; anything else stops
     grep -q "OutOfMemoryError\|CUDA out of memory" "$W/logs/L$N.log" || exit $rc
-    [ "$try" = 3 ] && { log "layer $L: OOM 3 times - giving up"; exit $rc; }
-    cp "$W/logs/L$N.log" "$W/logs/L$N.oom$try.log"; log "layer $L: OOM - retrying in 5 min"; sleep 300
+    [ "$try" = 5 ] && { log "layer $L: OOM 5 times - giving up"; exit $rc; }
+    cp "$W/logs/L$N.log" "$W/logs/L$N.oom$try.log"; log "layer $L: OOM - retrying in 2 min with half the rows"; sleep 120
   done
 done
 log "layers $1..$2 finished"

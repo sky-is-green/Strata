@@ -32,8 +32,14 @@ if [ ! -f "$W/stats/head_L40.json" ]; then
   if ! { [ -f "$W/driver.pid" ] && kill -0 "$(cat "$W/driver.pid")" 2>/dev/null; }; then
     IDLE_MIN=0 tools/v41/calibctl.sh start >> "$LOG" 2>&1
   fi
-  pid=$(cat "$W/driver.pid")
-  while kill -0 "$pid" 2>/dev/null; do chk; sleep 60; done
+  for att in 1 2 3; do
+    pid=$(cat "$W/driver.pid")
+    while kill -0 "$pid" 2>/dev/null; do chk; sleep 60; done
+    { [ -f "$W/stats/L39.json" ] && [ -f "$W/stats/head_L40.json" ]; } && break
+    chk; [ "$att" = 3 ] && break
+    log "calibration driver exited early (attempt $att: $(tail -1 "$W/calib.log")) - restarting in 10 min"; sleep 600
+    IDLE_MIN=0 tools/v41/calibctl.sh start >> "$LOG" 2>&1
+  done
   [ -f "$W/stats/L39.json" ] || die "calibration stopped before layer 39 ($(tail -1 "$W/calib.log"))"
   [ -f "$W/stats/head_L40.json" ] || die "calibration head gate missing (logs/head.log)"
 fi
@@ -59,8 +65,11 @@ log "layout: $(ls -la "$GGUF" 2>&1)"; chk
 # 4. GSQ quantize pass (mixed) ---------------------------------------------------------------------------------------
 step "4/4 GSQ quantize pass (mixed map) -> $GGUF"
 if [ ! -f "$QMIX/stats/head_L40.json" ]; then
-  bash tools/v41/quant_layers.sh "$QMIX" 0 39 -- --map "$MAP" --gguf "$GGUF" >> "$LOG" 2>&1 \
-    || die "quant pass (mixed): $(tail -1 "$QMIX/quant.log")"
+  for att in 1 2 3; do
+    bash tools/v41/quant_layers.sh "$QMIX" 0 39 -- --map "$MAP" --gguf "$GGUF" >> "$LOG" 2>&1 && break
+    chk; [ "$att" = 3 ] && die "quant pass (mixed), 3 attempts: $(tail -1 "$QMIX/quant.log")"
+    log "quant pass exited early (attempt $att: $(tail -1 "$QMIX/quant.log")) - restarting in 10 min"; sleep 600
+  done
   [ -f "$QMIX/stats/head_L40.json" ] || { chk; die "quant pass (mixed) ended without head_L40.json"; }
 fi
 log "GSQ mixed pass complete"; chk
