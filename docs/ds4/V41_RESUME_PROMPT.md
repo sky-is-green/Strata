@@ -26,10 +26,11 @@
 > **3. Run the per-shard check on any newly verified shard:** `tools/v41/shard_check.py` (see §Built). Cheap, CPU-only,
 > but its weight-space errors do NOT rank experts (all identical) — validation only.
 >
-> **4. Continue the pipeline.** The immediate next task is **step 1: the calibration runner `tools/v41/v41_calib.py`**
-> (§Next steps has the full spec). Write it, smoke-test it on CPU (layer 0 needs only shards 2+3, no engram, no GPU),
-> then gate it against a reference before trusting it. Then per-expert GPTQ→GSQ (step 2), the PTQ1_0 CUDA kernel
-> (step 3), the GGUF writer (step 4), the Strata port (step 5).
+> **4. Continue the pipeline.** The calibration runner + GPTQ screening is BUILT and running (§Calibration pipeline):
+> check `tail /media/Crucial1TB/v41-calib/calib.log`; if the driver died, re-run
+> `setsid nohup bash tools/v41/calib_layers.sh 0 39 > /media/Crucial1TB/v41-calib/driver.out 2>&1 &` (resumes).
+> Run `python3 tools/v41/v41_alloc.py --layers 0-N` on finished layers for the tier map.  Next: GSQ refinement at
+> the chosen tier, the PTQ1_0 CUDA kernel, the GGUF writer, the Strata port (§Next steps).
 >
 > **Rules:** work solo (no conductor workers); measure before concluding; commit each verified step (Co-Authored-By
 > trailer); no pushes without Mal's OK. Never kill processes by a `pgrep -f` pattern that matches your own command
@@ -37,16 +38,49 @@
 
 ---
 
-## Status snapshot (2026-10-09 22:55)
+## Status snapshot (2026-10-09 23:40)
 
 | item | state |
 |---|---|
-| Download | **shards 1–10 verified** (+ config, mascot); **shard 11 in flight** (~3.7/7.4 GB). Next: 11–16, then 48, then 17–46 |
-| GPU | RTX 4090, **12.5/24.5 GB used, 15% util** — GLM (`glm_generate`, pid 1424967) holds ~12 GB under `ds4-gpu.lock` |
-| Calibration runner | **not written yet** (step 1) — this is the immediate next task |
-| PTQ1_0 ternary | **CPU done + tested** (commit `50e9428d`); GPU kernel not started |
-| GSQ output pack | not started; target drive `/media/mal/SSD NVME` (163 GiB free) |
-| Blocker | real calibration/GSQ needs a GPU block; the CPU smoke test does not |
+| Download | shards 1–10 + 47 verified, 11–16 in flight, then 48 (~2 h), then 17–46. Tokenizer + index fetched separately (in the model dir with `.ok`) |
+| Calibration + GPTQ screening | **BUILT + GATED** (`2e442b20`, `317ef99a`): bit-exact vs DeepSeek's `Block.forward` on layers 0/1. Real run **queued**: `calib_layers.sh 0 39` (detached, pid 1591034), waits on the GPU lock + 38 GiB RAM + each shard |
+| Calibration data | `/media/Crucial1TB/v41-calib/`: 128 x 2048 tokens (web 61 / code 24 / chat 16 / zh 14 / sci 10 / de-es 3), 30 held-out sequences; fr/ja/pt never used (reserved for validation) |
+| Allocation map | `v41_alloc.py` ready; run it on whatever layers have stats (see §Calibration pipeline) |
+| PTQ1_0 ternary | CPU done + tested (`50e9428d`); GPU kernel not started |
+| GSQ output pack | not started; target `/media/mal/SSD NVME` (163 GiB free) |
+
+---
+
+## Calibration + GPTQ screening pipeline (built 2026-10-09 23:00-23:40)
+
+- `tools/v41/v41_calib.py` — DeepSeek's `model.py` run **one layer at a time** straight from the HF shards.
+  **Use DeepSeek's inference `config.json` (`~/AI/gsq-rco/dsv41-inference/config.json`)**: the HF one in the model dir
+  is the transformers schema and silently leaves ModelArgs at its TINY defaults (caught; now cross-checked by assert).
+  - `prep` (CPU): tokenizes the mix (Pile-10k web/sci/Github, StackExchange as `<｜User｜>q<｜Assistant｜></think>a`,
+    local repo code, CJK .md files as zh, README.de/es), BOS per sequence, every 4th sequence per domain held out;
+    engram hash ids for all positions -> `hashes.npy` (needs the tokenizer: compressed vocab 99,092 checked).
+  - `init` (CPU): embedding (shard 2) -> `h/L00.bin` (10 GiB bf16, [128,2048,4,5120]).
+  - `layer L` (GPU, ~20 GB VRAM, ~20-25 GiB RAM): attention half for every batch (B=2) -> gate -> **expert-major**
+    MoE (each FP4 expert's reference `Expert.forward` once over all its tokens) -> **per-expert GPTQ** at
+    ptq1/q2_0/q3_k (+RTN control) fitted on the 98 fit sequences, **error measured on the 30 held-out ones**:
+    `e_<tier>` whole expert, `egu_<tier>` gate+up only, `edn_<tier>` down only, `rtn_<tier>`; plus REAP saliency
+    (`reap` = mean ||g f(x)||), counts, `y_energy`.  -> `stats/LNN.json`, `route/LNN.npz`, `h/L(N+1).bin`,
+    `pre/`, `shared/` (SharedAttentionRuntime per batch: source-layer compressed KV / index keys / top-k / candidates).
+  - Engram: `MemmapEngramEmbedding` replaces the 98 GB table with memmap row reads (MADV_RANDOM).
+- `tools/v41/v41_gptq.py` — exact-format grids: PTQ1_0 `{-1,0,1}·d`/128, Q2_0 `{-1,0,1,2}·d`/64 (d fp16, sign
+  free), Q3_K `(q-4)·d·(sc-32)`/16 (fp16 d per 256, 6-bit sc).  Static diag(H)-weighted scale search (11 clip ratios x
+  both signs), then stacked multi-tier GPTQ (no act-order).  Everything it outputs is exactly representable.
+- `tools/v41/calib_layers.sh FROM TO` — one memguard'd GPU block per layer behind `ds4-gpu.lock` (strata-glm slots in
+  between), shard-gated (layer L = shard L+3; 47 for L=1, 48 for L=14), resumable, `--gc` keeps only 2 h files.
+  Log `/media/Crucial1TB/v41-calib/calib.log`, per layer `logs/LNN.log`.  Restart = re-run the same command.
+- `tools/v41/v41_alloc.py [--layers 0-7] [--per-proj] [--out map.json]` — tier map: cost = held-out error / layer's
+  held-out routed energy (layers 0-1 and 37-39 x2), budget = all-Q2_0 bytes, Lagrangian bisection + greedy fill;
+  ternary <= 50%/layer; experts with < 8 held-out tokens floored at q2_0.  Prints per-layer tier counts, bpw,
+  GPTQ/RTN error ratios, and the proxy error of the mix vs all-Q2_0.
+- Tests: `tests/test_v41_gptq.py` (17/17), `tests/test_calib_equiv.py L` (split forward == reference; needs a smoke
+  workdir: `V41_WORK=<dir> v41_calib.py prep --n 4 --seq 256 && init && layer 0 --device cpu --gptq-experts 3`).
+- Known limits: the screening uses GPTQ init only (GSQ refinement is the next step, at the chosen tier); the
+  allocation proxy treats layers as equally important (validate end-to-end: ppl/KL needs shard 43 = head).
 
 ---
 
@@ -183,21 +217,10 @@ needs **shard 48**. Layer 0 needs no engram at all.
 
 ## Next steps (in order)
 
-1. **Calibration runner `tools/v41/v41_calib.py`** — the immediate task. Needs GPU blocks for the real run; CPU is
-   enough for a smoke test.
-   - `sys.path[:0] = [tools/v41/torch_kernels, ~/AI/gsq-rco/dsv41-inference]`; build DeepSeek's `Transformer`
-     **layer by layer**, loading each layer's tensors straight from its shard (safetensors mmap; **no** TP convert),
-     keeping FP8/FP4 storage. torch is **2.9.1** (not ≥2.10): it has `float4_e2m1fn_x2` + `float8_e8m0fnu` — enough;
-     experts can also be dequantized per expert via `kernel.dequant_fp4_weight`.
-   - Embed (shard 2) → for L in 0..39: **engram** (L=1 → shard 47, L=14 → shard 48; rows by safetensors offset,
-     **never** load the whole table) → Block L → save the MoE input (post `ffn_norm`), the routing (indices+weights),
-     and the block output (hc stream `[T,4,5120]`) to disk for the next layer.
-   - Calibration text: `tools/ds4/make_reap_prompts.py` (en + zh + code) + reasoning traces; start with ~64 × 2048
-     tokens for the smoke run, then 256–512 × 2048.
-   - **Gate it** like `ds4_ref`: compare final logits at a few positions against pfeifferj's patched llama.cpp or
-     DwarfStar on the same tokens, and check **routing agreement** (JigSawPT: the gate amplifies errors ~14×).
-   - Accumulate **REAP saliency** per (layer, expert) on the way (same formula as `tools/ds4` / Strata-GLM).
-2. **Per-expert GPTQ → GSQ** on the saved routed inputs. Quantizer modules from
+1. **Calibration runner + GPTQ screening — DONE (2026-10-09, see §Calibration pipeline).**  Remaining gate: once
+   shard 43 (head) and all layers are in, add a `head` step (final norm + head on h/L40) and check calibration ppl /
+   next-token accuracy per domain (a broken runner shows up there).  Then the allocation map over all 40 layers.
+2. **GSQ refinement at the chosen tier** (screening already gives the GPTQ init and the tier per expert). Quantizer modules from
    `~/AI/gsq-rco/GSQ/src/quantization` (2-bit grid = Q2_0 group 64; ternary group 128 = PTQ1_0; 3-bit → project onto
    Q3_K). Record each expert's activation-weighted error at all three widths (GPTQ init is cheap; run GSQ refinement
    only at the chosen width) → RCO-lite knapsack on `error × saliency` under the exact byte budget → second pass at the
