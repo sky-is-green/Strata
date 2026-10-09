@@ -97,3 +97,37 @@ tail AND with low ternary error (per-layer cap, e.g. <= 50% of a layer); first/l
 like s37: per-domain held-out ppl (en/zh/code + never-calibrated languages) vs an all-Q2_0 control and vs the FP4
 original on the same tokens.  The ternary tail overlaps the soft-prune set (rarely routed), so speed comes mostly
 from the Q3 side being worth it in quality at equal size.
+
+## Research round 2 (2026-10-09): ternary work and V4.1 forks on GitHub
+
+Ternary formats / kernels:
+- **PTQ1_0 (id 143) / PQ2_0 (id 142)** = Prism ML's group-128 ternary (Ternary-Bonsai-2-27B), implemented in
+  LL4nc33/llama-tq (MIT, CUDA mmvq + MMQ + FWHT) and merged upstream in ikawrakow/ik_llama.cpp #2550 (2026-09-29,
+  CPU, Hadamard per role, signs kept at runtime) + #2564 (8-row repack R8, Q8_K128 activations: PTQ1_0 tg 3.4x on
+  AVX2).  We use PTQ1_0's block bit-for-bit (tools: src/kernels/cpu/ptq1_0.cpp); our rotation metadata is our own.
+  Next CPU speedup = an R8-style interleaved repack at load time.
+- Mainline llama.cpp TQ1_0/TQ2_0 are CPU-only (no CUDA).  ik's IQ1_BN/IQ2_BN have no per-block scale (BitNet).
+- Ternary PTQ methods to compare against GSQ-ternary: IntelChina-AI/BitTern **CAT-Q** (ICML 2026 oral; has
+  Qwen3-30B-A3B / 235B-A22B MoE checkpoints + packed deployment), Kishon-zzx/**TWLA** (ICML'26; Kronecker orthogonal
+  rotation to make weights tri-modal), sg-systems-co/**FORGE** (offline-fused randomized Hadamard + GPTQ over a
+  ternary codebook, per-256 scale refit).  AngelSlim **STQ1_0** (Tencent Hy4-preview 770B MoE): 3:4-sparse
+  symmetric ternary experts at 2.38 bpw, CUDA kernels in their llama.cpp patches.
+- Common lesson across all of them: **rotate before ternarizing** (Hadamard / orthogonal), then a second-order
+  (GPTQ-style) solve over the ternary grid with the scale refit after compensation.
+
+V4.1 runtimes:
+- **sybil-solutions/dsv41-flash-offload** (MIT): 1x RTX 3090 + 503 GiB 8-channel DDR4 + EPYC 24c: EXL3 3.0 bpw,
+  decode 19.3/24.0/26.6 tok/s at 1/2/4 streams, prefill 690-790 tok/s up to 261K.  ALL experts pinned in host RAM;
+  VRAM expert hit rate only ~0.41, the AVX2 CPU tier carries the misses (needs their ~150 GB/s RAM; ours ~30).
+  Worth taking: elastic VRAM expert cache (prefill borrows slots, decode gets them back), staged-DMA prefill with
+  FP16 GEMM for busy experts (fidelity: top-1 0.9856 vs 0.988 guard), cross-layer DMA prefetch, exact prefix cache
+  (131K-token cached turn: TTFT 200.8 s -> 0.76 s).
+- **JigSawPT/deepseek-v41-flash-on-5090** (llama.cpp fork `dsv41-porte`, MIT): 5.12 tok/s new content / 21.27
+  resident on a 5090 + 125.7 GiB RAM (269 GiB MXFP4 experts streamed: 18 GiB VRAM + 72 GiB RAM tiers + NVMe).
+  **Port defect to avoid: V4.1 has NO per-head RMS norm on q** (V4 has; keeping it gave fluent text but layer-39
+  correlation 0.78).  Floors vs the FP8/FP4 reference: fp8 linear 0.99990, window KV 0.99961, fp4 compressed latent
+  0.9946, fp4 indexer q/k 0.9877; the MoE gate amplifies small errors 14x (routing flips) - gate goldens on routing
+  agreement, not only cosine.  Also has engram prefetch and a DSpark draft GGUF.
+- Others: rexlunae/ds4-convert (streaming safetensors -> deepseek41 GGUF), helgard-orlm (8 GB GPU, 1.6 tok/s
+  disk-only), 05yuki (dual EPYC + 2x 5070 Ti), vcruz305 (llama.cpp deepseek41 conversion recipe), pfeifferj's
+  runtime patch (oracle).
