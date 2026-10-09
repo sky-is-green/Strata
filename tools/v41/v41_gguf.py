@@ -4,6 +4,9 @@ FP8/FP4 shards (CPU only, streaming, resumable).
     python3 tools/v41/v41_gguf.py --out DIR/V41-GSQ.gguf --experts QDIR            # the real export
     python3 tools/v41/v41_gguf.py --out DIR/V41-Q2.gguf --rtn q2_0                  # RTN control / fallback
     python3 tools/v41/v41_gguf.py --out ... --rtn-map alloc.json                    # RTN at a v41_alloc tier map
+    python3 tools/v41/v41_gguf.py --out ... --rtn-map alloc.json --experts-in-place --no-engram
+                         # the final file without a QDIR copy: dense + type maps now, expert regions left as holes
+                         # (+ <shard>.experts.json offsets) that v41_quant.py layer --gguf fills layer by layer
     python3 tools/v41/v41_gguf.py --verify DIR/V41-GSQ-00001-of-00002.gguf [--experts QDIR | --rtn ...]
     options: --layers A-B (partial file: globals + those blocks; tests), --no-engram, --engram-rows N (tests),
              --engram-dir D (shard 2 written there, symlinked next to shard 1), --threads N, --dry-run
@@ -363,6 +366,33 @@ class ExpertRTN:
         return F.encode_rtn(W, dn[e] if role == "down" else gu[e]).tobytes()
 
 
+class ExpertHoles(ExpertRTN):
+    """--experts-in-place: the tiers of --rtn / --rtn-map, but no payload - each expert region is left as a hole for
+    v41_quant.py --gguf to fill at the offsets in <shard>.experts.json."""
+
+    def ident(self):
+        return "inplace:" + super().ident()
+
+    def get(self, L, e, role, src):
+        raise RuntimeError("in-place experts have no payload here")
+
+
+def experts_json(path, hdr_len, plan):
+    """<shard>.experts.json: per layer the types and each expert's absolute (gate, up, down) byte offsets."""
+    out = {}
+    for t in plan:
+        if t.kind != "experts":
+            continue
+        lay = out.setdefault(str(t.layer), {"gu_type": [0] * 384, "d_type": [0] * 384, "off": {}})
+        per = t.nbytes // len(t.experts)
+        for k, e in enumerate(t.experts):
+            lay["d_type" if t.role == "down" else "gu_type"][e] = t.qtype
+            lay["off"].setdefault(str(e), {})[t.role] = hdr_len + t.offset + k * per
+    tmp = path + ".experts.json.tmp"
+    json.dump({"file": os.path.basename(path), "layers": out}, open(tmp, "w"))
+    os.replace(tmp, path + ".experts.json")
+
+
 _W = {}
 
 
@@ -476,6 +506,9 @@ def write_shard(path, tensors, records, src, provider, threads, ident):
                     parts = [np.asarray(t.experts, np.int32).tobytes()]
                 elif t.kind == "engram":
                     parts = engram_chunks(src, t)
+                elif isinstance(provider, ExpertHoles):   # filled later by v41_quant.py --gguf
+                    fp.seek(t.nbytes, 1)
+                    parts, n = [], t.nbytes
                 else:
                     jobs = [(t.layer, e, t.role) for e in t.experts]
                     if isinstance(provider, ExpertRTN) and threads > 1:
@@ -503,6 +536,8 @@ def write_shard(path, tensors, records, src, provider, threads, ident):
         finally:
             if pool is not None:
                 pool.shutdown(cancel_futures=True)
+    if isinstance(provider, ExpertHoles):
+        experts_json(path, len(hdr), tensors)
     os.rename(partial, path)
     os.unlink(journal)
 
@@ -578,6 +613,8 @@ def verify(p1, src, provider, cfg, layers, sample=3):
                 f.seek(base + off)
                 if list(np.frombuffer(f.read(t.nbytes), np.int32)) != list(t.experts):
                     bad.append(f"{name}: type map differs")
+            elif t.kind == "experts" and isinstance(provider, ExpertHoles):
+                pass   # payload written by the quantize pass; tests/check_v41_gguf.py --fp4 checks it
             elif t.kind == "experts":
                 per = t.nbytes // len(t.experts)
                 for k in sorted({0, len(t.experts) - 1, int(rng.integers(len(t.experts)))})[:sample]:
@@ -612,6 +649,8 @@ def main():
     g.add_argument("--experts")
     g.add_argument("--rtn", choices=list(F.TIER_TYPE))
     ap.add_argument("--rtn-map")
+    ap.add_argument("--experts-in-place", action="store_true",
+                    help="leave the expert regions as holes (tiers from --rtn / --rtn-map) for v41_quant.py --gguf")
     ap.add_argument("--layers")
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--engram-rows", type=int)
@@ -627,7 +666,7 @@ def main():
         provider = ExpertDir(a.experts, c["hidden_size"], c["moe_intermediate_size"])
     else:
         amap = json.load(open(a.rtn_map))["map"] if a.rtn_map else None
-        provider = ExpertRTN(a.rtn or "q2_0", amap, c["n_routed_experts"])
+        provider = (ExpertHoles if a.experts_in_place else ExpertRTN)(a.rtn or "q2_0", amap, c["n_routed_experts"])
     if a.verify:
         n, bad = verify(a.verify, src, provider, cfg, layers)
         print(f"verify: {n} tensors checked, {len(bad)} problems")

@@ -7,7 +7,7 @@
   3. dense: Q8_0 / F16 / F32 tensors decoded and compared with the source's dequantized FP8 / BF16 values;
   4. Engram: sampled rows == the source FP8 row + its 8 E8M0 scales.
 
-    python3 tools/v41/tests/check_v41_gguf.py SHARD1.gguf --experts QDIR [--layers 0-1]
+    python3 tools/v41/tests/check_v41_gguf.py SHARD1.gguf [--experts QDIR] [--fp4 N] [--layers 0-1]
 """
 import argparse
 import json
@@ -25,7 +25,9 @@ import v41_gguf as W  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("gguf")
-    ap.add_argument("--experts", required=True)
+    ap.add_argument("--experts", help="QDIR the experts came from (byte comparison)")
+    ap.add_argument("--fp4", type=int, default=0, metavar="N",
+                    help="decode N sampled experts per layer and compare with the FP4 source (any expert source)")
     ap.add_argument("--layers", default="0-1")
     a = ap.parse_args()
     bad = []
@@ -57,7 +59,7 @@ def main():
 
     x, y = map(int, a.layers.split("-"))
     nexp = 0
-    for L in range(x, y + 1):
+    for L in (range(x, y + 1) if a.experts else []):
         j = json.load(open(os.path.join(a.experts, f"L{L:02d}.json")))
         gu_f = T.get(f"blk.{L}.ffn_exps_gu_type")
         dn_f = T.get(f"blk.{L}.ffn_exps_down_type")
@@ -83,7 +85,35 @@ def main():
                     if T[name][1] != t or read(name, slot * per, per) != qf.read(per):
                         bad.append(f"L{L} expert {e} {role}: bytes differ (tensor {name} slot {slot})")
                     nexp += 1
-    print(f"2. experts: {nexp} expert matrices compared")
+    print(f"2. experts: {nexp} expert matrices compared with the QDIR")
+    # 2b. decoded experts vs the FP4 source: weight-space rel error must look like a quantization of THAT expert
+    #     (RTN/GPTQ: ~0.15 q3_k, ~0.35 q2_0, ~0.48 ptq1; a hole or a wrong slot decodes to ~1 or more)
+    LIM = {F.Q3_K: 0.30, F.Q2_0: 0.50, F.PTQ1_0: 0.65}
+    for L in (range(x, y + 1) if a.fp4 else []):
+        tmaps = {}
+        for key in ("gu", "down"):
+            nm = f"blk.{L}.ffn_exps_{key}_type"
+            tmaps[key] = np.frombuffer(read(nm, 0, 384 * 4), np.int32) if nm in T else None
+        worst = {}
+        for e in sorted({0, 383, *rng.integers(384, size=a.fp4).tolist()})[: a.fp4 + 2]:
+            for role, w in (("gate", "w1"), ("up", "w3"), ("down", "w2")):
+                tmap = tmaps["down" if role == "down" else "gu"]
+                if tmap is None:
+                    name, slot = f"blk.{L}.ffn_{role}_exps.weight", e
+                    t = T[name][1]
+                else:
+                    t = int(tmap[e])
+                    name = f"blk.{L}.ffn_{role}_exps.{F.TYPE_NAME[t].lower()}.weight"
+                    slot = int(np.sum(tmap[:e] == t))
+                shape = T[name][0]
+                per = F.nbytes(t, shape[:2])
+                got = F.decode(t, read(name, slot * per, per), shape[0] * shape[1])
+                want = src.f32(f"layers.{L}.ffn.experts.{e}.{w}.weight").reshape(-1)
+                rel = float(np.linalg.norm(got - want) / np.linalg.norm(want))
+                worst[F.TYPE_NAME[t]] = max(worst.get(F.TYPE_NAME[t], 0), rel)
+                if not rel < LIM[t]:
+                    bad.append(f"L{L} expert {e} {role} ({F.TYPE_NAME[t]}): rel {rel:.3f} vs FP4 source")
+        print(f"2b. L{L} experts vs FP4 source, worst rel per type: " + ", ".join(f"{k} {v:.3f}" for k, v in sorted(worst.items())))
     dense = [("output_norm.weight", "norm.weight"), ("token_embd.weight", "embed.weight"),
              ("blk.0.attn_q_a.weight", "layers.0.attn.wq_a.weight"), ("blk.0.attn_output_b.weight", "layers.0.attn.wo_b.weight"),
              ("blk.0.ffn_down_shexp.weight", "layers.0.ffn.shared_experts.w2.weight"),

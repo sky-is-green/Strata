@@ -455,6 +455,7 @@ def cmd_layer(a):
         is_eval_tok = torch.tensor(meta["is_eval"], device=dev).repeat_interleave(S)
         Y = torch.zeros((T, D), dtype=torch.float32, device=dev)
         stats, lim = {}, args.swiglu_limit
+        hook = getattr(a, "expert_hook", None)
         for ex in range(NE):
             tok, slot = torch.where(idx == ex)
             if len(tok) == 0:
@@ -462,14 +463,19 @@ def cmd_layer(a):
                 continue
             xe, ge = X[tok], wts[tok, slot, None]
             out = blk.ffn.experts[ex](xe, ge)
-            Y.index_add_(0, tok, out.float())
             st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
+            if hook is not None:        # v41_quant: quantize this expert; its output replaces the teacher's
+                out, extra = hook(L, ex, blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, out)
+                st.update(extra)
+            Y.index_add_(0, tok, out.float())
             if not a.no_gptq and ex < a.gptq_experts and ex % a.expert_stride == 0:
                 st.update(screen_expert(blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, a.min_fit, a.damps))
             stats[ex] = st
             if ex % 64 == 63:
                 log(f"layer {L}: experts {ex + 1}/{NE} ({time.time() - t2:.0f} s)")
         routed_energy = float(Y.square().sum())
+        if getattr(a, "moe_done_hook", None) is not None:   # v41_quant: experts no token reached, write the layer
+            a.moe_done_hook(L, blk, stats)
         for c in range(0, T, 65536):
             Y[c:c + 65536] += blk.ffn.shared_experts(X[c:c + 65536])
         log(f"layer {L}: MoE{'' if a.no_gptq else ' + GPTQ screening'} in {time.time() - t2:.0f} s")
