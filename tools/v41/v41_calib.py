@@ -462,7 +462,8 @@ def cmd_layer(a):
                 stats[ex] = {"n": 0}
                 continue
             xe, ge = X[tok], wts[tok, slot, None]
-            out = blk.ffn.experts[ex](xe, ge)
+            # chunked: a hot expert (88K tokens at layer 6) OOMs the 24 GB card in one call; rows are independent
+            out = torch.cat([blk.ffn.experts[ex](xe[c:c + 32768], ge[c:c + 32768]) for c in range(0, len(tok), 32768)])
             st = {"n": len(tok), "gsum": float(ge.sum()), "reap": float(out.float().norm(dim=-1).mean())}
             if hook is not None:        # v41_quant: quantize this expert; its output replaces the teacher's
                 out, extra = hook(L, ex, blk.ffn.experts[ex], xe, ge, ~is_eval_tok[tok], lim, out)

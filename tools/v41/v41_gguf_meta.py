@@ -129,6 +129,7 @@ def metadata(hf_dir, name, source_url):
     if any(t is None for t in tokens):
         raise ValueError("tokenizer has missing IDs")
     special = {item["id"] for item in tok["added_tokens"] if item["special"]}
+    added = {item["id"] for item in tok["added_tokens"]}   # not special (<｜System｜>, <｜User｜>, ...): USER_DEFINED
     merges = [" ".join(pair) if isinstance(pair, list) else pair for pair in tok["model"]["merges"]]
     records = [
         kv_string("general.architecture", "deepseek41"),
@@ -147,7 +148,8 @@ def metadata(hf_dir, name, source_url):
         kv_string("tokenizer.ggml.model", "gpt2"),
         kv_string("tokenizer.ggml.pre", "joyai-llm"),
         array_record("tokenizer.ggml.tokens", GGUF_STRING, tokens),
-        array_record("tokenizer.ggml.token_type", GGUF_INT32, [3 if i in special else 1 for i in range(len(tokens))]),
+        array_record("tokenizer.ggml.token_type", GGUF_INT32, [3 if i in special else 4 if i in added else 1
+                                                                  for i in range(len(tokens))]),
         array_record("tokenizer.ggml.merges", GGUF_STRING, merges),
         kv_u32("tokenizer.ggml.bos_token_id", config["bos_token_id"]),
         kv_u32("tokenizer.ggml.eos_token_id", config["eos_token_id"]),

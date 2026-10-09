@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-10 ~09:00 by `strata-ds4-gpu`.
+**Last updated:** 2026-10-10 ~09:05 by `strata-ds4-gpu`.
 **Read order:** this file → [V41_PLAN.md](V41_PLAN.md) (design, V4→V4.1 deltas, all research) →
 [V41_FEASIBILITY.md](V41_FEASIBILITY.md) (sizes, speed estimates) → [RESEARCH_2026-10-09.md](RESEARCH_2026-10-09.md)
 (community ideas) → `../../V41_PLAN`-adjacent [../../RESEARCH](../RESEARCH_2026-10-09.md).
@@ -40,6 +40,11 @@ before touching any file under `src/` or `include/`.
 >   `setsid nohup bash tools/v41/fetch_sequence2.sh &` if no `fetch_v41`/`curl` is running and shards are missing.
 > - Worktree `~/AI/Strata-DS4-up`: `git status` - the PTQ1_0 GPU work may still be uncommitted there (§In flight).
 >
+> **2b. FIRST: the calibration is STOPPED (7/40 layers) - the GPU was handed to strata-glm at Mal's request.**
+> Restart with `v41calib start` ONLY when strata-glm relays "GPU free" or Mal says so (it resumes at layer 7;
+> layer 7's first try OOM'd on a hot expert, fixed in this commit by chunking the expert forward - watch layer 7
+> finish: `v41calib status`, `tail /media/Crucial1TB/v41-calib/logs/L07.log`).
+>
 > **3. Continue** with §Next steps.  Built 2026-10-10: PTQ1_0 GPU (all 9 tier pairs in the grouped kernel), GGUF
 > writer, quantize pass + driver (§Export pipeline).  When calibration layers 0-39 + head are done: `v41_alloc.py
 > --layers 0-39 --per-proj --out /media/Crucial1TB/v41-calib/alloc_full.json`, report the tier map to Mal in plain
@@ -52,7 +57,7 @@ before touching any file under `src/` or `include/`.
 | item | state |
 |---|---|
 | Download | **complete**: 48/48 verified (1-46 on Crucial1TB, 47 Crucible, 48 Team CX2) |
-| Calibration | **running** on the agentic corpus: layers 0-2 done, ~11.5 min/layer (Engram layers 1/14 ~2x), ~7 h of GPU left. `v41calib status` |
+| Calibration | **STOPPED at 7/40 for strata-glm** (Mal 09:00); layer 7 OOM'd 08:55 (hot expert, 88K tokens at L6) - fixed (chunked expert forward); ~6.5 h of GPU left. `v41calib start` when the GPU is handed back |
 | Calibration data | agentic-first corpus, 32 x 8192 tokens (§Calibration pipeline); old Pile run archived in `v41-calib/old-pile2048/` (biased stats: damp 0.01) |
 | GPTQ damping | **1.0** (layer-8 sweep; 0.01 overfit) |
 | Layer-0 tier map (new corpus) | per-proj: 383 ptq1 / 140 q2_0 / 245 q3_k slots @ 2.25 bpw, proxy -39% vs all-Q2_0; per-expert 190/114/80, -24%; down proj = 68% of an expert's Q2 error; 3 rarely-routed experts floored at q2_0 |
@@ -94,6 +99,17 @@ before touching any file under `src/` or `include/`.
 ---
 
 ## Session log 2026-10-10 (what changed and why)
+
+- **Afternoon session (08:05-09:05), all committed:** PTQ1_0 GPU test passed (the earlier "fail" was the test's fp32
+  scale); grouped-kernel test over all 9 tier pairs; `v41_formats.py` (bit-exact encoders); GGUF writer (DwarfStar
+  names, per-expert tiers, split Engram shard); quantize pass + driver; writer `--experts-in-place` (no QDIR copy:
+  peak disk = the final file); independent checker.  Mal's decisions: **no Engram copy** (engine reads it from HF
+  shards 47/48 - keep them), the control pass writes no weights, final file on SSD NVME (163 GiB free; 152 GiB
+  needed), serve V4.1 exactly like `~/.local/bin/strata-glm-quetza` (§Serving).  **Bug found + fixed: tokenizer
+  types** - 54 added-but-not-special tokens (<｜System｜>, <｜User｜>, <｜Assistant｜>, ...) must be type 4
+  (USER_DEFINED), not 1, or they tokenize as text (389/394 texts wrong -> 0/394 after; also fixed in the GGUF meta).
+  Mal asked (answered): RCO/GSQ from the native-FP4 experts IS viable (FP4 is the trained model; 4.25 -> 2.25 bpw;
+  GPTQ beats RTN 0.58/0.70/0.74; the head gate on the quantized chain vs the all-Q2_0 control decides).
 
 - **GPTQ overfit found and fixed.**  Layers 0-7 on the old Pile corpus: from layer 1 on, experts with fewer fit tokens
   than the median were WORSE than RTN on held-out data (q3 ratio up to 1.43): most experts see ~2.5K fit tokens but
@@ -204,6 +220,38 @@ mixed -> `blk.L.ffn_<role>_exps.<q2_0|q3_k|ptq1_0>.weight` (experts of that type
 `blk.L.ffn_exps_{gu,down}_type[384]` (slot = rank among the experts of the same type).  Gate+up share a type.
 Dense: DwarfStar's names/types (`deepseek41_quantize.py` @fc80bd6): Q8_0 attention / shared / head (rel 5.4e-3 vs
 FP8), F16 embedding / compressor / indexer / Engram wkv, F32 norms / router / mHC.  mtp.* (DSpark) not exported yet.
+
+## Serving (Mal 2026-10-10: "we'll be running deepseek like `~/.local/bin/strata-glm-quetza`")
+
+Copy GLM's shape exactly (`~/AI/Strata-GLM/tools/glm/serve/`, its RESUME_PROMPT.md "Serving plumbing" + "Metrics"):
+engine `ds41_generate --serve` (Strata's engine line protocol, docs/BATCHING.md §Engine protocol + GEN/GENI) ->
+launcher `tools/v41/serve/ds41-engine.sh` (copy glm-engine.sh: ComfyUI refusal, `flock` the shared GPU lock for the
+server's life, `systemd-run --scope MemoryMax=84G MemorySwapMax=0`) -> shim `tools/v41/serve/serve_ds41.py` that
+imports **`~/AI/Strata/serve`** (that checkout has the llama.cpp-style metrics: `/metrics`, `/slots`,
+`?format=prometheus` -> `llamacpp:*` + `strata:*`; commit 9bb510c8 is LOCAL - its remote is upstream Niko1221,
+NEVER push it) and runs under `/home/mal/AI/Strata/.venv/bin/python` -> configs `tools/v41/serve/*.json` (NO
+`--slots` arg: server.py dies on it) -> wrapper `~/.local/bin/strata-ds41-quetza` (copy strata-glm-quetza: port,
+model name, context, QuetzaCodetl env).
+**Done:** `tools/v41/serve/export_tokenizer.py` (HF tokenizer.json -> vocab.json / merges.txt / token_type.json):
+Strata's BPE with pre `joyai-llm` == HF tokenizers on 394 corpus texts / 465,645 tokens, 0 mismatches.
+**Next (designed, not written):** `serve_ds41.py`:
+- tokenizer: patch `ST.Tokenizer` to pre="joyai-llm" (as serve_glm.py does for glm4);
+- end of turn: `S.IM_END = "<｜end▁of▁sentence｜>"`;
+- template: replace `F.ChatTemplate` / `S.ChatTemplate` with a class whose `render(messages, tools,
+  add_generation_prompt, **kw)` calls `dsv41_encoding.encode_messages` (pure Python; tools go on the first system
+  message as OpenAI-format `{"type":"function","function":...}`, tool results via role "tool" + merge; thinking_mode
+  "chat" when `enable_thinking is False` else "thinking"; reasoning_effort low/high/max (map medium->high); the
+  generation suffix is `<｜Assistant｜>` + `<think>` (thinking) or `</think>` (chat) - strip it for
+  add_generation_prompt=False); set `.caps` by hand (tools/thinking true);
+- tool calls: a streaming rewriter in front of `F.OutputParser.feed` that turns DSML (`<｜DSML｜ calls>`,
+  `<｜DSML｜ invoke name="X">`, `<｜DSML｜ parameter name="K" string="true|false">V</｜DSML｜ parameter>`; note the
+  LEADING SPACE in the tag names) into Qwen text (`<tool_call>\n<function=X>\n<parameter=K>\nV\n</parameter>\n
+  </function>\n</tool_call>`, one per invoke; drop the calls wrapper), holding back a partial `<｜DSML｜` / `</｜DSML｜`
+  tag; check how parse_tool_call trims the value newlines and string="false" -> JSON;
+- tests (`tools/v41/serve/test_serve_ds41.py`): tokenizer == HF; template == encode_messages on chats with tools /
+  tool results / thinking; DSML split at every byte boundary -> the same calls as `parse_message_from_completion_text`;
+  end to end with the server's `--engine mock` + a DSML script over HTTP (OpenAI + Anthropic tool calls).
+Tokenizer dir for the real config: next to the final GGUF (SSD NVME).
 
 ## Goal (Mal's decisions — all made)
 
