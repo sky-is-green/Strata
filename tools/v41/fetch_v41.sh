@@ -3,9 +3,11 @@
 #   default REPO = dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8 (510.3 GB; experts/engram byte-identical to the base)
 #   Re-run any time: finished+verified files are skipped (.ok markers), partial files resume (curl -C -).
 #   Shards 47/48 are the two Engram tables (101.5 GB each) - keep them on a fast SSD after quantization.
-#   Env: JOBS=3 (parallel files), HF_TOKEN (read from ~/.cache/huggingface/token if unset).
+#   Env: JOBS=1 (files at a time; 1 = sequential, steadiest), ORDER=name|size (default name = shard order),
+#        FIT=1 (download what fits now: skip the whole-repo space check, stop cleanly before a file that would leave
+#        < MARGIN_GB free; re-run after freeing space), MARGIN_GB=10, HF_TOKEN (default ~/.cache/huggingface/token).
 set -u
-DEST=${1:?usage: fetch_v41.sh DEST [REPO]}; REPO=${2:-dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8}; JOBS=${JOBS:-3}
+DEST=${1:?usage: fetch_v41.sh DEST [REPO]}; REPO=${2:-dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8}; JOBS=${JOBS:-1}; ORDER=${ORDER:-name}; FIT=${FIT:-0}; MARGIN_GB=${MARGIN_GB:-10}
 TOKEN=${HF_TOKEN:-$(cat ~/.cache/huggingface/token 2>/dev/null)}
 mkdir -p "$DEST" && cd "$DEST" || exit 1
 curl -sSf -H "Authorization: Bearer $TOKEN" "https://huggingface.co/api/models/$REPO/tree/main?recursive=1" > .tree.json || { echo "tree fetch failed"; exit 1; }
@@ -19,10 +21,15 @@ PY
 need=$(awk -F'\t' '{s+=$2} END{printf "%.0f", s}' .files.tsv)
 have=$(du -sb . | cut -f1); free=$(df -B1 --output=avail . | tail -1)
 echo "$(date '+%F %T') $REPO: $(wc -l < .files.tsv) files, $((need/1000000000)) GB total, $((have/1000000000)) GB here, $((free/1000000000)) GB free"
-[ $((need - have)) -gt $((free - 10000000000)) ] && { echo "NOT ENOUGH SPACE (need $(((need-have)/1000000000)) GB + 10 GB margin)"; exit 2; }
+if [ "$FIT" != 1 ] && [ $((need - have)) -gt $((free - MARGIN_GB*1000000000)) ]; then
+  echo "NOT ENOUGH SPACE (need $(((need-have)/1000000000)) GB + ${MARGIN_GB} GB margin) - free space or use FIT=1"; exit 2; fi
 one() {   # path size sha
   local p=$1 s=$2 h=$3
   [ -f "$p.ok" ] && return 0
+  if [ "$FIT" = 1 ]; then   # would this file (rest of it) leave less than the margin free?
+    local cur free; cur=$(stat -c %s "$p" 2>/dev/null || echo 0); free=$(df -B1 --output=avail . | tail -1)
+    if [ $((s - cur)) -gt $((free - MARGIN_GB*1000000000)) ]; then echo "$(date '+%T') SPACE: stop before $p ($(((s-cur)/1000000000)) GB needed, $((free/1000000000)) GB free)"; touch .space-stop; return 1; fi
+  fi
   mkdir -p "$(dirname "$p")"
   for try in 1 2 3 4 5; do
     curl -sS -L --retry 5 --retry-delay 10 -C - -H "Authorization: Bearer $TOKEN" -o "$p" "https://huggingface.co/$REPO/resolve/main/$p" 2>>.curl.err
@@ -36,8 +43,10 @@ one() {   # path size sha
   fi
   touch "$p.ok"; echo "$(date '+%T') ok $p"
 }
-export -f one; export REPO TOKEN
-# biggest first so the two engram shards start early; xargs runs JOBS at a time
-sort -t$'\t' -k2,2nr .files.tsv | tr '\t\n' '\0\0' | xargs -0 -n3 -P "$JOBS" bash -c 'one "$0" "$1" "$2"'
+export -f one; export REPO TOKEN FIT MARGIN_GB
+rm -f .space-stop
+# shard order by default (ORDER=size: biggest first); xargs runs JOBS at a time; FIT=1 stops at the first that won't fit
+if [ "$ORDER" = size ]; then SORT=(sort -t$'\t' -k2,2nr); else SORT=(sort -t$'\t' -k1,1); fi
+"${SORT[@]}" .files.tsv | tr '\t\n' '\0\0' | xargs -0 -n3 -P "$JOBS" bash -c '[ -f .space-stop ] && exit 0; one "$0" "$1" "$2" || [ -f .space-stop ] && exit 0 || true'
 bad=$(awk -F'\t' '{print $1}' .files.tsv | while read -r p; do [ -f "$p.ok" ] || echo "$p"; done)
 [ -z "$bad" ] && echo "ALL VERIFIED OK" || { echo "MISSING/BAD:"; echo "$bad"; exit 3; }

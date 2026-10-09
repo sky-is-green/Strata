@@ -75,3 +75,25 @@ Order (each step gated against v41_ref goldens on a mini fixture first, then the
 4. MoE tier: 384 experts x 40 layers, expert size from the GSQ GGUF types (Q2_0 / TQ1_0 / Q2_K), soft-prune +
    arena-adapt carried over.
 5. DSpark (3-layer draft) after decode works.
+
+## Mixed-tier allocation (Mal, 2026-10-09): Q3 for sensitive experts, ternary for the weakest, Q2 average
+
+Budget-neutral at the all-Q2 size (2.25 bpw, ~153 GB of experts).  Tiers Strata can run (TQ1_0 kernel to write):
+
+| tier | type | bpw | GSQ mode |
+|---|---|---:|---|
+| sensitive | Q3_K | 3.44 | 3-bit grid, projected onto Q3_K sub-block scales |
+| (optional middle) | Q2_K | 2.63 | GSQ in-format K-quant refinement |
+| default | Q2_0 | 2.25 | native 2-bit grid {-2,-1,0,1} x scale / 64 |
+| weakest | TQ1_0 | 1.69 | native ternary {-1,0,1} x scale |
+
+Neutral mix: every 1% of weights moved to ternary pays for 0.47% moved to Q3_K (e.g. 30% ternary <-> 14% Q3_K).
+Signals, all from the calibration pass we already need: REAP saliency (routing frequency x weight x output norm,
+same accumulator as s37), and per-expert reconstruction error at each width from GPTQ init (cheap: run GPTQ at
+1.58 / 2 / 3 bits, GSQ-refine only at the chosen width).  Allocation = exact-budget knapsack on
+error(width) x saliency (RCO-lite); full RCO teacher-KL search optional.
+Guard rails: dense, shared expert, router, engram never below Q8_0; ternary only for experts in the bottom saliency
+tail AND with low ternary error (per-layer cap, e.g. <= 50% of a layer); first/last layers biased up.  Validation
+like s37: per-domain held-out ppl (en/zh/code + never-calibrated languages) vs an all-Q2_0 control and vs the FP4
+original on the same tokens.  The ternary tail overlaps the soft-prune set (rarely routed), so speed comes mostly
+from the Q3 side being worth it in quality at equal size.
