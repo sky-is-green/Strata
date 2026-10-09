@@ -20,7 +20,7 @@ included, same fp32 math for teacher and student (so it is weight damage only, n
 Env: V41_WORK (default /media/Crucial1TB/v41-calib).
 """
 import argparse, glob, hashlib, json, mmap, os, struct, sys, time
-from collections import defaultdict
+from collections import Counter, defaultdict
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -170,13 +170,42 @@ def cmd_prep(a):
     for k in ("web", "sci", "code", "zh", "de_es"):
         rng.shuffle(pools[k])
     want = {"web": 56, "sci": 10, "chat": 16, "code": 24, "zh": 14, "de_es": 8}
+    if a.corpus:  # V4.1-rendered pools from build_corpus.py: agentic-first mix (docs/ds4/calib-refs/README.md)
+        def cj(*names):
+            out = []
+            for n in names:
+                f = os.path.join(a.corpus, f"{n}.jsonl")
+                out += [json.loads(l)["text"] for l in open(f)] if os.path.exists(f) else []
+            rng.shuffle(out)
+            return out
+
+        def mix(*lists):  # interleave so every source is represented in the first sequences
+            out = []
+            for i in range(max(map(len, lists))):
+                out += [l[i] for l in lists if i < len(l)]
+            return out
+        sess = [json.loads(l)["text"] for l in open(os.path.join(a.corpus, "sessions.jsonl"))]
+        rng.shuffle(sess)
+        pools = {
+            "agentic_long": sess,
+            "agent": cj("antirez_agent"),
+            "code": mix(cj("antirez_source", "antirez_programming", "antirez_algorithms"), pools["code"]),
+            "reason": mix(cj("antirez_eval_reasoning", "antirez_long_context"), cj("antirez_language"), pools["sci"]),
+            "web": pools["web"],
+            "zh": zh,
+            "chat": mix(cj("antirez_general"), pools["chat"]),
+            "multi": mix(cj("antirez_translation"), eu),
+        }
+        want = {"agentic_long": 10, "agent": 5, "code": 6, "reason": 4, "web": 2, "zh": 3, "chat": 1, "multi": 1}
     scale = a.n / sum(want.values())
     want = {k: max(1, round(v * scale)) for k, v in want.items()}
 
     def pack(texts, n):
         seqs, cur = [], [BOS]
         for t in texts:
-            special = t.startswith("<｜User｜>")
+            special = t.startswith("<｜User｜>") or t.startswith("<｜begin▁of▁sentence｜>")
+            if t.startswith("<｜begin▁of▁sentence｜>"):
+                t = t[len("<｜begin▁of▁sentence｜>"):]   # pack() already opens every sequence with BOS
             ids = tok.encode(t, add_special_tokens=False)[: S - 1]
             if not special:
                 ids = ids + [EOS]
@@ -200,12 +229,13 @@ def cmd_prep(a):
         seqs += got; doms += ["web"] * len(got)
     seqs, doms = seqs[: a.n], doms[: a.n]
     # held-out split: every 4th sequence of each domain
-    is_eval, cnt = [], defaultdict(int)
+    tot, is_eval, cnt = Counter(doms), [], defaultdict(int)
     for d_ in doms:
-        is_eval.append(cnt[d_] % 4 == 3); cnt[d_] += 1
+        n_ev = tot[d_] // 4 + (1 if tot[d_] % 4 == 3 else 0)
+        is_eval.append(cnt[d_] >= tot[d_] - n_ev); cnt[d_] += 1
     tokens = np.array(seqs, dtype=np.int32)
     np.save(wpath("tokens.npy"), tokens)
-    json.dump({"n": len(seqs), "seq": S, "domains": doms, "is_eval": is_eval}, open(wpath("meta.json"), "w"))
+    json.dump({"n": len(seqs), "seq": S, "domains": doms, "is_eval": is_eval, "corpus": a.corpus}, open(wpath("meta.json"), "w"))
     # engram n-gram hash ids for every position (depend on token ids only)
     args = model_args(len(seqs), S)
     layout = M.EngramLayout.from_args(args)
@@ -483,6 +513,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prep"); p.add_argument("--n", type=int, default=128); p.add_argument("--seq", type=int, default=2048)
+    p.add_argument("--corpus", default=None, help="build_corpus.py output dir (agentic-first V4.1 mix)")
     sub.add_parser("init")
     p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=2)
     p.add_argument("--device", default="cuda")
