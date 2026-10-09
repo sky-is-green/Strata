@@ -1019,8 +1019,13 @@ if(STRATA_NATIVE_EXPERTS)
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/kq_avx1.cpp)
+                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/ptq1_0.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+  if(STRATA_BUILD_TESTS)   # PTQ1_0 ternary rows (DeepSeek-V4.1 mixed tier): layout vs llama-tq's reference, dot parity
+    add_executable(ptq1_0_test tests/cpu/ptq1_0_test.cpp)
+    target_link_libraries(ptq1_0_test PRIVATE strata_kernels_cpu)
+    add_test(NAME ptq1_0_test COMMAND ptq1_0_test)
+  endif()
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")

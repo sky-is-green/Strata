@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/ptq1_0.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -19,7 +20,14 @@
 namespace strata::kernels::cpu {
 namespace {
 
-const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
+// PTQ1_0 (ternary, id 143) is Strata's own: the vendored ggml stops at GGML_TYPE_COUNT 43, so it must never see 143.
+const ggml_type_traits_cpu kPtq1Traits = {nullptr, ptq1_0_vec_dot_q8_0, GGML_TYPE_Q8_0, 1};
+const ggml_type_traits_cpu* traits(int type) {
+    if (type == kPtq1Type) return &kPtq1Traits;
+    return type >= 0 && type < GGML_TYPE_COUNT ? ggml_get_type_traits_cpu((ggml_type) type) : nullptr;
+}
+int64_t blck(int type) { return type == kPtq1Type ? kPtq1Block : ggml_blck_size((ggml_type) type); }
+size_t row_size(int type, int64_t n) { return type == kPtq1Type ? ptq1_0_row_bytes(n) : ggml_row_size((ggml_type) type, n); }
 
 void init_once() {
     static std::once_flag once;
@@ -44,7 +52,7 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
         err = "native experts: ggml-cpu cannot quantize an activation for this layer";
         return false;
     }
-    if (n_embd % ggml_blck_size((ggml_type) gu_type) || n_ff % ggml_blck_size((ggml_type) d_type) ||
+    if (n_embd % blck(gu_type) || n_ff % blck(d_type) ||
         n_embd % ggml_blck_size(tg->vec_dot_type) || n_ff % ggml_blck_size(td->vec_dot_type)) {
         err = "native experts: expert geometry is not whole blocks";
         return false;
@@ -55,8 +63,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     f.d_act = (int) td->vec_dot_type;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
-    f.gu_row = ggml_row_size((ggml_type) gu_type, n_embd);
-    f.d_row = ggml_row_size((ggml_type) d_type, n_ff);
+    f.gu_row = row_size(gu_type, n_embd);
+    f.d_row = row_size(d_type, n_ff);
     f.up_off = f.gu_row * (size_t) n_ff;
     f.down_off = 2 * f.up_off;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
@@ -78,13 +86,13 @@ bool native_fmt3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t
         err = "native experts: ggml-cpu has no dot product for type " + std::to_string(up_type);
         return false;
     }
-    if ((int) tu->vec_dot_type != f.gu_act || n_embd % ggml_blck_size((ggml_type) up_type)) {
+    if ((int) tu->vec_dot_type != f.gu_act || n_embd % blck(up_type)) {
         err = "native experts: up type " + std::to_string(up_type) + " needs a different activation than gate type " +
               std::to_string(gate_type);
         return false;
     }
     f.up_type = up_type;
-    f.up_row = ggml_row_size((ggml_type) up_type, n_embd);
+    f.up_row = row_size(up_type, n_embd);
     f.down_off = f.up_off + f.up_row * (size_t) n_ff;
     f.bytes = f.down_off + f.d_row * (size_t) n_embd;
     return true;
