@@ -57,14 +57,19 @@ Shard layout (one layer per shard): 1 vision, 2 embed, **3..42 = layers 0..39** 
 
 ## Download (running in the background, survives the session)
 
-- Driver: `tools/v41/fetch_sequence.sh` (setsid/nohup), log `.../Crucial1TB/.../sequence.log`; each file's own
-  progress in `fetch.log` of its directory.  Order: shard 4 (finish) -> 47 -> 48 -> the remaining 42 shards.
+- Driver: `tools/v41/fetch_sequence2.sh` (setsid/nohup), log `.../Crucial1TB/.../sequence2.log` (the earlier
+  `fetch_sequence.sh` / `sequence.log` are superseded); each file's own progress in `fetch.log` of its directory.
+  **Order (matched to GSQ, 2026-10-09 20:00):** 47 -> **backbone layers 2-13 (shards 5-16)** -> 48 -> the rest of
+  the backbone (17-46).  Rationale: 47 is the only Engram shard GSQ needs for layers 0-13, so those layers'
+  backbone shards go first so GSQ can run while downloading; 48 is packed in before layer 14.  The script
+  self-heals: if it starts and no 47 fetch is running (re-run after reboot), it fetches 47 itself.
 - `tools/v41/fetch_v41.sh DEST [REPO]` - resumable (curl -C -), `.ok` marker per verified file, sha256 via
   **O_DIRECT** (page cache lies on this box), env JOBS=1 FIT=1 MARGIN_GB=10 ONLY=regex SKIP=regex ORDER=name|size.
   Re-run the same command any time; it skips verified files and resumes partial ones.
-- To restart by hand after a reboot:
+- To restart by hand after a reboot (or just re-run `fetch_sequence2.sh`, which does all of this in order):
   ```
   cd /media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8 && JOBS=1 FIT=1 ONLY='model-00047-of' ~/AI/Strata-DS4/tools/v41/fetch_v41.sh "$PWD"
+  cd /media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8 && JOBS=1 FIT=1 ONLY='model-000(0[5-9]|1[0-6])-of' ~/AI/Strata-DS4/tools/v41/fetch_v41.sh "$PWD"
   cd "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8" && JOBS=1 FIT=1 ONLY='model-00048-of' ~/AI/Strata-DS4/tools/v41/fetch_v41.sh "$PWD"
   cd /media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8 && JOBS=1 FIT=1 SKIP='model-0004[78]-of' ~/AI/Strata-DS4/tools/v41/fetch_v41.sh "$PWD"
   ```
