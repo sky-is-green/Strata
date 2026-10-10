@@ -40,6 +40,8 @@ struct Ds41DenseConfig {
     int     engram_threads = 16;        ///< parallel row reads
     /// KV caches (window ring, compressed rows, indexer keys) element type: GGML_TYPE_F32 or GGML_TYPE_BF16 / F16.
     int     kv_type = GGML_TYPE_F32;
+    /// model.py's activation rounding (ds41_ops.hpp): window K FP8, compressed KV FP4/E4M3, indexer q/k FP4.
+    bool    act_quant = true;
 };
 
 class Ds41Dense {

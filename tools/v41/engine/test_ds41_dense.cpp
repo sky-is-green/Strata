@@ -103,7 +103,7 @@ int main(int argc, char ** argv) {
     std::vector<int> toks;
     std::vector<std::string> edirs;
     int threads = 8, chunk = 0;
-    bool zero_experts = false;
+    bool zero_experts = false, act_quant = true;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() { return std::string(argv[++i]); };
@@ -113,6 +113,7 @@ int main(int argc, char ** argv) {
         else if (a == "--threads") threads = std::stoi(next());
         else if (a == "--chunk") chunk = std::stoi(next());
         else if (a == "--zero-experts") zero_experts = true;
+        else if (a == "--no-actquant") act_quant = false;
         else if (a == "--engram") {
             std::stringstream ss(next());
             std::string d;
@@ -129,6 +130,7 @@ int main(int argc, char ** argv) {
         cfg.ctx_max = 4096;
         cfg.max_pass = m == "decode" ? 1 : chunk;
         cfg.engram_dirs = edirs;
+        cfg.act_quant = act_quant;
         Ds41Dense dn;
         std::string err;
         if (!dn.init(path, cfg, err)) { std::fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
