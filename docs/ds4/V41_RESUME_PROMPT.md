@@ -23,9 +23,8 @@ below it is history (still accurate unless this section says otherwise).
   -> chunked bf16, `bf23f296`); L13 crash in `q3k_split` (all-zero super-block whose fp16 d did not round-trip ->
   search/re-round + log, `2989e535`); L14 slow (Engram table on Team CX2: slow drive + ntfs-3g FUSE, 1h40).
 - **Engram shards copied to NVMe** (Mal OK'd 2026-10-11): `/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/`
-  shard 48 (L14) DONE + verified (size + 302 sampled MiB) + `.ok` + `model.safetensors.index.json`; **shard 47 (L1)
-  copy started 07:15** (`/home/mal/AI/v41-dev/copy47.log`, `.partial`): when dd says "records out", verify the same
-  way (size + sampled blocks vs Crucible), `mv .partial` -> final name, `touch .ok`.  Engine config
+  shard 48 (L14) DONE + verified (size + 302 sampled MiB) + `.ok` + `model.safetensors.index.json`; **shard 47 (L1) DONE 07:18 +
+  verified the same way (302 sampled MiB, 0 differ) + `.ok`** (copy log `/home/mal/AI/v41-dev/copy47.log`).  NVME1TB now 58 GB free.  Engine config
   (`tools/v41/serve/strata-ds41.json`), `gpu_bringup.sh` and `v41_calib.DIRS` list NVME1TB FIRST.
 - **PLAN for the running chain (agreed with Mal 07:15): do NOT stop/restart it for the Engram move.**  Only layers 1 and
   14 read Engram and both are already written; layers 15-39 and the final head gate never read it, so a restart would
