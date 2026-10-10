@@ -648,7 +648,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         L.eslot = G.engram_slot(l);
     }
     // persistent state
-    const ggml_type kvt = (ggml_type) cfg.kv_type;
+    const ggml_type kvt = cfg.kv_type >= 0 ? (ggml_type) cfg.kv_type : cfg.act_quant ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     ggml_init_params sp = { ggml_tensor_overhead() * 512, nullptr, true };
     im.sctx = ggml_init(sp);
     auto T = [&](ggml_type t, std::initializer_list<int64_t> ne) {

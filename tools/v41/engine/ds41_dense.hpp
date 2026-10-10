@@ -38,8 +38,10 @@ struct Ds41DenseConfig {
     /// Empty = no Engram (its add is skipped: a debugging mode, the model is then not the model).
     std::vector<std::string> engram_dirs;
     int     engram_threads = 16;        ///< parallel row reads
-    /// KV caches (window ring, compressed rows, indexer keys) element type: GGML_TYPE_F32 or GGML_TYPE_BF16 / F16.
-    int     kv_type = GGML_TYPE_F32;
+    /// KV caches (window ring, compressed rows, indexer keys) element type: GGML_TYPE_F32 / BF16, or -1 = auto: BF16
+    /// with act_quant (every cached value is then an FP8/FP4 grid point times a power-of-two / E4M3 scale: <= 7
+    /// significant bits, exact in BF16 - half the VRAM of F32 at 512K), F32 without.
+    int     kv_type = -1;
     /// model.py's activation rounding (ds41_ops.hpp): window K FP8, compressed KV FP4/E4M3, indexer q/k FP4.
     bool    act_quant = true;
 };
