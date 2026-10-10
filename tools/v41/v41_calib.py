@@ -348,6 +348,7 @@ def expert_f(x, W1, W3, W2, g, lim):
     Rows are independent: done ROWS at a time so a hot expert never needs a whole-batch intermediate."""
     if len(x) > ROWS:
         return torch.cat([expert_f(x[c:c + ROWS], W1, W3, W2, g[c:c + ROWS], lim) for c in range(0, len(x), ROWS)])
+    x, g = x.float(), g.float()        # callers pass bf16 rows: fp32 only per ROWS chunk (a hot expert's fp32 copy OOMs)
     gate = x @ W1.T
     up = x @ W3.T
     if lim > 0:
@@ -360,7 +361,7 @@ def act_hessians(xf, W1, W3, gf, lim):
     H1 = torch.zeros((xf.shape[1], xf.shape[1]), dtype=torch.float32, device=xf.device)
     H2 = torch.zeros((W1.shape[0], W1.shape[0]), dtype=torch.float32, device=xf.device)
     for c in range(0, len(xf), ROWS):
-        x, g = xf[c:c + ROWS], gf[c:c + ROWS]
+        x, g = xf[c:c + ROWS].float(), gf[c:c + ROWS].float()
         H1 += x.T @ x
         a = F.silu((x @ W1.T).clamp(max=lim)) * (x @ W3.T).clamp(-lim, lim) * g
         H2 += a.T @ a
@@ -372,8 +373,8 @@ def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
     W1 = K.dequant_fp4_weight(exp.w1.weight, exp.w1.scale)
     W3 = K.dequant_fp4_weight(exp.w3.weight, exp.w3.scale)
     W2 = K.dequant_fp4_weight(exp.w2.weight, exp.w2.scale)
-    xf, gf = xe[fit].float(), ge[fit].float()
-    xv, gv = xe[~fit].float(), ge[~fit].float()
+    xf, gf = xe[fit], ge[fit]          # bf16; expert_f / act_hessians convert per chunk
+    xv, gv = xe[~fit], ge[~fit]
     st = {"n_fit": int(fit.sum()), "n_eval": int((~fit).sum())}
     if st["n_eval"] == 0:              # nothing held out: measure on the fit tokens (flagged)
         xv, gv, st["eval_on_fit"] = xf, gf, True

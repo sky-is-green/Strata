@@ -151,7 +151,7 @@ class Layer:
         a = self.a
         W1, W3, W2 = self.weights(exp)
         assert W2.shape == (C.D, FF), W2.shape
-        xf, gf = xe[fit].float(), ge[fit].float()
+        xf, gf = xe[fit], ge[fit]          # bf16; C.expert_f / C.act_hessians convert per chunk
         n_fit = int(fit.sum())
         do = n_fit >= a.min_fit and ex < a.gptq_experts
         if do:
@@ -163,13 +163,13 @@ class Layer:
         (q2,) = quant([W2], H2, self.dn[ex], a.damp, do)
         self.write(ex, q1, q3, q2)
         st = {"gu": self.gu[ex], "dn": self.dn[ex], "n_fit": n_fit, "gptq": do}
-        xv, gv = xe[~fit].float(), ge[~fit].float()
+        xv, gv = xe[~fit], ge[~fit]
         if len(xv):   # held-out output error at the chosen tiers (the fit used none of these tokens)
             Y = C.expert_f(xv, W1, W3, W2, gv, lim)
             st["q_err"] = float((C.expert_f(xv, q1[0], q3[0], q2[0], gv, lim) - Y).square().sum())
             st["y_energy"] = float(Y.square().sum())
         if a.propagate == "quant":
-            out = C.expert_f(xe.float(), q1[0], q3[0], q2[0], ge.float(), lim).to(out_teacher.dtype)
+            out = C.expert_f(xe, q1[0], q3[0], q2[0], ge, lim).to(out_teacher.dtype)
         else:
             out = out_teacher
         return out, st
