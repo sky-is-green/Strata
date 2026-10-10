@@ -112,7 +112,31 @@ def q3k_split(S):
     sc = np.where(dead[..., None], 0, sc)
     bad = ~dead[..., None] & ((np.abs(sc * dsafe[..., None] - Sb) > 1e-6 * np.abs(Sb)) | (sc < -32) | (sc > 31))
     if bad.any():
-        raise ValueError(f"Q3_K scales are not fp16 d x int6 ({int(bad.sum())} groups)")
+        # rare: amax/31 does not round-trip (fp16-subnormal d of a tiny super-block, or max|sc| < 31).  Search the fp16
+        # d values near amax/k for one that splits the block exactly; failing that, re-round the block (one tiny-
+        # magnitude block written within its own rounding of the GPTQ value - logged, never a crash)
+        for r, b in zip(*np.nonzero(bad.any(-1))):
+            row = Sb[r, b]
+            best = None
+            for k in range(31, 0, -1):
+                d0 = np.float16(amax[r, b] / k)
+                for d in (d0, np.nextafter(d0, np.float16(np.inf)), np.nextafter(d0, np.float16(0))):
+                    d = np.float32(d)
+                    if d <= 0:
+                        continue
+                    q = np.rint(row / d)
+                    if (q >= -32).all() and (q <= 31).all() and (np.abs(q * d - row) <= 1e-6 * np.abs(row)).all():
+                        best = (d, q)
+                        break
+                if best:
+                    break
+            if best is None:
+                d = np.float32(_f16(np.float32(amax[r, b] / 31.0)))
+                d = d if d > 0 else np.float32(np.finfo(np.float16).smallest_subnormal)
+                best = (d, np.clip(np.rint(row / d), -32, 31))
+                print(f"q3k_split: row {r} block {b} re-rounded (max rel {float(np.abs(best[1] * d - row).max() / max(amax[r, b], 1e-30)):.2e})",
+                      flush=True)
+            dsup[r, b], sc[r, b] = best
     return dsup, sc.reshape(R, n16).astype(np.int16)
 
 
