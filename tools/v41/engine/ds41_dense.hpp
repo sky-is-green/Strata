@@ -69,6 +69,13 @@ public:
     bool finish(int il, const float * routed_sum);
     /// Logits of rows row0..row0+nrows-1 of the pass after the last layer's finish: nrows * n_vocab floats.
     bool logits(int row0, int nrows, float * out);
+    /// Conversation reuse: every cache is position-indexed except the window ring and the ratio-2 compressor state
+    /// ring, so a snapshot is those rings (~11 MB) + its position; restore() rewinds to it (decoding continues at
+    /// snapshot_pos()).  Positions past a rewind point are overwritten when decoded again (rows past a query's
+    /// visible count are never attended).
+    bool snapshot(int pos);
+    bool restore();
+    int snapshot_pos() const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The x state after begin (+ the Engram add of the layer `il`, when il is an Engram layer) - gate tap.

@@ -145,7 +145,9 @@ struct Ds41Dense::Impl {
         ggml_tensor * st_sc = nullptr;    // [DH, 2]         ... (scores)
         ggml_tensor * sel = nullptr;      // I32 [ITOP, NC]  top-k rows (index sources)
         ggml_tensor * selm = nullptr;     // F32 [ITOP, NC]  0 / -inf (row visible to the query)
+        ggml_tensor * raw_snap = nullptr, * st_kv_snap = nullptr, * st_sc_snap = nullptr;   // snapshot()
     };
+    int snap_pos = -1;
     std::vector<Layer> ly;
 
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
@@ -652,10 +654,16 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     for (int64_t l = 0; l < im.nl; ++l) {
         auto & L = im.ly[(size_t) l];
         L.raw = T(kvt, { im.DH, im.RAW });
+        L.raw_snap = T(kvt, { im.DH, im.RAW });
         if (L.kv_src) {
             L.comp = T(kvt, { im.DH, im.cmax[L.ratio] + 1 });
             L.idxk = T(kvt, { im.ID, im.cmax[L.ratio] + 1 });
-            if (L.ratio == 2) { L.st_kv = T(GGML_TYPE_F32, { im.DH, 2 }); L.st_sc = T(GGML_TYPE_F32, { im.DH, 2 }); }
+            if (L.ratio == 2) {
+                L.st_kv = T(GGML_TYPE_F32, { im.DH, 2 });
+                L.st_sc = T(GGML_TYPE_F32, { im.DH, 2 });
+                L.st_kv_snap = T(GGML_TYPE_F32, { im.DH, 2 });
+                L.st_sc_snap = T(GGML_TYPE_F32, { im.DH, 2 });
+            }
         }
         if (L.idx_src) { L.sel = T(GGML_TYPE_I32, { im.ITOP, NC }); L.selm = T(GGML_TYPE_F32, { im.ITOP, NC }); }
     }
@@ -883,3 +891,27 @@ bool Ds41Dense::read_state(std::vector<float> & x, std::vector<float> & pre) {
     ggml_backend_tensor_get(im.pre_state, pre.data(), 0, pre.size() * 4);
     return true;
 }
+
+bool Ds41Dense::snapshot(int pos) {
+    Impl & im = *p_;
+    for (auto & L : im.ly) {
+        ggml_backend_tensor_copy(L.raw, L.raw_snap);
+        if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv, L.st_kv_snap); ggml_backend_tensor_copy(L.st_sc, L.st_sc_snap); }
+    }
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = pos;
+    return true;
+}
+
+bool Ds41Dense::restore() {
+    Impl & im = *p_;
+    if (im.snap_pos < 0) return false;
+    for (auto & L : im.ly) {
+        ggml_backend_tensor_copy(L.raw_snap, L.raw);
+        if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv_snap, L.st_kv); ggml_backend_tensor_copy(L.st_sc_snap, L.st_sc); }
+    }
+    ggml_backend_synchronize(im.backend);
+    return true;
+}
+
+int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }

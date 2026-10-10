@@ -37,7 +37,10 @@ inline constexpr int NE = 512;      // routed experts per layer
 inline constexpr int QK = 64;       // QK2_0: weights per fp16 scale
 inline constexpr int QKA = 32;      // QK8_1/QK8_0: ACTIVATION elements per scale
 inline constexpr int BB = 18;       // bytes per 64-weight Q2_0 block: 2 fp16-scale + 16 codes
-inline constexpr int MAXC = H / QKA;             // 80 activation chunks across the widest reduction
+// Strata-DS4 fork: the widest activation an ActQ holds - DeepSeek-V4.1's n_embd 5120 through the native Q2_0
+// kernels (q2_rows_any); H stays Qwen's 2560 for the pack layouts below
+inline constexpr int kActMax = 5120;
+inline constexpr int MAXC = kActMax / QKA;       // activation chunks across the widest reduction
 inline constexpr int ROW_GU = H * 2 / 8;         // 640 B of codes per gate/up row
 inline constexpr int ROW_D = FF * 2 / 8;         // 160 B of codes per down row
 inline constexpr int SC_GU = H / QK;             // 40 weight blocks per gate/up row
@@ -62,7 +65,7 @@ inline constexpr size_t O_D_SCALES = O_GU_SCALES + 2ull * FF * SC_GU * 2;
 /// (`sum (c-1) d_w xhat d_x = d_w (d_x*sum(c*xhat) - d_x*sum(xhat))`), precomputed once per layer rather than
 /// once per row: 640 rows would otherwise recompute it 640 times.
 struct ActQ {
-    alignas(64) int8_t q[H];
+    alignas(64) int8_t q[kActMax];
     float scale[MAXC];
     int32_t sum[MAXC];
     float hx[MAXC];
@@ -71,9 +74,9 @@ struct ActQ {
     /// `act_quant_q8_1_avx2` with STRATA_Q2_BITPLANE=1 and read only by `q2_0_gguf_rows_multi_avx2`.  Per pair p of 64-value blocks:
     /// `qp[128p + 32k + 16h + i] = q[128p + 64h + 4i + k]`, `psum[8p + 4h + m]` = the sum of q[128p + 64h + 16m ..
     /// + 16), `pscale[8p + 2c + e] = scale[4p + c]`.  `bp_pairs` is 0 when the image is absent (n % 128 != 0).
-    alignas(32) int8_t qp[H];
-    alignas(32) int32_t psum[H / 16];
-    alignas(32) float pscale[H / 16];
+    alignas(32) int8_t qp[kActMax];
+    alignas(32) int32_t psum[kActMax / 16];
+    alignas(32) float pscale[kActMax / 16];
     int bp_pairs = 0;
 };
 
