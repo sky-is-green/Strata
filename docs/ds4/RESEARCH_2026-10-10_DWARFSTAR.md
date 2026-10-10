@@ -43,3 +43,42 @@ mw00/project-maya, bodhi37/strata (Qwen/GLM only, no DeepSeek code), sectilelabs
 ## Non-DeepSeek (for strata-glm, FYI)
 PolyStrata: cold experts computed on the CPU from the mmap'd GGUF instead of skipped (vs our `--skip-miss`);
 drafting from the model's draft block + repeats of the conversation; first-64-token parity vs llama.cpp.
+
+## From the GLM / Qwen forks, applicable to V4.1 (added 2026-10-10 15:15)
+
+Our engine already inherits upstream Strata's 3-tier expert source (VRAM / pinned RAM / NVMe `pread` ring with
+O_DIRECT, `src/core/expert_source.cpp`), which V4.1 needs: the ~152 GiB file > 90 GiB RAM + 24 GiB VRAM.
+
+**Quant pipeline (project-maya `docs/QUANT-PLAN.md`, a GLM GSQ/RCO plan close to ours):**
+- **KL to the teacher, not only ppl.** They store the reference's top-64 log-probs + logsumexp per eval position
+  and score each candidate by KL, top-1 agreement and ppl per domain + long context.  Our head gate
+  (`v41_calib.py head`, l.573) records ppl + top-1 only; adding the teacher's top-k to the calibration head
+  output and KL to the quant pass's head gate would give a sharper GSQ-vs-teacher number.  Needs to be in place
+  before the calibration head step runs (~18:30) - Mal's call; a bug there would stop the unattended chain.
+- **Floor: down never below gate/up for the same expert.**  `v41_alloc.py --per-proj` picks gu and dn tiers
+  independently (l.40).  Our layer-0 data already says down carries 68% of an expert's Q2 error, so the floor
+  likely rarely binds; check the full map's count of dn < gu experts before the export.
+- **Loop test** for low-bit files: 50 sampled + 20 greedy long generations; count repeated n-grams, never-ending
+  runs, broken think blocks.  Add to our post-export checks (V4.1 thinks by default).
+- Pruning: REAP-pruning GLM (60/288 experts) cost KL 0.45; per-expert bits beat pruning.  We do not prune: keep it.
+
+**Engine (PolyStrata `docs/BACKENDS.md` "What was tuned", same Strata base, measured on GLM 5.3 Flash
+with OUR GLM file on a 5090/120 GiB):**
+- **The draft block is the biggest decode win**: GLM 26.7-27.7 -> 47-51 tok/s with it.  For V4.1: export `mtp.*`
+  (DSpark, 3 layers) early rather than last (P6 now says "then DSpark").
+- Cached experts launched 8 at a time, one launch per stage (Qwen 132 -> 241-269 tok/s): our
+  `native_expert_grouped` is the same idea; keep it for every tier pair.
+- Sampling / guess checking without a candidate per vocab entry (159 ms -> 25 ms per 600-token answer).
+- Prefill: walk the prompt's calls layer by layer so a layer's experts are copied to the card once
+  (GLM 417 -> 516 tok/s), keep the residual in host memory past checkpoints (-> 602-616), leave a round of a
+  layer's experts in the staging buffer for the next call (-> 639-643).
+- Prefault the experts' pages once after load (first answer 43 -> 47 tok/s).
+- Overlap: the card's layers run while the CPU computes the cold experts (52-53 -> 56-59 tok/s).
+
+**bodhi37 `orca-port` (frozen fork: SSD tier on a 32 GiB RAM box) - lessons for our SSD-backed V4.1:**
+- Decode wall = NVMe queue-depth-1 latency (~2.8 ms) x serial layers, not bandwidth; issue a layer's misses
+  together and compute resident experts while they fly (two-pass `begin_layer` / `wait_layer`).
+- Read amplification: page-faulting 4 KiB through the mapping was 6.4x; whole-blob `pread` + O_DIRECT fixed it.
+- `cudaHostRegister`-pinned RAM tiers are unswappable: a too-big pinned tier + KV caused swap storms and cuBLAS
+  init deaths; register in ~2 GiB slices and shed under memory pressure.  Size V4.1's pinned tier with headroom.
+- LRU churn on prefill collapsed decode (12 -> 2.5 tok/s): keep prefill admissions off / profile-seeded static tier.
