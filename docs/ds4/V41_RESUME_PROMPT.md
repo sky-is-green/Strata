@@ -524,6 +524,16 @@ chunked into bf16, 4d0..; passed try 4); L13 died on q3k_split (an all-zero supe
 fixed: search/re-round, logged; passed on the chain's retry); L14 (Engram table on Team CX2) is I/O-bound like in
 calibration (8294 s there) -> ETA ~13:00.  Engram row reads from Team CX2 will matter for engine speed too: measure.
 
+DRIVES (found 2026-10-11 06:45): Crucial1TB, Crucible (Engram L1) and Team CX2 (Engram L14) are mounted fuseblk =
+ntfs-3g (FUSE, single-threaded small random reads: why calib/quant L14 took 2.3 h - wchan request_wait_answer); SSD NVME
+is kernel ntfs3.  After the chain: remount Crucible + Team CX2 as ntfs3 (udisksctl / mount -t ntfs3) and measure the
+engine's Engram rows/token before/after - decode reads 48 rows/token from them.
+Size options (Mal asked for a Maya-size ~90 GiB): /home/mal/AI/v41-dev/size_sweep.py - calibration proxy with
+prune-or-tier per expert: 152 GiB current mix 1.88 (all-Q2 2.17); prune+mixed 120 GiB 0.37, 99 GiB 0.45, 89 GiB 0.54
+(57% pruned), 79 GiB 0.68.  Pruning cost only measured on the calibration corpus (OOD risk) -> recommended: keep the
+152 file, soft-prune at runtime (route-bias penalty on the coldest experts, GLM's recipe), decide on a smaller file
+after real ppl + tok/s.
+
 ### Engine next steps (in order)
 1. When the layout exists (step 3 of the chain): `test_ds41_geometry` on the real file; full 40-layer dense gate on
    the CPU with zero experts (golden `--zero-experts` is NOT written yet: experts are being filled during step 4 -
