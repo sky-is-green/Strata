@@ -38,9 +38,12 @@ sys.path.insert(0, HERE)
 import v41_calib as C  # noqa: E402  (sets up model.py / kernel.py)
 import v41_formats as F  # noqa: E402
 import v41_gptq as G  # noqa: E402
+import v41_gptq_graph as GG  # noqa: E402  (bit-identical CUDA-graph gptq, 8x faster)
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 K = C.K
 CALIB = C.WORK
+WRITE_THREADS = int(os.environ.get("V41_WRITE_THREADS", "3"))
 FF = 2304   # moe_intermediate_size (checked against each expert's w2)
 
 
@@ -77,7 +80,7 @@ def quant(Ws, H, tier, damp, do_gptq):
     hiv = torch.full((Wst.shape[0], 1), float(hi), device=Wst.device)
     if do_gptq:
         Hinv, dead = G.hinv_chol(H, damp)
-        Q = G.gptq(Wst, Sst, lov, hiv, Hinv, dead)
+        Q = GG.gptq(Wst, Sst, lov, hiv, Hinv, dead)
     else:
         Q = G.rtn(Wst, Sst, lov, hiv)
     out, r0 = [], 0
@@ -135,13 +138,31 @@ class Layer:
         self.size = [(F.nbytes(self.gt[e], (C.D, FF)), F.nbytes(self.dt[e], (FF, C.D))) for e in range(C.NE)]
         self.sink = Sink(a, L, self.gt, self.dt, self.size)
         self.done, self.info = set(), {}
+        # encode + pwrite on worker threads while the GPU does the next expert (numpy, same bytes; distinct offsets)
+        self.pool, self.pending = ThreadPoolExecutor(max_workers=max(WRITE_THREADS, 1)), []
+
+    def _encode_put(self, ex, mats):
+        b = [F.encode_tier(q, s, t).tobytes() for q, s, t in mats]
+        self.sink.put(ex, *b)
 
     def write(self, ex, q1, q3, q2):
         if self.sink.mode != "none":
-            b = [F.encode_tier(q.cpu().numpy(), s.cpu().numpy(), t).tobytes()
-                 for (q, s), t in ((q1, self.gu[ex]), (q3, self.gu[ex]), (q2, self.dn[ex]))]
-            self.sink.put(ex, *b)
+            mats = [(q.cpu().numpy(), s.cpu().numpy(), t)
+                    for (q, s), t in ((q1, self.gu[ex]), (q3, self.gu[ex]), (q2, self.dn[ex]))]
+            if WRITE_THREADS == 0:                 # V41_WRITE_THREADS=0: in-line, as before
+                self._encode_put(ex, mats)
+                self.done.add(ex)
+                return
+            while len(self.pending) >= 6:          # bound the host copies in flight (~115 MB each)
+                self.pending.pop(0).result()       # re-raises a worker's error here
+            self.pending.append(self.pool.submit(self._encode_put, ex, mats))
         self.done.add(ex)
+
+    def drain(self):
+        for f in self.pending:
+            f.result()
+        self.pending = []
+        self.pool.shutdown(wait=True)
 
     def weights(self, exp):
         return (K.dequant_fp4_weight(exp.w1.weight, exp.w1.scale), K.dequant_fp4_weight(exp.w3.weight, exp.w3.scale),
@@ -185,6 +206,7 @@ class Layer:
                 (q2,) = quant([W2], torch.eye(W2.shape[1], device=W1.device), self.dn[ex], self.a.damp, False)
                 self.write(ex, q1, q3, q2)
                 stats[ex].update({"gu": self.gu[ex], "dn": self.dn[ex], "gptq": False, "unrouted": True})
+        self.drain()                              # every expert's bytes written before fsync + the done json
         self.sink.close()
         j = {"layer": L, "sink": self.sink.mode, "gu_type": self.gt, "d_type": self.dt, "propagate": self.a.propagate, "damp": self.a.damp,
              "map": self.a.map, "tier": self.a.tier, "experts": {str(e): stats[e] for e in range(C.NE)}}
