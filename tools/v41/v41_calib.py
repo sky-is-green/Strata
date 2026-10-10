@@ -34,7 +34,8 @@ import kernel as K  # noqa: E402  (our torch stand-in)
 import v41_gptq as G  # noqa: E402
 
 MAIN = "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
-DIRS = [MAIN, "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
+DIRS = [MAIN, "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",   # shard 48 (Engram L14) copied here 2026-10-11: NVMe, not Team CX2
+        "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
         "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]
 WORK = os.environ.get("V41_WORK", "/media/Crucial1TB/v41-calib")
 D, HC, NE, TOPK = 5120, 4, 384, 6

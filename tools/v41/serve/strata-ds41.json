@@ -8,7 +8,7 @@
   "--experts",
   "gpu",
   "--engram",
-  "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
+  "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
   "--rank",
   "/media/mal/SSD NVME/AI/V41-GSQ/rank.bin",
   "--arena-gib",
