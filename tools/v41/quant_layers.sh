@@ -45,7 +45,7 @@ for L in $(seq "$FROM" "$TO"); do
     [ $rc -eq 0 ] && break
     grep -q "OutOfMemoryError\|CUDA out of memory" "$W/logs/L$N.log" || exit $rc
     [ "$try" = 5 ] && { log "layer $L: OOM 5 times - giving up"; exit $rc; }
-    cp "$W/logs/L$N.log" "$W/logs/L$N.oom$try.log"; log "layer $L: OOM - retrying in 2 min with half the rows"; sleep 120
+    cp "$W/logs/L$N.log" "$W/logs/L$N.oom$try.log"; log "layer $L: OOM - retrying now with half the rows"; sleep 5
   done
 done
 log "layers $FROM..$TO finished"

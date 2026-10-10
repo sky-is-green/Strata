@@ -37,7 +37,7 @@ if [ ! -f "$W/stats/head_L40.json" ]; then
     while kill -0 "$pid" 2>/dev/null; do chk; sleep 60; done
     { [ -f "$W/stats/L39.json" ] && [ -f "$W/stats/head_L40.json" ]; } && break
     chk; [ "$att" = 3 ] && break
-    log "calibration driver exited early (attempt $att: $(tail -1 "$W/calib.log")) - restarting in 10 min"; sleep 600
+    log "calibration driver exited early (attempt $att: $(tail -1 "$W/calib.log")) - restarting now"; sleep 5
     IDLE_MIN=0 tools/v41/calibctl.sh start >> "$LOG" 2>&1
   done
   [ -f "$W/stats/L39.json" ] || die "calibration stopped before layer 39 ($(tail -1 "$W/calib.log"))"
@@ -68,7 +68,7 @@ if [ ! -f "$QMIX/stats/head_L40.json" ]; then
   for att in 1 2 3; do
     bash tools/v41/quant_layers.sh "$QMIX" 0 39 -- --map "$MAP" --gguf "$GGUF" >> "$LOG" 2>&1 && break
     chk; [ "$att" = 3 ] && die "quant pass (mixed), 3 attempts: $(tail -1 "$QMIX/quant.log")"
-    log "quant pass exited early (attempt $att: $(tail -1 "$QMIX/quant.log")) - restarting in 10 min"; sleep 600
+    log "quant pass exited early (attempt $att: $(tail -1 "$QMIX/quant.log")) - restarting now"; sleep 5
   done
   [ -f "$QMIX/stats/head_L40.json" ] || { chk; die "quant pass (mixed) ended without head_L40.json"; }
 fi
