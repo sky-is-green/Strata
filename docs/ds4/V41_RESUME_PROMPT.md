@@ -2,6 +2,12 @@
 
 **Last updated:** 2026-10-10 ~09:05 by `strata-ds4-gpu`.
 
+**2026-10-10 NIGHT (engine port, by strata-ds4-gpu; Mal asleep, chain running): READ §Engine (night of 10-10) FIRST.**
+Chain: calibration resumed 22:28 at layer 25 (`v41allday start`), then tier map -> layout -> GSQ pass (~07:00 est).
+Engine (tools/v41/engine/, all committed): geometry/loader, Ds41Dense (CPU-gated vs model.py), act-quant ops,
+Ds41MoeTier (per-expert format classes), Ds41FileBlobs, ds41_generate (CLI/--ppl/--serve).  GPU runs NOT done yet
+(GPU owned by the chain).  Next: §Engine next steps.
+
 **09:04 UPDATE (supersedes 09:01):** the WHOLE chain runs unattended: `v41allday` (tools/v41/all_day.sh + alldayctl.sh,
 start|status|stop|log): calibration 7-39 + head -> v41_alloc tier map -> GGUF layout on SSD NVME/AI/V41-GSQ -> GSQ quant pass
 (mixed, in place) + its head gate.  All-Q2_0 control SKIPPED (Mal).  Resumable: rerun `v41allday start` after a failure/stop.
@@ -473,3 +479,40 @@ needs **shard 48**. Layer 0 needs no engram at all.
 - Verify downloads with **O_DIRECT** reads; RAM has a known bad lane (soft-offlined).
 - Commits end with the `Co-Authored-By` trailer; **no pushes without Mal's OK.**
 - Measure before concluding; reproduce before diagnosing; commit each verified step.
+
+---
+
+## Engine (night of 10-10) - tools/v41/engine/
+
+| file | what | gate |
+|---|---|---|
+| `ds41_geometry.hpp` | keys, full tensor map (conditional sets), per-expert tier maps, full-length GGUF arrays (the reader samples 64) | `test_ds41_geometry` PASS + mutations |
+| `ds41_dense.{hpp,cpp}` | V4.1 dense half: one pass = n tokens at pos0 (decode n=1, prefill chunk); single-pass HC; window ring [ring \| pass rows]; compressed KV on kv sources (ratio 2 pooled, 1 plain) read by later layers; indexer (fused ggml_lightning_indexer) on index sources, top-k reused; layer-20 candidate blocks (pool max + pinned newest block); flash-attn with the QUERY AS BATCH (each query its own window + top-k rows), sinks; Engram rows from HF shards 47/48; snapshot/restore (rings only) | CPU vs `ds41_golden.py`: 3-layer file, 21 tok cos>=0.99996 top-1 21/21; 1688 tok (top-512 of 844) cos>=0.99983; decode == prefill |
+| `ds41_ops.hpp` | model.py's KV/indexer rounding (FP8/pow2, FP4/E4M3, FP4/pow2) as exact stock-ggml float tricks, `act_quant` default on | bit-identical to torch on 2M values (NaN-overflow case saturates) |
+| `ds41_engram.{hpp,cpp}` | n-gram hash (GGUF arrays) + parallel preads of rows + scales | via the dense gate (layer 1) |
+| `ds41_golden.py` / `compare_ds41.py` | model.py on the GGUF's own weights (CPU, layer by layer) / per-layer cos, routing sets, logits | - |
+| `ds41_moe.{hpp,cpp}` | fork of tools/ds4/ds4_moe: per-expert format CLASSES (gu,d pair); per-class launches / pool runs / LRU; chunk = pass per class | CPU path via ds41_generate on the 3-layer file; GPU path compiled, NOT RUN |
+| `ds41_generate.cpp` | `-m F --ids ... [--ppl] [--prefill-chunk N] [--serve] [--engram D:D:D] [--rank r.bin] [--vram-lru]` | CPU smoke on the 3-layer file |
+
+Facts found tonight:
+- model.py's KV rounding matters: without it 3-layer outputs move cos 1.6e-3 and 16% of routing sets (DwarfStar
+  emulates it too).  Engine with it vs golden with it: cos >= 0.9992 (step-function amplification of Q8 noise).
+- The CPU native-expert buffers were V4-sized: raised for V4.1 (kNativeActBytes 5840, kNativeHBytes 2628,
+  kNativeFFMax 2304, ActQ 5120 wide).  Q2_0 classes need ActQ activations (Strata's Q2_0 kernels), not nact.
+- The writer's `--experts-in-place` file is shorter than its last expert region until the quant pass writes it
+  (the partial test file was truncate-extended); the real file is complete after step 4.
+- NEVER `pkill -f` with a pattern in your own command line: it killed this session's shell once tonight.
+- 3-layer test file: /home/mal/AI/v41-dev/v41-L0-2h.gguf (holes = zero experts); goldens in v41-dev/g1, g2, g2q.
+
+### Engine next steps (in order)
+1. When the layout exists (step 3 of the chain): `test_ds41_geometry` on the real file; full 40-layer dense gate on
+   the CPU with zero experts (golden `--zero-experts` is NOT written yet: experts are being filled during step 4 -
+   race), small S (~200) so ratio-1 + all index layers run; DS41 candidate logic at small S needs an env override of
+   candidate_topk_blocks on both sides (not written).
+2. GPU (after step 4 finishes, ~07:00, Mal's GPU): `test_ds41_ops --cuda` (bit-exactness of the rounding on CUDA),
+   then `build-ds4-gpu/ds41_generate --backend cuda --experts gpu --prefill-chunk 512 --ppl` through memguard on a
+   held-out text; compare ppl/top-1 with the calibration head gate (`stats/head_L40.json`); act-quant on/off ppl.
+3. Speed: router predictor (prefetch), rank file from calibration counts (`stats/LNN.json` experts[e].n ->
+   int32 pairs), vram-lru, arena budget, chunk MMQ, decode graph reuse; target > GLM (25 tok/s decode, 400 tok/s
+   prefill); 512K context (caches: ~1.5 GB at 512K with BF16 storage - set kv_type BF16).
+4. Serving: ds41-engine.sh / configs / strata-ds41-quetza wrapper (copy GLM's); tool-call + coherence checks.
