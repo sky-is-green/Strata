@@ -533,7 +533,7 @@ def cmd_layer(a):
         os.makedirs(wpath("stats"), exist_ok=True)
         json.dump({"summary": summ, "experts": stats}, open(wpath("stats", f"L{L:02d}.json"), "w"))
     if a.gc and L >= 1:
-        for p in (wpath("h", f"L{L - 1:02d}.bin"),):
+        for p in (wpath("h", f"L{L - 1:02d}.bin"), wpath("shared", f"L{L - 1:02d}.pt")):   # shared: 3 GB/layer from L21
             if os.path.exists(p):
                 os.remove(p)
     log(f"layer {L}: done in {time.time() - t0:.0f} s; load CV {summ['load_cv']:.3f}, unused {summ['unused_experts']}, "
