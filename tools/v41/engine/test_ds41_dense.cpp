@@ -143,6 +143,7 @@ int main(int argc, char ** argv) {
         std::vector<std::vector<float>> X((size_t) nl), P((size_t) nl), WT((size_t) nl);
         std::vector<std::vector<int>> ID((size_t) nl);
         std::vector<float> logits((size_t) S * (size_t) V);
+        ::mkdir(out.c_str(), 0755);
         const auto t0 = std::chrono::steady_clock::now();
         const int step = m == "decode" ? 1 : chunk;
         for (int p0 = 0; p0 < S; p0 += step) {
@@ -159,6 +160,21 @@ int main(int argc, char ** argv) {
                         for (int k = 0; k < NU; ++k)
                             rx.expert(l, ids[(size_t) (t * NU + k)], wts[(size_t) (t * NU + k)], fn + (size_t) t * D, &routed[(size_t) t * D]);
                 if (!dn.finish((int) l, routed.data())) { std::fprintf(stderr, "finish: %s\n", dn.last_error().c_str()); return 1; }
+                {   // index source layers: the visible top-k rows per query (gate of the indexer / candidates)
+                    std::vector<int> sl;
+                    std::vector<float> sm;
+                    int K = 0;
+                    dn.read_sel((int) l, sl, sm, &K);
+                    if (K > 0) {
+                        std::ofstream f(out + "/" + m + "_sel" + std::to_string(l) + ".txt", std::ios::app);
+                        for (int t = 0; t < n; ++t) {
+                            f << (p0 + t);
+                            for (int j = 0; j < K; ++j)
+                                if (sm[(size_t) (t * K + j)] == 0.0f) f << ' ' << sl[(size_t) (t * K + j)];
+                            f << '\n';
+                        }
+                    }
+                }
                 std::vector<float> xs, pr;
                 dn.read_state(xs, pr);
                 X[(size_t) l].insert(X[(size_t) l].end(), xs.begin(), xs.end());

@@ -84,6 +84,9 @@ public:
     int snapshot_pos() const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
+    /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
+    /// and their visibility mask; empty for other layers.
+    bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);
     /// The x state after begin (+ the Engram add of the layer `il`, when il is an Engram layer) - gate tap.
     const std::string & last_error() const;
 

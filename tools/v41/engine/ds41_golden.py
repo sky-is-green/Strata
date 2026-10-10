@@ -271,6 +271,10 @@ def main():
                 h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :], None)
                 out[f"engram{L}"] = h[0].float().numpy()
             h, pre = blk(h, 0, pre, None)
+            if blk.attn.is_index_source and M.shared_attn.topk_idxs is not None:
+                ti = M.shared_attn.topk_idxs[0]                     # [S, K] (+ window offset), -1 = masked
+                off = 0 if L == 0 else None
+                out[f"sel{L}"] = ti.numpy().astype(np.int32)
         out[f"x{L}"] = h[0].float().numpy()
         out[f"pre{L}"] = pre[0].float().numpy()
         out[f"ids{L}"] = rec["ids"].numpy().astype(np.int32)

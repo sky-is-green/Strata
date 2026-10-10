@@ -953,3 +953,26 @@ bool Ds41Dense::restore() {
 }
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
+
+bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
+    Impl & im = *p_;
+    const auto & L = im.ly[(size_t) il];
+    sel.clear();
+    mask.clear();
+    *K = 0;
+    if (!L.idx_src || !L.ratio) return true;
+    const int64_t cap = im.pass_cap[L.ratio];
+    if (cap == 0) return true;
+    const int64_t k = std::min<int64_t>(cap, im.ITOP);
+    std::vector<int32_t> s((size_t) (im.ITOP * im.n));
+    std::vector<float> m((size_t) (im.ITOP * im.n));
+    ggml_backend_tensor_get(L.sel, s.data(), 0, s.size() * 4);
+    ggml_backend_tensor_get(L.selm, m.data(), 0, m.size() * 4);
+    for (int t = 0; t < im.n; ++t)
+        for (int64_t j = 0; j < k; ++j) {
+            sel.push_back(s[(size_t) (t * im.ITOP + j)]);
+            mask.push_back(m[(size_t) (t * im.ITOP + j)]);
+        }
+    *K = (int) k;
+    return true;
+}

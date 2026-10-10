@@ -504,6 +504,14 @@ Facts found tonight:
 - NEVER `pkill -f` with a pattern in your own command line: it killed this session's shell once tonight.
 - 3-layer test file: /home/mal/AI/v41-dev/v41-L0-2h.gguf (holes = zero experts); goldens in v41-dev/g1, g2, g2q.
 
+40-layer CPU gate (2026-10-11 00:30, dense-only test file /home/mal/AI/v41-dev/v41-all-h.gguf, zero experts, 300 tok):
+- real top-k (512 >= visible rows), no act-quant: block outputs cos >= 0.996 every layer (most >= 0.9993), logits
+  mean cos 0.99995, top-1 295/300 vs model.py
+- top-32 / 8 candidate blocks (forced selection): selected-row sets identical for 272/300 queries at L2, mean Jaccard
+  0.98-0.994 at every index layer (L24+ candidate layers incl.); differences = boundary ties (ggml F16 activations)
+- engine decode == chunked prefill over 40 layers: logits cos 1.000000, top-1 300/300 (act-quant on, top-32)
+- zero experts make |x| ~3e4 by L39 (unnatural), amplifying noise; the real gate is ppl on the filled file.
+
 ### Engine next steps (in order)
 1. When the layout exists (step 3 of the chain): `test_ds41_geometry` on the real file; full 40-layer dense gate on
    the CPU with zero experts (golden `--zero-experts` is NOT written yet: experts are being filled during step 4 -
