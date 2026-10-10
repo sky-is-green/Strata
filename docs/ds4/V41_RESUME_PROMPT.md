@@ -512,6 +512,13 @@ Facts found tonight:
 - engine decode == chunked prefill over 40 layers: logits cos 1.000000, top-1 300/300 (act-quant on, top-32)
 - zero experts make |x| ~3e4 by L39 (unnatural), amplifying noise; the real gate is ppl on the filled file.
 
+Real file (2026-10-11 01:55): calibration done 01:29 (teacher head gate ALL/eval ppl 4.915, top-1 0.701; code 1.74,
+agent 2.12, reason 5.83, zh 6.83, agentic_long 9.79); tier map = all-Q2_0 bytes, proxy error -17%; layout passes
+test_ds41_geometry (9 classes model-wide, 7 in L0); GSQ pass started 01:41 at ~13 min/layer -> ETA ~10:30.
+test_ds41_moe (CPU) on the real L0, all 7 classes mixed per token: rel 1.2-1.5e-2 vs dequant+F32 = PASS (the Q8
+activation rounding, as DS4's tier).  Held-out eval token files for engine ppl: /home/mal/AI/v41-dev/eval/*.i32
+(the head gate's eval sequences: compare engine ppl with stats/head_L40.json and the GSQ pass's QMIX head).
+
 ### Engine next steps (in order)
 1. When the layout exists (step 3 of the chain): `test_ds41_geometry` on the real file; full 40-layer dense gate on
    the CPU with zero experts (golden `--zero-experts` is NOT written yet: experts are being filled during step 4 -
