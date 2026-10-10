@@ -27,6 +27,12 @@ below it is history (still accurate unless this section says otherwise).
   copy started 07:15** (`/home/mal/AI/v41-dev/copy47.log`, `.partial`): when dd says "records out", verify the same
   way (size + sampled blocks vs Crucible), `mv .partial` -> final name, `touch .ok`.  Engine config
   (`tools/v41/serve/strata-ds41.json`), `gpu_bringup.sh` and `v41_calib.DIRS` list NVME1TB FIRST.
+- **PLAN for the running chain (agreed with Mal 07:15): do NOT stop/restart it for the Engram move.**  Only layers 1 and
+  14 read Engram and both are already written; layers 15-39 and the final head gate never read it, so a restart would
+  only redo a layer.  The NVMe Engram copies are for the ENGINE (decode reads 48 rows/token).  Let the chain finish
+  (~12:20), then: (a) finish/verify the shard 47 copy, (b) Mal remounts the ntfs-3g drives with ntfs3 (commands below),
+  (c) GPU bring-up.  Only if a layer must be RE-quantized later (e.g. a re-export) does the order matter: the calib/quant
+  code already reads Engram from NVME1TB first (v41_calib.DIRS).
 - **Drives:** Crucial1TB, Crucible, Team CX2 are `fuseblk` (ntfs-3g, slow random reads).  Suggested to Mal (not done,
   needs sudo): Crucible/Team CX2 -> `ntfs3` read-only (zero risk), Crucial1TB -> ntfs3 rw after the chain (or keep).
   Never `force`-mount a dirty volume.  With both Engram shards on NVME1TB this matters less for the engine.
