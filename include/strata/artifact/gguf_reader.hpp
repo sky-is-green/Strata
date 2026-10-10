@@ -118,6 +118,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 143:   // Strata-DS4 fork: llama-tq / ik_llama PTQ1_0 ternary (V4.1 routed experts; never reaches ggml)
+        return "PTQ1_0";
     default:
         return "?";
     }
@@ -235,6 +237,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 42:
         elems = 64;
         bytes = 18;
+        return true;
+    case 143:   // Strata-DS4 fork: PTQ1_0 (128 trits in 28 B: 26 B of base-3 digits + fp16 d)
+        elems = 128;
+        bytes = 28;
         return true;
     default:
         return false;

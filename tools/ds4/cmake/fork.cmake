@@ -62,3 +62,6 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_dense.cmake OPTIONAL)
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_moe.cmake OPTIONAL)
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ds4_engine.cmake OPTIONAL)
+
+# DeepSeek-V4.1 engine (tools/v41/engine)
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/engine/v41_engine.cmake OPTIONAL)
