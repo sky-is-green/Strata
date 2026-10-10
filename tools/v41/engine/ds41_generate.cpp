@@ -59,7 +59,7 @@ struct Args {
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = false, arena_adapt = false, chunk_mmq = false;
     bool act_quant = true;
-    float skip_miss = 0.0f;
+    float skip_miss = 0.0f, skip_file = 0.0f;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -92,6 +92,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
+        else if (k == "--skip-file") a.skip_file = (float) std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
@@ -211,6 +212,7 @@ int main(int argc, char ** argv) {
     mc.arena_adapt = a.arena_adapt;
     mc.chunk_mmq = a.chunk_mmq;
     mc.skip_miss = a.skip_miss;
+    mc.skip_file = a.skip_file;
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!mc.cpu_only) {
         std::vector<std::pair<int32_t, int32_t>> ranked;

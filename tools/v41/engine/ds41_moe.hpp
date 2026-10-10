@@ -274,6 +274,9 @@ struct Ds41MoeConfig {
     /// Decode (run): a routed expert that is a VRAM miss and weighs less than `skip_miss` x the token's weight sum is
     /// dropped (not fetched, contributes 0).  Hits are never dropped.  0 = off.  A quality trade: measure ppl.
     float skip_miss = 0.0f;
+    /// Decode (run): the same rule for the FILE TIER only (experts neither in VRAM nor in the RAM arena: an NVMe read
+    /// each, ~2 ms).  0 = off.  A quality trade: measure ppl.
+    float skip_file = 0.0f;
     /// Decode (MiMo and DS4): a PCIe-share miss (and a prefetched expert the routing used) takes
     /// the least-recently-used VRAM slot of its layer instead of a staging buffer, so the cache follows the
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per

@@ -1251,6 +1251,17 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // skip_miss: a miss with a small gate weight is dropped - its 6.75 MB never moves (wloc = the weights the sum uses)
     float wloc[kMaxParts];
     for (int64_t k = 0; k < K; ++k) wloc[k] = w6[k];
+    if (im.cfg.skip_file > 0.0f && nc > 0) {   // file-tier misses only (not in the arena)
+        double ws = 0;
+        for (int64_t k = 0; k < K; ++k) ws += (double) w6[k];
+        int keep = 0;
+        for (int i = 0; i < nc; ++i) {
+            const int32_t k = cpu_i[i];
+            if (!gp.arena.ptr(layer, ids6[k]) && (double) w6[k] < (double) im.cfg.skip_file * ws) { wloc[k] = 0.0f; ++st.skipped; }
+            else cpu_i[keep++] = k;
+        }
+        nc = keep;
+    }
     if (im.cfg.skip_miss > 0.0f && nc > 0) {
         double ws = 0;
         for (int64_t k = 0; k < K; ++k) ws += (double) w6[k];
