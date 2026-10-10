@@ -193,7 +193,7 @@ def build_block(gg, args, layout, L):
     return blk
 
 
-def moe_forward(gg, L, X, rec):
+def moe_forward(gg, L, X, rec, zero=False):
     def fwd(self, x, image_mask=None):
         shape = x.size()
         x = x.view(-1, self.dim).float()
@@ -201,7 +201,7 @@ def moe_forward(gg, L, X, rec):
         rec["ids"], rec["wts"] = indices.clone(), weights.clone()
         y = torch.zeros_like(x)
         lim = self.shared_experts.swiglu_limit
-        for e in sorted(set(indices.flatten().tolist())):
+        for e in ([] if zero else sorted(set(indices.flatten().tolist()))):
             W1, W3, W2 = (gg.expert(L, r, e, X) for r in ("gate", "up", "down"))
             idx, top = torch.where(indices == e)
             xe = x[idx]
@@ -224,6 +224,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-actquant", action="store_true")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--zero-experts", action="store_true", help="routed experts contribute 0 (a file still being filled)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     gg = GG(a.gguf)
@@ -244,6 +245,10 @@ def main():
     torch.set_default_dtype(F32)
     M.default_dtype = F32
     args = C.model_args(1, S)
+    if os.environ.get("DS41_TEST_TOPK"):
+        args.index_topk = int(os.environ["DS41_TEST_TOPK"])
+    if os.environ.get("DS41_TEST_CAND_BLOCKS"):
+        args.candidate_topk_blocks = int(os.environ["DS41_TEST_CAND_BLOCKS"])
     layout = M.EngramLayout.from_args(args)
     tokens = torch.tensor([ids])
     hashes = M.NgramHashState(args, layout, tok)(tokens, 0)        # [1, S, n_engram_layers, 24]
@@ -260,7 +265,7 @@ def main():
         blk = build_block(gg, args, layout, L)
         X = expert_map(gg, L, args.n_routed_experts)
         rec = {}
-        blk.ffn.forward = moe_forward(gg, L, X, rec).__get__(blk.ffn)
+        blk.ffn.forward = moe_forward(gg, L, X, rec, a.zero_experts).__get__(blk.ffn)
         with torch.inference_mode():
             if blk.engram is not None:
                 h = blk.engram(h, hashes[:, :, blk.engram.layer_hash_index, :], None)

@@ -615,6 +615,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.OL = G.o_lora; im.OGD = G.n_head * G.d_head / G.o_groups; im.RQ = G.r_q; im.SWA = G.n_swa;
     im.IH = G.idx_heads; im.ID = G.idx_dim; im.ITOP = G.idx_topk; im.NE = G.n_expert; im.NU = G.n_used; im.NFF = G.n_ff;
     im.CB = G.cand_blocks; im.CBS = G.cand_bsize; im.EC = (G.engram_ngram - 1) * G.engram_heads; im.ED = G.engram_dim;
+    // gate-only overrides (the golden takes the same): small top-k / candidate counts make the selection logic bite
+    // on a short prompt
+    if (const char * e = std::getenv("DS41_TEST_TOPK")) im.ITOP = std::atoi(e);
+    if (const char * e = std::getenv("DS41_TEST_CAND_BLOCKS")) im.CB = std::atoi(e);
     im.NC = std::max(1, cfg.max_pass);
     im.RAW = im.SWA + 3;
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
