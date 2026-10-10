@@ -1,5 +1,112 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
+**Last updated:** 2026-10-11 ~07:20 by `strata-ds4-gpu` (Claude).  **READ §HANDOFF 2026-10-11 FIRST** - everything
+below it is history (still accurate unless this section says otherwise).
+
+## HANDOFF 2026-10-11 07:20
+
+### 1. State right now
+- **GSQ quant pass running** (step 4/4 of `v41allday`, chain pid in /media/Crucial1TB/v41-calib/allday.pid): layers 0-14
+  written into `/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf` (152 GiB, single file, kernel ntfs3); layer 15 started
+  07:07; ~12.5 min/layer -> **ETA ~12:20**, then its own head gate on the quantized chain
+  (`/media/Crucial1TB/v41-quant-mixed/stats/head_L40.json`).  Check: `v41allday status`, `tail
+  /media/Crucial1TB/v41-quant-mixed/quant.log`.  Pause: `v41allday stop` (after the current layer); resume
+  `v41allday start` (resumes at the first unfinished layer).  The model is unusable until all 40 layers are written
+  (unwritten layers are zero experts).
+- **Calibration DONE** 01:29.  Teacher head gate (`/media/Crucial1TB/v41-calib/stats/head_L40.json`, held-out
+  49,146 tokens): **ALL/eval ppl 4.915, top-1 0.701**; per domain eval: code 1.739, agent 2.121, reason 5.832,
+  zh 6.831, agentic_long 9.793.  This is the bar for the GSQ file.
+- **Tier map** `/media/Crucial1TB/v41-calib/alloc_full.json` (v41_alloc --per-proj): budget = all-Q2_0 bytes (142.4 GiB
+  experts), proxy error 1.882 vs all-Q2_0 2.269 (-17%).  Early layers get Q3_K (L4-8 ~2.45-2.52 bpw), L33-39 ~2.0.
+  9 (gu,down) format classes model-wide, up to 7-8 per layer.
+- **Night fixes (all committed, all in the running chain):** L7 OOM (1.88 GiB fp32 torch.cat of the propagated output
+  -> chunked bf16, `bf23f296`); L13 crash in `q3k_split` (all-zero super-block whose fp16 d did not round-trip ->
+  search/re-round + log, `2989e535`); L14 slow (Engram table on Team CX2: slow drive + ntfs-3g FUSE, 1h40).
+- **Engram shards copied to NVMe** (Mal OK'd 2026-10-11): `/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/`
+  shard 48 (L14) DONE + verified (size + 302 sampled MiB) + `.ok` + `model.safetensors.index.json`; **shard 47 (L1)
+  copy started 07:15** (`/home/mal/AI/v41-dev/copy47.log`, `.partial`): when dd says "records out", verify the same
+  way (size + sampled blocks vs Crucible), `mv .partial` -> final name, `touch .ok`.  Engine config
+  (`tools/v41/serve/strata-ds41.json`), `gpu_bringup.sh` and `v41_calib.DIRS` list NVME1TB FIRST.
+- **Drives:** Crucial1TB, Crucible, Team CX2 are `fuseblk` (ntfs-3g, slow random reads).  Suggested to Mal (not done,
+  needs sudo): Crucible/Team CX2 -> `ntfs3` read-only (zero risk), Crucial1TB -> ntfs3 rw after the chain (or keep).
+  Never `force`-mount a dirty volume.  With both Engram shards on NVME1TB this matters less for the engine.
+- **Housekeeping done 07:05:** deleted `/media/mal/NVME1TB/syv-qwen` (vLLM Qwen3.8 repo + 23 GB models) and the wrappers
+  `qwen3.8-quetza-vllm`, `qwen3.8-swift-quetza-vllm` (+ .bak) - Mal: moved to NInfer.  Gateway profiles untouched.
+
+### 2. The engine (tools/v41/engine/, all committed; GPU NEVER RUN YET)
+Build trees: `build-ds4` (CPU, ggml from FetchContent pin) and `build-ds4-gpu` (CUDA, STRATA_GGML_DIR=third_party/llama.cpp
+- gitignored, NOT tracked: never add ops there; ds41_ops.hpp builds the rounding from stock ops for that reason).
+CMake: `tools/v41/engine/v41_engine.cmake` (included at the end of tools/ds4/cmake/fork.cmake).
+- `ds41_geometry.hpp` - keys + full tensor map + per-expert tier maps; full-length GGUF arrays (strata::GgufFile keeps
+  64 items).  `test_ds41_geometry FILE` -> PASS on the real file.
+- `ds41_dense.{hpp,cpp}` - dense half.  Pass = n tokens at pos0 (decode n=1 cached graphs w/ CUDA-graph reuse; prefill
+  n=chunk built per pass).  Single-pass HC (pre_state carries the next attention's pre-mix); window ring [ring|pass];
+  compressed KV on kv sources (2,8,14,20: ratio 2 pooled / 1 plain) read by later same-ratio layers; indexer (fused
+  ggml_lightning_indexer) on index sources (2,8,14,20,24,28,32,36), top-k reused until the next; L20 candidate blocks
+  (pool_2d max, newest block pinned) masking L24+; attention = flash-attn with the QUERY AS BATCH (each query its own
+  128 window + top-k rows; pad keys to 256 off-CPU), sinks; Engram rows via Ds41Engram at L1/L14; act-quant rounding;
+  KV BF16 (lossless with act-quant); snapshot/restore (rings, ~11 MB) for multi-turn; predict() router hint; read_sel tap.
+- `ds41_ops.hpp` - FP8/pow2, FP4/E4M3, FP4/pow2 fake-quant from stock ggml ops (Veltkamp + magic-number RNE).
+- `ds41_engram.{hpp,cpp}` - hash from GGUF arrays, parallel preads (fork-join pool) of 256-B rows + 8-B scales.
+- `ds41_moe.{hpp,cpp}` - FORK of tools/ds4/ds4_moe with per-expert format CLASSES (Ds41MoeGeom::eclass, cls_gu, cls_d):
+  per-class CPU pool runs (Q2_0 classes need ActQ: im.actq), per-class grouped GPU launches, VRAM LRU swaps within
+  (layer, class), chunk path = one pass per class + one weighted sum, run_multi token-by-token for per-expert geoms,
+  `skip_file` option.  `Ds41FileBlobs` = an expert's blob from the 3 per-type tensors (preads).  `ds41_read_ranked`.
+- `ds41_generate.cpp` - CLI (`--ids/--ids-file -n --ppl --dump-logits`), `--serve` (Strata engine line protocol: GEN/
+  STOP/QUIT -> READY/RESUME/PP/T/DONE/ERR; snapshot reuse), flags `--backend cuda|cpu --experts gpu|cpu --engram D:D
+  --rank r.bin --slots auto|N --vram-margin --arena-gib --vram-lru --arena-adapt --pcie --pf-b --prefill-chunk N
+  --chunk-mmq --skip-miss --skip-file --ctx --temp --stop --no-actquant`.
+- Tests: `test_ds41_dense` (vs golden), `test_ds41_ops [--cuda]`, `test_ds41_moe[_gpu] FILE --layers .. [--gpu]`,
+  `ds41_golden.py` (model.py on the GGUF's weights, `--no-actquant --zero-experts`, env DS41_TEST_TOPK /
+  DS41_TEST_CAND_BLOCKS on both sides), `compare_ds41.py`.
+- Serving: `tools/v41/serve/serve_ds41.py` (+40 tests), `ds41-engine.sh`, `strata-ds41.json` (port 8150, ctx 524288,
+  chunk 1024, arena 64, vram-lru, rank file), `strata-ds41-quetza.wrapper` (NOT installed in ~/.local/bin until the
+  engine runs).  Tokenizer: `/media/mal/SSD NVME/AI/V41-GSQ/tokenizer`.  Rank: `/media/mal/SSD NVME/AI/V41-GSQ/rank.bin`
+  (v41_rank.py: calibration count per byte).
+- Shared-file fork edits (one-liners, documented): gguf_reader.hpp (PTQ1_0 143), native_expert.hpp (kNativeActBytes
+  5840, kNativeHBytes 2628, kNativeFFMax 2304), expert.hpp (ActQ kActMax 5120).
+
+### 3. Gates passed (CPU)
+- 3-layer file: block outputs cos >= 0.99996 vs model.py (21 tok), >= 0.99983 (1688 tok, top-512 of 844); decode ==
+  chunked prefill; act-quant rounding bit-identical to torch (2M values); BF16 KV bit-identical to F32.
+- 40-layer dense-only file (`/home/mal/AI/v41-dev/v41-all-h.gguf`, zero experts, 300 tok): real top-k: cos >= 0.996
+  every layer, logits mean 0.99995, top-1 295/300; forced top-32/8 blocks: selected sets identical 272/300 at L2, mean
+  Jaccard 0.98-0.994 at all index layers (boundary ties from ggml F16 activations); decode == prefill 300/300.
+- Tier on the REAL L0 (all 7 classes mixed per token): rel 1.2-1.5e-2 vs dequant+F32 (the Q8 activation rounding) PASS.
+- Dropping act-quant moves model.py's own outputs cos 1.6e-3 / 16% routing sets -> kept on (measure ppl on/off on GPU).
+
+### 4. NEXT (in order) - when the GSQ pass is DONE (~12:20) and Mal OKs the GPU
+1. Finish/verify the shard 47 copy (above).  Compare the GSQ head gate (v41-quant-mixed/stats/head_L40.json) with the
+   teacher's 4.915 - report per domain to Mal plainly.
+2. `bash tools/v41/engine/gpu_bringup.sh` (RANK=/media/mal/SSD\ NVME/AI/V41-GSQ/rank.bin optional): CUDA rounding
+   bit-exact -> tier on real L0/20/39 with --gpu -> ds41_generate --ppl on 2048 held-out code tokens (chunk 512).
+   Expect issues on first GPU contact (graph reuse, FA with ne3 batch, top_k sizes, lightning-indexer shapes): fix with
+   the CPU tree as oracle (`--backend cpu`).
+3. Engine ppl on the 6 held-out eval sequences (`/home/mal/AI/v41-dev/eval/seq*.i32`, 8192 tok each) vs the GSQ head
+   gate: the engine must reproduce it (same weights; engine has Q8_0 dense vs FP8 + Q8 activations - small diff).
+   Also act-quant on/off ppl.
+4. Speed (Mal's target: beat GLM's 25 tok/s decode / 400 tok/s prefill, 512K ctx).  Routing is flat: rank shows 16 GiB
+   of experts = 42% of lookups, 64 GiB = 78%, 80 GiB = 86% -> expect ~8-10 tok/s at first.  Levers, measure each:
+   arena size (84 GiB memguard cap), vram-lru, arena-adapt, pf-b prefetch (Ds41Dense::predict), per-class launch
+   count (up to ~4 per token-layer: fuse into one launch), merge the 3 readbacks per layer, Engram read time/token,
+   prefill chunk 2048-8192 + chunk-mmq (Q3_K only), **soft-prune** = route-bias penalty on the coldest experts
+   (GLM's recipe, not yet in ds41: port set_route_bias / --prune-penalty from tools/ds4), skip-file.
+5. Size (Mal asked: Maya-size ~90 GiB?).  `/home/mal/AI/v41-dev/size_sweep.py`: prune+mixed proxy error 0.54 at
+   89 GiB vs current mix 1.88 / all-Q2 2.17 - BUT pruning cost is only measured on the calibration corpus (OOD
+   risk).  Recommendation given: keep the 152 file, soft-prune at runtime, decide on a smaller re-export after real
+   ppl/tok/s (new tier map = minutes on CPU; a new GSQ pass = ~8 h GPU).
+6. Serving: install `strata-ds41-quetza` (copy wrapper to ~/.local/bin) once `--serve` works; test via serve_ds41
+   (OpenAI + Anthropic, tool calls), coherence, agentic tasks, loop test, DwarfStar's official V4.1 fixtures.
+7. Later: DSpark/MTP (mtp.* not exported yet), 512K long-context run, upstream of the Engram/indexer work.
+
+### 5. Rules (Mal)
+Mal decides GPU use (strata-glm shares it: lock ~/.quetza-data/conductor/ds4-gpu.lock).  Never push without Mal's OK
+(nothing pushed).  Commit each verified step with the Co-Authored-By trailer.  Never `pkill -f` a pattern that can match
+your own command line (it killed this session's shell once): use PIDs.  Never edit a running script in place
+(.new + mv).  CPU work nice 15; big RAM runs via tools/ds4/memguard.sh (it takes the GPU lock - not while the chain
+runs).  Keep HF shards 47/48 on Crucible/Team CX2 as backups.  NSFW is headless-only (CLAUDE.md).  Explain plainly.
+
+
 **Last updated:** 2026-10-10 ~09:05 by `strata-ds4-gpu`.
 
 **2026-10-10 NIGHT (engine port, by strata-ds4-gpu; Mal asleep, chain running): READ §Engine (night of 10-10) FIRST.**
