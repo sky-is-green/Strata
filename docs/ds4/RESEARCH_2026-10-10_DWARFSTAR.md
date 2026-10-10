@@ -17,8 +17,8 @@ mw00/project-maya, bodhi37/strata (Qwen/GLM only, no DeepSeek code), sectilelabs
    (the head gate's teacher numbers are the in-house version of this).
 2. **Mixed-layer evidence (`gguf-tools/mixed/README.md`).**  On V4 Flash, upgrading only the LAST SIX layers'
    routed experts (37-42 of 43) from 2-bit to Q4 made a 91 GB file measurably closer to full Q4 (153 GB) than plain
-   2-bit.  Independent support for edge-weighting late layers; check what our `v41_alloc.py --edge-weight` gives
-   the last layers of V4.1 (40 layers -> ~34-39) before the export.
+   2-bit.  Our `v41_alloc.py --edge-weight 2.0` already boosts layers 0-1 and 37-39 (last 3); DwarfStar's
+   best result was the last SIX (V4.1: 34-39).  Widening the boost is Mal's call (open question 2026-10-10).
 3. **Validator `gguf-tools/deepseek41_validate_gguf.py`.**  Audits a complete V4.1 GGUF's layout and re-encodes
    sampled experts against the source; Engram as 264-B rows in a disk shard.  Our uniform-type tensors and dense
    half use DwarfStar names, so its layout checks are a free second opinion on our writer.  It will NOT accept our
