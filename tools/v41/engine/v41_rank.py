@@ -40,7 +40,12 @@ def main():
             n = float(ex[str(e)]["n"]) if str(e) in ex else 0.0
             if amap and str(L) in amap:
                 m = amap[str(L)]
-                gu, dn = (m["gu"][e], m["dn"][e]) if isinstance(m, dict) else (m[e], m[e])
+                if isinstance(m, dict) and str(e) in m:          # v41_alloc --per-proj: {e: {gu, dn}}
+                    gu, dn = m[str(e)]["gu"], m[str(e)]["dn"]
+                elif isinstance(m, dict):
+                    gu, dn = m["gu"][e], m["dn"][e]
+                else:
+                    gu = dn = m[e]
             else:
                 gu = dn = "q2_0"
             b = 2 * D * FF * BPW[gu] + D * FF * BPW[dn]
