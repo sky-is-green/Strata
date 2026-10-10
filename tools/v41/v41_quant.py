@@ -169,7 +169,10 @@ class Layer:
             st["q_err"] = C.sq_err(xv, q1[0], q3[0], q2[0], gv, lim, Y)
             st["y_energy"] = float(Y.square().sum())
         if a.propagate == "quant":
-            out = C.expert_f(xe, q1[0], q3[0], q2[0], ge, lim).to(out_teacher.dtype)
+            # chunk by chunk straight into the output dtype: a hot expert's whole fp32 output (L7: 1.88 GiB) OOM'd
+            out = torch.empty((len(xe), C.D), dtype=out_teacher.dtype, device=xe.device)
+            for c in range(0, len(xe), C.ROWS):
+                out[c:c + C.ROWS] = C.expert_f(xe[c:c + C.ROWS], q1[0], q3[0], q2[0], ge[c:c + C.ROWS], lim).to(out.dtype)
         else:
             out = out_teacher
         return out, st
