@@ -43,6 +43,12 @@ below it is history (still accurate unless this section says otherwise).
   re-run into a qdir == the GGUF bytes of the old code (all 1152 matrices) + identical h/L18 (`compare_layer_bytes.py`;
   NB C.D = 5120, not 4096).  Layer ~830 s -> ~203 s.  Restarted 08:14 at L18 -> **ETA ~09:30-09:45** incl. head gate.
   Old file: /home/mal/AI/v41-dev/v41_quant.py.pre-graph.  Test dir to delete: /media/mal/SSD NVME/AI/v41-test-L17.
+- **GSQ PASS DONE 10:20** (all 40 layers rc=0; L22 + L26 needed the OOM retry at V41_ROWS=8192).  Head gate,
+  quantized chain vs teacher (held-out eval): **ALL 4.915 -> 5.645 (+14.9%), top-1 0.701 -> 0.674**; agent 2.121 ->
+  2.118 (=), reason 5.832 -> 6.190 (+6%), zh 6.831 -> 7.639 (+12%), code 1.739 -> 1.978 (+14%), agentic_long 9.793 ->
+  12.781 (+31%).  Fit split only +4.1% (fit/eval gap: few eval sequences, agentic_long/code eval most hurt).  No
+  all-Q2 control was run, so the mixed map's gain over plain Q2 is not measured.  Test dir deleted.  Crucial1TB:
+  v41-calib/h (20G) + shared (69G) are leftovers, deletable on Mal's OK.  NEXT: engine GPU bring-up (§4 step 2).
 - **Reference found (r/LocalLLaMA, Chida82, github.com/Chida82/sf-ds4-1flash):** stock antirez ds4 already runs V4.1
   Flash Q2 (152 GB + 189 GB Engram) with SSD streaming -> usable as a TOKEN-PARITY reference for our engine.  Their
   M5 Max numbers: decode 12 -> 25 tok/s, prefill 404 -> 636 tok/s; per-token profile ~50 ms, SSD expert reads ~4 ms.
