@@ -356,6 +356,12 @@ def expert_f(x, W1, W3, W2, g, lim):
     return (F.silu(gate) * up * g) @ W2.T
 
 
+def sq_err(x, W1, W3, W2, g, lim, Y):
+    """sum((expert_f(x) - Y)^2), ROWS at a time: no full-size temporaries for a hot expert."""
+    return sum(float((expert_f(x[c:c + ROWS], W1, W3, W2, g[c:c + ROWS], lim) - Y[c:c + ROWS]).square().sum())
+               for c in range(0, len(x), ROWS))
+
+
 def act_hessians(xf, W1, W3, gf, lim):
     """H1 = x^T x, H2 = a^T a (a = gated SwiGLU activation), accumulated ROWS at a time."""
     H1 = torch.zeros((xf.shape[1], xf.shape[1]), dtype=torch.float32, device=xf.device)
@@ -388,7 +394,7 @@ def screen_expert(exp, xe, ge, fit, lim, min_fit, damps=(0.01,)):
         return st
     Y = expert_f(xv, W1, W3, W2, gv, lim)
     st["y_energy"] = float(Y.square().sum())
-    err = lambda q1, q3, q2: float((expert_f(xv, q1, q3, q2, gv, lim) - Y).square().sum())
+    err = lambda q1, q3, q2: sq_err(xv, q1, q3, q2, gv, lim, Y)
     for di, damp in enumerate(damps):   # several damps (sweep): keys after the first get an "@damp" suffix
         sfx = "" if di == 0 else f"@{damp:g}"
         Qg1, Qr1 = G.quantize_stack([W1, W3], H1, TIERS, damp=damp, do_gptq=do_gptq)

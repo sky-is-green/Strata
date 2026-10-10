@@ -166,7 +166,7 @@ class Layer:
         xv, gv = xe[~fit], ge[~fit]
         if len(xv):   # held-out output error at the chosen tiers (the fit used none of these tokens)
             Y = C.expert_f(xv, W1, W3, W2, gv, lim)
-            st["q_err"] = float((C.expert_f(xv, q1[0], q3[0], q2[0], gv, lim) - Y).square().sum())
+            st["q_err"] = C.sq_err(xv, q1[0], q3[0], q2[0], gv, lim, Y)
             st["y_energy"] = float(Y.square().sum())
         if a.propagate == "quant":
             out = C.expert_f(xe, q1[0], q3[0], q2[0], ge, lim).to(out_teacher.dtype)
