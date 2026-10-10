@@ -38,6 +38,18 @@ below it is history (still accurate unless this section says otherwise).
 - **Housekeeping done 07:05:** deleted `/media/mal/NVME1TB/syv-qwen` (vLLM Qwen3.8 repo + 23 GB models) and the wrappers
   `qwen3.8-quetza-vllm`, `qwen3.8-swift-quetza-vllm` (+ .bak) - Mal: moved to NInfer.  Gateway profiles untouched.
 
+- **08:14 SPEED-UP (Mal asked; commit `baa59315`):** chain stopped after L17 (L18 1 min in, discarded), `v41_quant.py`
+  now uses `v41_gptq_graph.gptq` (CUDA-graph inner loop, bit-identical, 8x) + threaded encode/pwrite.  Verified: L17
+  re-run into a qdir == the GGUF bytes of the old code (all 1152 matrices) + identical h/L18 (`compare_layer_bytes.py`;
+  NB C.D = 5120, not 4096).  Layer ~830 s -> ~203 s.  Restarted 08:14 at L18 -> **ETA ~09:30-09:45** incl. head gate.
+  Old file: /home/mal/AI/v41-dev/v41_quant.py.pre-graph.  Test dir to delete: /media/mal/SSD NVME/AI/v41-test-L17.
+- **Reference found (r/LocalLLaMA, Chida82, github.com/Chida82/sf-ds4-1flash):** stock antirez ds4 already runs V4.1
+  Flash Q2 (152 GB + 189 GB Engram) with SSD streaming -> usable as a TOKEN-PARITY reference for our engine.  Their
+  M5 Max numbers: decode 12 -> 25 tok/s, prefill 404 -> 636 tok/s; per-token profile ~50 ms, SSD expert reads ~4 ms.
+  Their wins (each bit-exact): no per-layer GPU sync in decode, expert reads over a thread pool, a few kernel fusions,
+  prefill prefetches layer L+1's experts while L computes, prefill reads split across two SSDs holding byte-identical
+  copies (verified at start), KV cache on the other drive.  Their "rejected ideas" table with numbers: copy the habit.
+
 ### 2. The engine (tools/v41/engine/, all committed; GPU NEVER RUN YET)
 Build trees: `build-ds4` (CPU, ggml from FetchContent pin) and `build-ds4-gpu` (CUDA, STRATA_GGML_DIR=third_party/llama.cpp
 - gitignored, NOT tracked: never add ops there; ds41_ops.hpp builds the rounding from stock ops for that reason).
