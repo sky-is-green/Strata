@@ -519,6 +519,11 @@ test_ds41_moe (CPU) on the real L0, all 7 classes mixed per token: rel 1.2-1.5e-
 activation rounding, as DS4's tier).  Held-out eval token files for engine ppl: /home/mal/AI/v41-dev/eval/*.i32
 (the head gate's eval sequences: compare engine ppl with stats/head_L40.json and the GSQ pass's QMIX head).
 
+GSQ pass night notes (2026-10-11): L7 OOM'd 3x on a 1.88 GiB fp32 torch.cat of the propagated output (fixed:
+chunked into bf16, 4d0..; passed try 4); L13 died on q3k_split (an all-zero super-block whose fp16 d did not round-trip;
+fixed: search/re-round, logged; passed on the chain's retry); L14 (Engram table on Team CX2) is I/O-bound like in
+calibration (8294 s there) -> ETA ~13:00.  Engram row reads from Team CX2 will matter for engine speed too: measure.
+
 ### Engine next steps (in order)
 1. When the layout exists (step 3 of the chain): `test_ds41_geometry` on the real file; full 40-layer dense gate on
    the CPU with zero experts (golden `--zero-experts` is NOT written yet: experts are being filled during step 4 -
