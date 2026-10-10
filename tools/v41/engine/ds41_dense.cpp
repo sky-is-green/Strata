@@ -184,6 +184,7 @@ struct Ds41Dense::Impl {
         return std::tie(il, kind, cap, n) < std::tie(o.il, o.kind, o.cap, o.n); } };
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
+    std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
 
     ~Impl() {
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -532,6 +533,21 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     return gf;
 }
 
+// predict: router(rms_norm(hc_pre(state, pre)) * ffn_norm) + bias, top 16 of token 0
+static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor ** out) {
+    B b { &im, gc, &im.g };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
+    const int64_t D = im.D, HC = im.HC;
+    ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, 1), b.cols2(im.pre_state, HC, 1));
+    ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
+    ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+    ggml_tensor * sc = ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias"));
+    *out = ggml_argsort_top_k(gc, sc, 16);
+    ggml_set_output(*out);
+    ggml_build_forward_expand(gf, *out);
+    return gf;
+}
+
 // finish: x_state = hc_post(shexp + routed, hap, post_f, comb_f)
 static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64_t n) {
     B b { &im, gc, &im.g };
@@ -842,6 +858,24 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
     *fn_host = im.host_fn.data();
     if (fn_dev) *fn_dev = im.o_fn;
+    return true;
+}
+
+bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
+    Impl & im = *p_;
+    if (im.n != 1 || n_top < 1 || n_top > 16) return false;
+    const Impl::GKey key { il, 3, 0, 1 };
+    auto it = im.graphs.find(key);
+    if (it == im.graphs.end()) {
+        ggml_tensor * o = nullptr;
+        ggml_cgraph * gf = build_predict(im, im.gctx, il, &o);
+        it = im.graphs.emplace(key, gf).first;
+        im.predict_out[il] = o;
+    }
+    if (!im.compute(it->second, true)) return false;
+    int32_t buf[16];
+    ggml_backend_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
+    for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
 

@@ -51,7 +51,7 @@ struct Args {
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
-    double vram_margin_gib = 1.0, pcie = 0.25, arena_gib = 60.0;
+    double vram_margin_gib = 1.0, pcie = 0.25, arena_gib = 60.0, pf_b = 0.0;
     int threads = 0, prefill_chunk = 0;
     int64_t ctx = 0;
     float temp = 0.0f;
@@ -88,6 +88,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vram-lru") a.vram_lru = true;
         else if (k == "--arena-adapt") a.arena_adapt = true;
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
+        else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
@@ -202,7 +203,7 @@ int main(int argc, char ** argv) {
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
     mc.slot_gib = a.slots > 0 ? 0.0 : slot_gib;
     mc.pcie_frac = a.pcie;
-    mc.pf_b = 0.0;   // no predictor yet
+    mc.pf_b = a.pf_b;   // predicted prefetch (Ds41Dense::predict -> tier.prefetch), experts per layer
     mc.threads = a.threads;
     mc.arena_gib = a.arena_gib;
     mc.max_arena_gib = a.arena_gib;
@@ -235,7 +236,15 @@ int main(int argc, char ** argv) {
     std::string ferr;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
         if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
+        int32_t top16[16];
         for (int l = 0; l < n_layer; ++l) {
+            if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
+                int t16[16];
+                if (dense.predict(l, t16, 16)) {
+                    for (int i = 0; i < 16; ++i) top16[i] = t16[i];
+                    tier.prefetch(l, top16, 16);
+                }
+            }
             const float * fn = nullptr;
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
             if (!tier.run(l, ids1.data(), w1.data(), fn, routed1.data())) { ferr = "tier.run failed"; return false; }

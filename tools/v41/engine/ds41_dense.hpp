@@ -65,6 +65,10 @@ public:
     /// ids / wts: n * n_used (token-major); *fn_host: n * n_embd floats (the routed experts' input, valid until the
     /// next call).  `fn_dev` (optional): the same activations on the backend.
     bool attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev = nullptr);
+    /// Prefetch hint for layer il of a one-token pass (call before attn_router(il)): the layer's router applied to
+    /// rms_norm(hc_pre(state, pre)) * ffn_norm.weight, + the selection bias, ranked; top_ids gets n_top (<= 16).
+    /// A hint only: the result does not depend on it.
+    bool predict(int il, int * top_ids, int n_top);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
     bool finish(int il, const float * routed_sum);
     /// Logits of rows row0..row0+nrows-1 of the pass after the last layer's finish: nrows * n_vocab floats.
