@@ -303,6 +303,11 @@ struct Ds41MoeImpl {
     std::vector<uint8_t> nact;        ///< the Q8_K activation the CPU kernel consumes
     cpu::ActQ actq;                   ///< the same for a Q2_0 class on Strata's own Q2_0 kernels (q2_native_kernels)
     std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, f.act_bytes apart
+    /// One input-activation buffer per DISTINCT gate/up activation format among the classes (kNativeActBytes
+    /// each, `nact_multi_act[b]` its `gu_act`), so the one-dispatch-per-layer path quantizes the layer's
+    /// activation once per format instead of once per class.  The Q2_0-native classes share `actq`.
+    std::vector<uint8_t> nact_multi;
+    std::vector<int> nact_multi_act;
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     std::vector<float> parts;         ///< top_k * n_embd, one expert output per routing index
     std::vector<cpu::ExpertJobMulti> jobs;
@@ -616,6 +621,17 @@ void chunk_stage_close(Ds41MoeImpl& im) {
 }
 
 #endif  // DS4_MOE_CUDA
+
+
+// ---- one input-activation buffer per distinct `gu_act` (the one-dispatch-per-layer path) ----------------------
+/// The buffer for the gate/up activation format `gu_act` (built in `init`), or the single `nact` when the
+/// geometry has no such class.  Two classes with the same `gu_act` share it: the quantized activation is a pure
+/// function of the format and the hidden state, so quantizing once per format is byte-identical to per class.
+uint8_t* nact_slot(Ds41MoeImpl& im, int gu_act) {
+    for (size_t b = 0; b < im.nact_multi_act.size(); ++b)
+        if (im.nact_multi_act[b] == gu_act) return im.nact_multi.data() + b * cpu::kNativeActBytes;
+    return im.nact.data();
+}
 
 // ================================ geometry ================================
 
@@ -1014,6 +1030,15 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     im_->parts.assign((size_t) geom.top_k * (size_t) geom.n_embd, 0.0f);
     im_->nact.assign(cpu::kNativeActBytes, 0);
     im_->nact_n.assign((size_t) kMaxTok * cpu::kNativeActBytes, 0);
+    // the input-activation formats the classes of this model need (a Q2_0 gate/up uses `actq`, not one of these)
+    im_->nact_multi_act.clear();
+    for (int64_t c = 0; c < NCL; ++c) {
+        if (!geom.per_expert() && !geom.routed(c)) continue;
+        const int a = im_->fl[(size_t) c].gu_act;
+        if (std::find(im_->nact_multi_act.begin(), im_->nact_multi_act.end(), a) == im_->nact_multi_act.end())
+            im_->nact_multi_act.push_back(a);
+    }
+    im_->nact_multi.assign(im_->nact_multi_act.size() * cpu::kNativeActBytes, 0);
     im_->parts_n.assign((size_t) kMaxEnt * (size_t) geom.n_embd, 0.0f);
 
     if (cfg.cpu_only) {
@@ -1443,6 +1468,55 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
 
 // ---- the CPU path: the whole expert half, and the fallback for every miss the GPU does not take ----------
 
+/// DS41_CHECK_POOL_BATCH=1, the bitwise determinism gate: recompute a layer's `nk` CPU experts (routing indices
+/// `idx`) the pre-batching way - one `run_split_multi_native` per format class, `fmt` unset - into `im.parts`,
+/// and assert every row is bitwise identical to the single-batch result already written there.  Same blobs,
+/// same activation buffers (the per-`gu_act` ones, quantized again here), same kernels; only the pool's
+/// park/drain scheduling differs, so a difference is a batching bug, not arithmetic.  False (and a printed row)
+/// on the first mismatch.
+bool check_pool_batch(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const int32_t* idx, int nk,
+                      const std::vector<const uint8_t*>& held, const float* x) {
+    static bool announced = false;
+    if (!announced) { announced = true; std::fprintf(stderr, "[pool-batch] per-class vs one-batch bitwise check active\n"); }
+    const int64_t H = im.g.n_embd;
+    std::vector<float> ref((size_t) nk * (size_t) H);
+    for (int i = 0; i < nk; ++i)
+        std::memcpy(ref.data() + (size_t) i * H, im.parts.data() + (size_t) idx[i] * H, (size_t) H * 4);
+    std::vector<char> done((size_t) nk, 0);
+    for (int a = 0; a < nk; ++a) {
+        if (done[(size_t) a]) continue;
+        const int c = im.g.cls(layer, ids6[idx[a]]);
+        const cpu::NativeFmt& fc = im.fl[(size_t) c];
+        if (cpu::q2_native_kernels(fc.gu_type)) cpu::act_quant_any(x, (int) fc.n_embd, im.actq);
+        else cpu::native_quant_act(fc, x, nact_slot(im, fc.gu_act));
+        int nj = 0;
+        for (int b = a; b < nk; ++b) {
+            if (done[(size_t) b] || im.g.cls(layer, ids6[idx[b]]) != c) continue;
+            done[(size_t) b] = 1;
+            cpu::ExpertJobMulti& j = im.jobs[(size_t) nj++];
+            j.blob = held[(size_t) b];
+            j.fmt = nullptr;   // the single-format path this check is against
+            j.nt = 1;
+            for (int t = 0; t < cpu::MAXT; ++t) { j.nact[t] = nullptr; j.out[t] = nullptr; }
+            j.nact[0] = nact_slot(im, fc.gu_act);
+            j.act[0] = &im.actq;
+            j.out[0] = im.parts.data() + (size_t) idx[b] * H;
+        }
+        im.pool->run_split_multi_native(fc, im.jobs.data(), nj);
+    }
+    for (int i = 0; i < nk; ++i) {
+        const float* g = im.parts.data() + (size_t) idx[i] * H;
+        const float* r = ref.data() + (size_t) i * H;
+        for (int64_t h = 0; h < H; ++h)
+            if (std::memcmp(&g[h], &r[h], sizeof(float)) != 0) {
+                std::fprintf(stderr, "[pool-batch] L%lld e%d differs at row %lld: batched %.9g, per-class %.9g\n",
+                             (long long) layer, ids6[idx[i]], (long long) h, (double) g[h], (double) r[h]);
+                return false;
+            }
+    }
+    return true;
+}
+
 bool cpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -1452,35 +1526,44 @@ bool cpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         bool from_file = false;
         held[(size_t) k] = acquire(im, layer, ids6[k], (int) k, &from_file);
     }
-    // one pool run per format class present (a per-layer / uniform geometry has one: the layer's)
-    double cms = 0;
-    for (int64_t k0 = 0; k0 < K; ++k0) {
-        const int c = im.g.cls(layer, ids6[k0]);
-        bool first = true;
-        for (int64_t j = 0; j < k0; ++j) first = first && im.g.cls(layer, ids6[j]) != c;
-        if (!first) continue;
+    // ONE pool dispatch for the whole layer: every class present goes into the same batch (each job carries its
+    // own format), and the activation is quantized once per DISTINCT format - the Q2_0-native classes share
+    // `actq`, every native class quantizes into the buffer of its `gu_act`.  Was one dispatch per class.
+    const double c0 = now_ms();
+    bool q2_done = false;
+    std::vector<char> act_done(im.nact_multi_act.size(), 0);
+    int nj = 0;
+    for (int64_t k = 0; k < K; ++k) {
+        const int c = im.g.cls(layer, ids6[k]);
         const cpu::NativeFmt& f = im.fl[(size_t) c];
-        if (cpu::q2_native_kernels(f.gu_type)) cpu::act_quant_any(x, (int) f.n_embd, im.actq);
-        else cpu::native_quant_act(f, x, im.nact.data());
-        int nj = 0;
-        for (int64_t k = k0; k < K; ++k) {
-            if (im.g.cls(layer, ids6[k]) != c) continue;
-            cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj++];
-            jb.blob = held[(size_t) k];
-            jb.nt = 1;
-            for (int t = 0; t < cpu::MAXT; ++t) {
-                jb.nact[t] = nullptr;
-                jb.out[t] = nullptr;
-            }
-            jb.nact[0] = im.nact.data();
-            jb.act[0] = &im.actq;
-            jb.out[0] = im.parts.data() + (size_t) k * H;
+        if (cpu::q2_native_kernels(f.gu_type)) {
+            if (!q2_done) { cpu::act_quant_any(x, (int) f.n_embd, im.actq); q2_done = true; }
+        } else {
+            for (size_t b = 0; b < im.nact_multi_act.size(); ++b)
+                if (im.nact_multi_act[b] == f.gu_act && !act_done[b]) {
+                    cpu::native_quant_act(f, x, im.nact_multi.data() + b * cpu::kNativeActBytes);
+                    act_done[b] = 1;
+                }
         }
-        const double c0 = now_ms();
-        im.pool->run_split_multi_native(f, im.jobs.data(), nj);
-        cms += now_ms() - c0;
+        cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj++];
+        jb.blob = held[(size_t) k];
+        jb.fmt = &f;
+        jb.nt = 1;
+        for (int t = 0; t < cpu::MAXT; ++t) {
+            jb.nact[t] = nullptr;
+            jb.out[t] = nullptr;
+        }
+        jb.nact[0] = nact_slot(im, f.gu_act);
+        jb.act[0] = &im.actq;
+        jb.out[0] = im.parts.data() + (size_t) k * H;
     }
-    im.st.cpu_ms += cms;
+    im.pool->run_split_multi_native(im.fl[(size_t) im.g.cls(layer, ids6[0])], im.jobs.data(), nj);
+    if (std::getenv("DS41_CHECK_POOL_BATCH")) {   // the bitwise gate: the pool's per-class path must agree
+        std::vector<int32_t> ident((size_t) K);
+        for (int64_t k = 0; k < K; ++k) ident[(size_t) k] = (int32_t) k;
+        if (!check_pool_batch(im, layer, ids6, ident.data(), (int) K, held, x)) return false;
+    }
+    im.st.cpu_ms += now_ms() - c0;
     for (int64_t i = 0; i < H; ++i) {
         double s = 0;
         for (int64_t k = 0; k < K; ++k) s += (double) w6[k] * (double) im.parts[(size_t) (k * H + i)];
@@ -1791,35 +1874,12 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             held[(size_t) i] = gp.arena.ptr(layer, ids6[cpu_keep[i]]);
             if (!held[(size_t) i]) fi.push_back(i);
         }
-        // the file reads run WHILE the pool computes the arena-held misses (they are mostly NVMe wait; FINDINGS s10:
-        // ~36 ms/token serial before the pool); then the pool computes the file-tier ones
-        auto fill_job = [&](int slot, int i) {
-            cpu::ExpertJobMulti& j = im.jobs[(size_t) slot];
-            j.blob = held[(size_t) i];
-            j.nt = 1;
-            for (int t = 0; t < cpu::MAXT; ++t) {
-                j.nact[t] = nullptr;
-                j.out[t] = nullptr;
-            }
-            j.nact[0] = im.nact.data();
-            j.act[0] = &im.actq;
-            j.out[0] = im.parts.data() + (size_t) cpu_keep[i] * H;
-        };
-        // the pool on entries `idx` of cpu_keep, one run per format class (each with its own activation)
-        auto pool_classes = [&](const std::vector<int>& idx) {
-            std::vector<char> done(idx.size(), 0);
-            for (size_t a = 0; a < idx.size(); ++a) {
-                if (done[a]) continue;
-                const int c = im.g.cls(layer, ids6[cpu_keep[idx[a]]]);
-                const cpu::NativeFmt& fc = im.fl[(size_t) c];
-                if (cpu::q2_native_kernels(fc.gu_type)) cpu::act_quant_any(gp.h_x, (int) fc.n_embd, im.actq);
-                else cpu::native_quant_act(fc, gp.h_x, im.nact.data());
-                int nj = 0;
-                for (size_t b2 = a; b2 < idx.size(); ++b2)
-                    if (!done[b2] && im.g.cls(layer, ids6[cpu_keep[idx[b2]]]) == c) { done[b2] = 1; fill_job(nj++, idx[b2]); }
-                im.pool->run_split_multi_native(fc, im.jobs.data(), nj);
-            }
-        };
+        // ONE pool dispatch for the whole layer (see the join below): the batch used to be issued once per format
+        // class, twice (arena-held, then file-tier) with the file reads overlapping the first pass.  The card
+        // kernels launched above overlap this entire section either way, and the read wall (1-5 ms, latency-bound,
+        // on the critical path) dwarfs the pool (sub-ms), so the trade is the collapse of 2 x classes park/drain
+        // cycles into one for the small arena-vs-read overlap - and one activation quant per distinct format
+        // instead of per class.
         std::vector<std::thread> rd;
         std::atomic<size_t> nx{0};
         double tf = 0;
@@ -1863,17 +1923,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                     }
                 });
         }
-        std::vector<int> arena_i;
-        for (int i = 0; i < nk; ++i)
-            if (held[(size_t) i]) arena_i.push_back(i);
-        const double c0 = now_ms();
-        if (!arena_i.empty()) pool_classes(arena_i);
+        for (auto& t : rd) t.join();   // every CPU expert's bytes are home before the one batch goes out
         if (!fi.empty()) {
-            for (auto& t : rd) t.join();
             im.st.file_tier += (int64_t) fi.size();
-            im.st.file_ms += now_ms() - tf;   // read wall time, now overlapped with the pool above
+            im.st.file_ms += now_ms() - tf;   // the read wall, no longer overlapped with a first per-class batch
             static const bool check_read = std::getenv("DS4_CHECK_READ") != nullptr;
-            std::vector<int> file_i;
             for (size_t q = 0; q < fi.size(); ++q) {
                 const int i = fi[q];
                 held[(size_t) i] = fdst[q];
@@ -1886,10 +1940,40 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                     static int64_t n_chk = 0;
                     if (++n_chk % 200 == 0) std::fprintf(stderr, "[read-chk] %lld blobs checked\n", (long long) n_chk);
                 }
-                file_i.push_back(i);
             }
-            pool_classes(file_i);
         }
+        // ---- the single batch: all `nk` CPU experts, every class, each job with its own format; the activation
+        // quantized once per DISTINCT gate/up format present (the Q2_0-native classes share `actq`) ----
+        const double c0 = now_ms();
+        bool q2_done = false;
+        std::vector<char> act_done(im.nact_multi_act.size(), 0);
+        for (int i = 0; i < nk; ++i) {
+            const int c = im.g.cls(layer, ids6[cpu_keep[i]]);
+            const cpu::NativeFmt& fc = im.fl[(size_t) c];
+            if (cpu::q2_native_kernels(fc.gu_type)) {
+                if (!q2_done) { cpu::act_quant_any(gp.h_x, (int) fc.n_embd, im.actq); q2_done = true; }
+            } else {
+                for (size_t b = 0; b < im.nact_multi_act.size(); ++b)
+                    if (im.nact_multi_act[b] == fc.gu_act && !act_done[b]) {
+                        cpu::native_quant_act(fc, gp.h_x, im.nact_multi.data() + b * cpu::kNativeActBytes);
+                        act_done[b] = 1;
+                    }
+            }
+            cpu::ExpertJobMulti& j = im.jobs[(size_t) i];
+            j.blob = held[(size_t) i];
+            j.fmt = &fc;
+            j.nt = 1;
+            for (int t = 0; t < cpu::MAXT; ++t) {
+                j.nact[t] = nullptr;
+                j.out[t] = nullptr;
+            }
+            j.nact[0] = nact_slot(im, fc.gu_act);
+            j.act[0] = &im.actq;
+            j.out[0] = im.parts.data() + (size_t) cpu_keep[i] * H;
+        }
+        im.pool->run_split_multi_native(im.fl[(size_t) im.g.cls(layer, ids6[cpu_keep[0]])], im.jobs.data(), nk);
+        if (std::getenv("DS41_CHECK_POOL_BATCH") && !check_pool_batch(im, layer, ids6, cpu_keep, nk, held, gp.h_x))
+            return false;
         st.cpu_ms = now_ms() - c0;
         // arena_adapt: the blobs read above already sit in their victims' slots - publish the swaps
         for (size_t q = 0; q < fi.size(); ++q) {
@@ -2141,6 +2225,7 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
         cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj];
         jb.blob = acquire(im, layer, ue[u], nj, &from_file);
         jb.nt = 0;
+        jb.fmt = nullptr;   // this batch is one format (`f`); a stale per-job fmt from a prior call must not leak in
         for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; }
         for (int j = 0; j < NE; ++j)
             if (ent_u[j] == u) {

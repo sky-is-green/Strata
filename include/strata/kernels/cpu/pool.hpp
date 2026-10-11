@@ -61,6 +61,10 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    /// Fork (DS4.1 mixed tiers): this expert's own format on the MULTI-FORMAT native path, so one
+    /// `run_split_multi_native` batch can cover every format class present in a layer.  `nullptr` (every other
+    /// caller) means "the batch's `fmt` argument", i.e. exactly the pre-fork behaviour.
+    const NativeFmt* fmt = nullptr;
 };
 
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
@@ -182,6 +186,12 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    ///
+    /// Fork (DS4.1 mixed tiers): a job whose `ExpertJobMulti::fmt` is set uses THAT format for its own gate/up
+    /// and down kernels (and for the intermediate activation's quantization), so one batch covers several format
+    /// classes at once - the whole point of the one-dispatch-per-layer path.  Jobs with `fmt == nullptr` all use
+    /// `f`, byte-identically to the pre-fork code.  Every job in `f`'s batch must share `n_embd`/`n_ff` (a model's
+    /// geometry is uniform across its format classes; a mixed-geometry batch falls back to one call per job).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
