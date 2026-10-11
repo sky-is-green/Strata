@@ -356,6 +356,15 @@ int main(int argc, char ** argv) {
     std::vector<float> last_logits((size_t) nv);
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
     bool enc_reported = false;
+    // ---- env-gated per-layer dumps (determinism bisect): STRATA_LAYER_DUMP=<dir> writes, for every layer of the
+    // sequential chunk path, the routed experts' input (fn, the dense half's output) and their weighted sum, plus an
+    // index source layer's top-k ids.  Two runs' files diff at the first layer where a run-to-run difference appears,
+    // and fn-vs-routed tells whether it is the MoE tier or the attention / indexer half.
+    const char * dump_dir = std::getenv("STRATA_LAYER_DUMP");
+    auto dumpf = [&](const char * name, const void * p, size_t bytes) {
+        std::ofstream f(std::string(dump_dir) + "/" + name, std::ios::binary);
+        f.write((const char *) p, (std::streamsize) bytes);
+    };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
@@ -427,11 +436,26 @@ int main(int argc, char ** argv) {
                 for (int l = 0; l < n_layer; ++l) {
                     const float * fn = nullptr;
                     if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
+                    if (dump_dir) {
+                        char nb[64];
+                        std::snprintf(nb, sizeof(nb), "L%02d_fn.f32", l);
+                        dumpf(nb, fn, (size_t) m * (size_t) n_embd * 4);
+                        std::vector<int> sel; std::vector<float> smask; int K = 0;
+                        if (dense.read_sel(l, sel, smask, &K) && K > 0 && !sel.empty()) {
+                            std::snprintf(nb, sizeof(nb), "L%02d_sel.i32", l);
+                            dumpf(nb, sel.data(), sel.size() * 4);
+                        }
+                    }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
                     const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
                                            : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
                     if (!ok) { ferr = "tier run refused"; return false; }
+                    if (dump_dir) {
+                        char nb[64];
+                        std::snprintf(nb, sizeof(nb), "L%02d_routed.f32", l);
+                        dumpf(nb, crouted.data(), (size_t) m * (size_t) n_embd * 4);
+                    }
                     t0 = now_ms();
                     fd_tier += t0 - t1;
                     if (!dense.finish(l, crouted.data())) { ferr = dense.last_error(); return false; }

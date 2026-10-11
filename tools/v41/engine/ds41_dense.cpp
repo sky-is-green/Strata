@@ -464,6 +464,15 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
                 }
                 sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, n]
+                // Canonicalise the top-k order.  ggml_cuda_op_top_k asks CUB's DeviceTopK for
+                // output_ordering::unsorted, and CUB hands the k ids back in an order its atomically assigned
+                // output slots produce - run-to-run unstable, while the SET is stable (measured: order-only on
+                // every differing row).  The ids drive the gather of the compressed rows, so that order is the
+                // flash-attn's accumulation order; left alone the whole run stops being reproducible from the
+                // first query whose compressed rows are attended (the SWA window's 128).  Sort ascending.
+                sel = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sel, 1, K, n),
+                                                        ggml_argsort(gc, ggml_cast(gc, sel, GGML_TYPE_F32),
+                                                                     GGML_SORT_ORDER_ASC)), K, n);
                 selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, n), sel), K, n);   // vis at sel
                 outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, n, L.sel->nb[1], (size_t) col0 * L.sel->nb[1])));
                 outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, n, L.selm->nb[1], (size_t) col0 * L.selm->nb[1])));
