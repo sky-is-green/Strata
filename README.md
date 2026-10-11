@@ -50,19 +50,29 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
 | Layer-major prompt batches: each layer's experts stream **once** per 8192-token batch | 102.6 |
 | + next-layer file-tier prefetch into pinned slabs (O_DIRECT, 4.6 GB/s) | 105.9 |
 | + encoder-only skip: layers above the last KV source only run the last 2560 tokens | 133-140 |
-| + one expert pass per layer (no duplicate stream at B=8192) | **142.9** |
+| + one expert pass per layer (no duplicate stream at B=8192) | 142.9 |
+| + next layer's arena experts uploaded during its dense half (layer prestage) | 149.1 |
+| + routed sums written straight into the dense half's tensor (no host round trip) | 153.9 |
+| + Engram rows read in the background during the layers below the first Engram layer | **176.3** |
+| 16384-token prompt (two 8192 batches) | **203** |
 
-Where the time goes now (8192 tokens, ~57 s): dense half ~24 s (attention, Engram rows), experts ~34 s - almost all
-of it PCIe uploads of streamed experts, which run at ~10 GB/s on a 25 GB/s link (pageable side uploads at 2.7 GB/s,
-pinned expert copies at a 13 GB/s median). Target: **300-400 tok/s** (the V4-Flash engine below reaches 359-392).
+Where the time goes now (8192 tokens, ~46 s): dense half ~19 s (attention, indexer, hyper-connections), experts
+~27 s - PCIe uploads of streamed experts (~10 GB/s effective on a 25 GB/s link) and the grouped expert kernels.
+`STRATA_PROM=1` (prompt-batch kernels) gives another ~6% but costs +0.6% ppl (2.3799 -> 2.3946), so it stays off.
+Target: **300-400 tok/s** (the V4-Flash engine below reaches 359-392).
 
-**Decode**
+**Decode** (256-token prompt, 128 generated tokens, greedy)
 
 | Config | tok/s |
 | --- | ---: |
 | baseline (VRAM LRU cache, predicted prefetch) | 3.4 |
-| `--route-bias 1.0` (selection-only bonus for VRAM-resident experts, weights exact, every expert reachable) | **15.5** |
-| after an 8192-token prompt | 6-10 |
+| `--route-bias 1.0` (selection-only bonus for VRAM-resident experts, weights exact, every expert reachable) | 15.9 |
+| + `--route-bias-file 0.6` (selection-only penalty on experts that would be read from NVMe; quality being measured) | **18.8** |
+| after an 8192-token prompt (`--route-bias 1.0`) | ~14 |
+
+Decode fixes on 2026-10-11: Engram rows for a decode token were read serially (11 ms/token on the exFAT volume that
+holds the Engram table, ~13K random reads/s vs ~290K/s on the ntfs3 NVMe); they are now read in parallel and every
+row read is kept in a 0.6 GB raw-row cache (4.8 ms/token left). Logits byte-identical.
 
 Target: 20+ (the V4-Flash engine below does 23-24). Next: fewer per-layer syncs, predicted file-tier prefetch in
 decode, decayed-hotness eviction, MTP drafting.
@@ -81,6 +91,11 @@ decode, decayed-hotness eviction, MTP drafting.
 - **Engram batch reader**: hashes deduplicated, sorted by file offset and coalesced per 4 KiB page (cold 4-8× faster).
 - **Prompt-batch kernels for PTQ1_0 / Q2_0** (`STRATA_PROM=1`, off by default): halve expert compute at large
   groups; enabled once uploads stop being the limit.
+- **Layer prestage**: the next layer's RAM-arena experts are copied to a 3 GiB device region while its dense half
+  runs (`STRATA_PRESTAGE_GIB`), and the routed sums go straight into the dense half's tensor (`run_chunk_dev`).
+- **One expert pass per layer** at B=8192 (a 1 GB buffer cap used to split it in two, uploading every layer twice).
+- **Engram**: prompt reads overlap the layers below the first Engram layer; decode reads run in parallel with a
+  raw-row cache.
 - **Route bias** (`--route-bias X`) and **soft pruning** (`--prune F --prune-penalty X`): penalties only, never masks.
 
 ### Running the V4.1 engine
