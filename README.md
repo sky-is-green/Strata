@@ -1,43 +1,110 @@
-<h1 align="center">Strata-DS4</h1>
+<h1 align="center">Strata-DSV4.1</h1>
 
-<p align="center"><b>DeepSeek-V4-Flash (284B MoE) on one gaming PC, faster than llama.cpp</b><br>
-A DeepSeek-V4 engine built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
+<p align="center"><b>DeepSeek-V4.1-Flash (40 layers × 384 experts) on one gaming PC - 152 GiB of experts across VRAM, pinned RAM and NVMe</b><br>
+DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
 
-> **Status: experimental, single-developer research code.** It generates correct, coherent text and beats
-> llama.cpp's best configuration on the machine below, but it has been measured on exactly one PC, has no server or
-> chat UI of its own yet, and serves one sequence at a time. Expect rough edges. The upstream Strata README (the
-> Qwen3.8-Flash engine this is built on) is in [README.strata.md](README.strata.md).
+> **Status: experimental, single-developer research code, measured on one PC.** The V4.1 engine generates correct
+> text, its GPU prompt path is deterministic (byte-identical logits run to run), and it is getting faster every day -
+> but it has no installed server yet, serves one sequence at a time, and the GSQ model file it runs is not published.
+> The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
+> (This repo was called `Strata-DS4`; old links redirect.)
 
-## New: DeepSeek-V4.1-Flash (GSQ mixed tiers) - work in progress
+## DeepSeek-V4.1-Flash
 
-`tools/v41/` is a second, separate engine for **DeepSeek-V4.1-Flash** (40 layers × 384 experts, top-6, Engram
-n-gram memory, shared compressed-KV / indexer layers). It runs a custom **GSQ** quant (GPTQ-style per-expert tier
-allocation: PTQ1_0 ternary 1.75 bpw, Q2_0 2.25 bpw and Q3_K experts; 152 GiB single file) whose experts live in three
-tiers: a VRAM cache, a pinned 60 GiB RAM arena, and the NVMe file itself (O_DIRECT reads).
+V4.1-Flash is a different shape from V4-Flash: **40 layers × 384 routed experts (top-6)**, an **Engram** n-gram
+memory (hashed rows read from a ~300 GB table on disk at layers 1 and 14), and **shared compressed-KV / indexer
+layers** (a few "KV source" layers own the compressed cache; the layers above read it and keep only their own
+128-token window). Its experts do not fit in RAM even at 2 bits, so the engine (`tools/v41/engine`) keeps them in
+three tiers:
 
-Quality of the GSQ file (head gate, held-out eval): ppl 5.645 vs 4.915 for the FP8 teacher (+14.9%), top-1 0.674 vs
-0.701; per domain agent 2.118 vs 2.121, reasoning 6.19 vs 5.83, code 1.98 vs 1.74. Engine on the 4090: 4096-token code
-ppl 2.380, top-1 0.822, and the GPU prompt path is deterministic (byte-identical logits run to run).
+| Tier | What lives there | How it is fed |
+| --- | --- | --- |
+| VRAM cache | the hottest ~1,300-1,600 experts (sized from measured free VRAM after the prompt) | `--vram-lru`, `--route-bias` |
+| Pinned RAM arena | ~6,700 experts (60 GiB, `cudaHostRegister`) | DMA straight to the GPU |
+| NVMe file tier | the other ~8,700 experts | O_DIRECT reads at ~4.5 GB/s, prefetched a layer ahead |
 
-Measured on the same PC (RTX 4090, 90 GB RAM, NVMe at ~4.5 GB/s), 2026-10-11:
+### The model file: GSQ mixed tiers (152 GiB)
 
-| | tok/s |
-|---|---|
-| Prefill, 8192-token prompt, chunked (start of 2026-10-11) | ~54 |
-| + layer-major prompt batches (`--prompt-batch`, default 8192) | 102.6 |
-| + next-layer file-tier prefetch into pinned slabs (O_DIRECT, 4.5 GB/s) | 105.9 |
-| + `--enc-skip` (layers past the last KV source only run the last 2560 tokens; exact) | **135.5** |
-| Decode, short prompt, `--route-bias 1.0` (selection-only bonus for VRAM-resident experts, nothing pruned) | 15.5 |
-| Decode after an 8192-token prompt | 6-10 |
+`tools/v41` holds a GPTQ-style quantisation pipeline (`v41_calib.py`, `v41_alloc.py`, `v41_quant.py`,
+`v41_gptq_graph.py`) that gives every expert its own format from calibration statistics: **PTQ1_0** (ternary,
+1.75 bpw), **Q2_0** (2.25 bpw) or **Q3_K**, early layers richer (~2.5 bpw) and late layers leaner (~2.0 bpw).
+Quality on held-out data against the FP8 original ("teacher"):
 
-Prefill is now bound by PCIe uploads of streamed experts (5-8 GB/s in situ vs 24 GB/s isolated) and by a duplicated
-expert stream at B=8192; decode by per-layer syncs and file-tier misses. Targets: prefill 300-400 tok/s, decode 20+.
-The OpenAI/Anthropic server wrapper (`tools/v41/serve`) exists but does not yet use the prompt-batch / prefetch paths.
-Full state, numbers and commands: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
+| Domain | GSQ ppl | Teacher ppl |
+| --- | ---: | ---: |
+| All (head gate) | 5.645 | 4.915 |
+| agent | 2.118 | 2.121 |
+| reasoning | 6.19 | 5.83 |
+| code | 1.98 | 1.74 |
+| zh | 7.64 | 6.83 |
 
-The rest of this README describes the **V4-Flash (0731)** engine (`tools/ds4/`).
+Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380, top-1 0.822.
 
-## What this is
+### How fast is it? (RTX 4090 24 GB · Ryzen 7 5700X · 90 GB DDR4 · NVMe, 2026-10-11)
+
+**Prefill, 8192-token prompt** - all steps keep the output exact (last-token logits byte-identical to the step before):
+
+| Step | tok/s |
+| --- | ---: |
+| Chunked prefill (2048-token chunks; every chunk re-streams every expert) | ~54 |
+| Layer-major prompt batches: each layer's experts stream **once** per 8192-token batch | 102.6 |
+| + next-layer file-tier prefetch into pinned slabs (O_DIRECT, 4.6 GB/s) | 105.9 |
+| + encoder-only skip: layers above the last KV source only run the last 2560 tokens | 133-140 |
+| + one expert pass per layer (no duplicate stream at B=8192) | **142.9** |
+
+Where the time goes now (8192 tokens, ~57 s): dense half ~24 s (attention, Engram rows), experts ~34 s - almost all
+of it PCIe uploads of streamed experts, which run at ~10 GB/s on a 25 GB/s link (pageable side uploads at 2.7 GB/s,
+pinned expert copies at a 13 GB/s median). Target: **300-400 tok/s** (the V4-Flash engine below reaches 359-392).
+
+**Decode**
+
+| Config | tok/s |
+| --- | ---: |
+| baseline (VRAM LRU cache, predicted prefetch) | 3.4 |
+| `--route-bias 1.0` (selection-only bonus for VRAM-resident experts, weights exact, every expert reachable) | **15.5** |
+| after an 8192-token prompt | 6-10 |
+
+Target: 20+ (the V4-Flash engine below does 23-24). Next: fewer per-layer syncs, predicted file-tier prefetch in
+decode, decayed-hotness eviction, MTP drafting.
+
+### What changed on 2026-10-11
+
+- **Layer-major prompt batches** (`--prompt-batch B`, default 8192): attention runs in sub-batches in order, the MoE
+  runs once per layer over the whole batch, so a layer's ~5 GB of experts crosses PCIe once instead of once per chunk.
+- **File-tier prefetch** (default on, `--no-chunk-prefetch`): layer l+1's file-tier experts are read with O_DIRECT
+  into one of two pinned slabs while layer l computes (SSD wait 46 s -> 0.4 s on 4096 tokens).
+- **Encoder-only skip** (default on for one-shot runs, `--no-enc-skip`): a prompt token older than the last
+  `128 × 20 = 2560` positions is never read above layer 20 except through compressed KV that layers <= 20 produce,
+  so layers 21-39 only run the tail. Exact (byte-identical last-token logits), -23% wall at 8192 tokens.
+- **Determinism**: CUB's GPU top-k returns the indexer's selection in a run-dependent order; the selected ids are
+  now sorted before the gather. Prefill is byte-identical run to run (it drifted ~1% ppl before).
+- **Engram batch reader**: hashes deduplicated, sorted by file offset and coalesced per 4 KiB page (cold 4-8× faster).
+- **Prompt-batch kernels for PTQ1_0 / Q2_0** (`STRATA_PROM=1`, off by default): halve expert compute at large
+  groups; enabled once uploads stop being the limit.
+- **Route bias** (`--route-bias X`) and **soft pruning** (`--prune F --prune-penalty X`): penalties only, never masks.
+
+### Running the V4.1 engine
+
+```bash
+cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
+      -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
+ninja -C build-ds4-gpu ds41_generate test_ds41_moe_gpu
+STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_generate -m V41-GSQ.gguf \
+     --ids-file prompt.i32 -n 128 --backend cuda --experts gpu --engram /path/to/DeepSeek-V4.1-Flash-FP8 \
+     --arena-gib 60 --vram-lru --vram-margin 1 --rank rank.bin --pf-b 1.43 --pcie 0.75 --route-bias 1.0
+```
+
+`STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. `--ppl` /
+`--dump-logits F` / `--dump-last F` for quality checks; `test_ds41_moe_gpu GGUF --layers 0,20,39 --tokens 2 --gpu
+--chunk 64` checks the expert tier against a dequantised F32 reference. An OpenAI/Anthropic server
+(`tools/v41/serve`, DSML tool calls) exists but does not use the fast prompt path yet. Full engineering log, every
+measurement and the next steps: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
+
+---
+
+## DeepSeek-V4-Flash (0731) engine
+
+### What this is
 
 [Strata](https://github.com/Niko1221/Strata) is an inference engine specialised for one MoE model
 (Qwen3.8-Flash-Next): the hot experts live in a VRAM cache, the rest in pinned RAM, and each layer's misses are
@@ -49,7 +116,7 @@ architecture llama.cpp supports but which is unusually hard to run fast on a con
 - **compressed sparse attention** (raw 128-token window + 4× compressed blocks chosen by a "lightning indexer" + 128×
   compressed blocks), attention sinks, a grouped output LoRA, hash routing on the first 3 layers, a SwiGLU clamp.
 
-## How fast is it?
+### How fast is it?
 
 Measured on: **RTX 4090 24 GB · Ryzen 7 5700X (8 cores, AVX2) · 90 GB DDR4-3200 · NVMe**, model
 `DeepSeek-V4-Flash-Q2-0731.gguf` (80.8 GiB: experts IQ2_XXS gate/up + Q2_K down, dense Q8_0). Decode = greedy
@@ -136,7 +203,7 @@ accumulator and `reap_prune.py` come from the Strata-GLM work. Details: [FINDING
 The first token's logits match llama.cpp's (same top-1; KL 0.03-0.10, which is the difference between the GPU's and
 the CPU's 8-bit activation rounding).
 
-## How it works
+### How it works
 
 Per token, per layer (`tools/ds4/ds4_generate.cpp`):
 
@@ -161,12 +228,12 @@ block (3 of 4 tokens in CSA layers, 127 of 128 in HCA) → 23-24.
 allocator; the expert side streams each layer's experts into VRAM once per chunk and runs them through MMQ, the next
 layer's experts DMA in while the current one computes, and the VRAM expert cache is seeded after the prompt.
 
-## Running it
+### Running it
 
 Requirements: Linux, CUDA 13.x toolkit, an NVIDIA GPU with 24 GB, **~80 GB of free RAM**, the GGUF above.
 
 ```bash
-git clone https://github.com/Indras-Mirror/Strata-DS4 && cd Strata-DS4
+git clone https://github.com/Indras-Mirror/Strata-DSV4.1 && cd Strata-DSV4.1
 cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
 ninja -C build-ds4-gpu ds4_generate          # ggml-cuda takes ~10 minutes the first time
@@ -206,7 +273,7 @@ resolve toward the cache. It trades quality for speed - measured: 0.05 → +9% d
 (0.05: ~0.4% of lookups, within run-to-run noise; 0.10: 23.8 tok/s vs 22.3-23.4 for the reference runs, +5% perplexity
 - not recommended).
 
-## Verifying it
+### Verifying it
 
 - `test_ds4_dense` - the dense half vs a CPU reference forward (`ds4_ref`) on small synthetic models: bit-exact on the
   CPU backend; `--cuda` agrees to ~1e-4 (CUDA vs CPU arithmetic).
@@ -219,7 +286,7 @@ resolve toward the cache. It trades quality for speed - measured: 0.05 → +9% d
   chunks of 1-70 tokens; `DS4_CPU_FA_REF=1` for >= 64-token chunks, whose flash-attention otherwise tiles), and every
   speed change above was checked the same way and mutation-tested (break it on purpose, the gate must fail).
 
-## Roadmap
+### Roadmap
 
 - **MTP verification on CUDA**: the head drafts at 63% acceptance here (74-93% reported elsewhere); at that rate
   depth 1 is worth ~+10%, deeper drafts lose (each costs ~9 ms and more expert reads).
@@ -232,7 +299,7 @@ resolve toward the cache. It trades quality for speed - measured: 0.05 → +9% d
 - DSpark (0731's native 5-token drafter) and n-gram drafting on the same verification path.
 - A server (OpenAI-compatible) and a merge back into a single multi-model Strata; a MiMo-V2.6-Flash engine is next.
 
-## Credits
+### Credits
 
 Built on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors (MIT). Uses
 [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), including its DeepSeek-V4 hyper-connection kernels,

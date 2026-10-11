@@ -1181,6 +1181,7 @@ bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ra
         gp.arena.base = gp.arena.owner->base;
         gp.arena.pinned = true;
         gp.arena.backing = "pinned (" + gp.arena.owner->note + ")";
+        std::fprintf(stderr, "arena: %s\n", gp.arena.backing.c_str());
     } else {
         void* p = nullptr;
         if (posix_memalign(&p, 4096, gp.arena.bytes) != 0 || !p) {
