@@ -53,29 +53,34 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
 | + one expert pass per layer (no duplicate stream at B=8192) | 142.9 |
 | + next layer's arena experts uploaded during its dense half (layer prestage) | 149.1 |
 | + routed sums written straight into the dense half's tensor (no host round trip) | 153.9 |
-| + Engram rows read in the background during the layers below the first Engram layer | **176.3** |
-| 16384-token prompt (two 8192 batches) | **203** |
+| + Engram rows read in the background during the layers below the first Engram layer | 176.3 |
+| + Engram tables moved off exFAT to ntfs3 NVMe / SATA SSD (raw block-device reads for the fragmented file) | **219-227** |
+| 16384-token prompt (two 8192 batches) | **288** |
 
-Where the time goes now (8192 tokens, ~46 s): dense half ~19 s (attention, indexer, hyper-connections), experts
-~27 s - PCIe uploads of streamed experts (~10 GB/s effective on a 25 GB/s link) and the grouped expert kernels.
-`STRATA_PROM=1` (prompt-batch kernels) gives another ~6% but costs +0.6% ppl (2.3799 -> 2.3946), so it stays off.
-Target: **300-400 tok/s** (the V4-Flash engine below reaches 359-392).
+Where the time goes now (8192 tokens, ~37 s): dense half ~11 s, experts ~25 s - PCIe uploads of streamed experts
+(~10 GB/s effective on a 25 GB/s link) and the grouped expert kernels. `STRATA_PROM=1` (prompt-batch kernels) gives
+~6% more but costs +0.6% ppl (2.3799 -> 2.3946), so it stays off. Target: **300-400 tok/s** (16K prompts: 288).
 
-**Decode** (256-token prompt, 128 generated tokens, greedy)
+**Decode** (256-token prompt, 128 generated tokens, greedy, default flags)
 
-| Config | tok/s |
-| --- | ---: |
-| baseline (VRAM LRU cache, predicted prefetch) | 3.4 |
-| `--route-bias 1.0` (selection-only bonus for VRAM-resident experts, weights exact, every expert reachable) | 15.9 |
-| + `--route-bias-file 0.6` (selection-only penalty on experts that would be read from NVMe; quality being measured) | **18.8** |
-| after an 8192-token prompt (`--route-bias 1.0`) | ~14 |
+| Config | tok/s | ppl code / agentic (4096 tok) |
+| --- | ---: | --- |
+| exact routing (`--route-bias 0 --route-bias-file 0`) | ~3.5 | 2.38 / 15.11 |
+| `--route-bias 1.0` (selection-only bonus for VRAM-resident experts) | 15.1 | 2.67 / 6.88 |
+| **default**: + `--route-bias-file 0.6` (selection-only penalty on experts read from NVMe) | **21.1** | 2.87 / 6.39 |
+| after an 8192 / 16384-token prompt | 21.0 / 25.4 | |
 
-Decode fixes on 2026-10-11: Engram rows for a decode token were read serially (11 ms/token on the exFAT volume that
-holds the Engram table, ~13K random reads/s vs ~290K/s on the ntfs3 NVMe); they are now read in parallel and every
-row read is kept in a 0.6 GB raw-row cache (4.8 ms/token left). Logits byte-identical.
+Both biases change only which experts are *selected* (mixing weights exact, every expert reachable) and only in
+decode - the prompt is computed exactly. Their quality effect is domain dependent: code loses (+21%), agentic text
+gains (GSQ gave its cheapest formats to rarely-used experts; the bias steers towards the better-quantized hot ones).
+`--route-bias 0 --route-bias-file 0` gives exact routing.
 
-Target: 20+ (the V4-Flash engine below does 23-24). Next: fewer per-layer syncs, predicted file-tier prefetch in
-decode, decayed-hotness eviction, MTP drafting.
+Engram: decode reads ~48 random rows per token. On the exFAT volume that held the FP8 checkpoint this cost ~10
+ms/token (~13K random reads/s); `tools/v41/extract_engram.py` copies just the two tables (202.8 GB) to fast storage,
+and a heavily fragmented copy is read straight from the block device via FIEMAP (1 ms/token).
+
+Next for decode: the dense half (~21 ms/token, ~5,000 small kernels and ~380 host syncs per token), the expert tier's
+remaining CPU / file work, MTP drafting.
 
 ### What changed on 2026-10-11
 
@@ -104,9 +109,11 @@ decode, decayed-hotness eviction, MTP drafting.
 cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
 ninja -C build-ds4-gpu ds41_generate test_ds41_moe_gpu
+# once: copy the Engram tables (202.8 GB) off slow storage, one file per drive if needed
+python3 tools/v41/extract_engram.py /path/to/DeepSeek-V4.1-Flash-FP8 --to layers.1=/fast/a --to layers.14=/fast/b
+# defaults are the tuned config (layer-major prompt, prefetch, enc-skip, prestage, route bias 1.0 + file penalty 0.6)
 STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_generate -m V41-GSQ.gguf \
-     --ids-file prompt.i32 -n 128 --backend cuda --experts gpu --engram /path/to/DeepSeek-V4.1-Flash-FP8 \
-     --arena-gib 60 --vram-lru --vram-margin 1 --rank rank.bin --pf-b 1.43 --pcie 0.75 --route-bias 1.0
+     --ids-file prompt.i32 -n 128 --backend cuda --experts gpu --engram "/fast/a:/fast/b" --rank rank.bin
 ```
 
 `STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. `--ppl` /

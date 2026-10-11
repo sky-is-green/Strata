@@ -1,7 +1,73 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-11 ~13:10 by `strata-ds4-gpu` (Claude, conductor session `636553.13852289`).
-**READ §HANDOFF 2026-10-11 EVENING FIRST, then 13:10 (ENGINE SPEED)** - it supersedes the 07:20 handoff below where they differ.
+**READ §HANDOFF 2026-10-11 NIGHT FIRST** (then EVENING, 13:10) - it supersedes the 07:20 handoff below where they differ.
+
+## HANDOFF 2026-10-11 NIGHT (~20:15) - prefill 219-227 tok/s (8K) / 288 (16K), decode 21.1 tok/s - READ THIS FIRST
+
+Session: inline conductor (workers all stopped; Mal said do the work directly). Repo GitHub **Indras-Mirror/Strata-DSV4.1**
+(local remote `ds4`; `git push ds4 deepseek4:main` - Mal OK'd pushing progress). Branch deepseek4, HEAD after this doc.
+
+### Current measured state (RTX 4090, 90 GB RAM, default flags)
+| | value |
+|---|---|
+| Prefill 8192-token code prompt | 218.9-226.5 tok/s (split dense ~11 s / experts ~25 s; file wait 0.4 s) |
+| Prefill 16384 tokens | 288.0 tok/s |
+| Decode, 256-tok prompt, 128 tokens | **21.1 tok/s** (route-bias 1.0 + file penalty 0.6, the defaults) |
+| Decode after 8K / 16K prompt | 21.0 / 25.4 tok/s |
+| Prompt exactness | default 8192 last row md5 4d229102872a = the exact full path (enc-skip, prestage, single piece, Engram async/raw: all byte-identical); GPU prompt deterministic run to run |
+| Quality (4096 tok, --ppl, deterministic) | code 2.3799 exact prompt. Decode-routing proxy (--bias-prompt 1550): code none 2.380 / rb1.0 2.674 / rb1.0+f0.6 2.873 / rb1.0+f1.0 2.937 / rb2.0 4.518; agentic_long 15.11 / 6.88 / 6.39 / 5.13 / 5.05 |
+
+### Defaults now in ds41_generate (each measured; old behaviour flag in brackets)
+--prompt-batch 8192 [0 = chunk path], --enc-skip on for one-shot [--no-enc-skip], prefetch slabs [--no-chunk-prefetch],
+layer prestage 3 GiB [STRATA_PRESTAGE_GIB=0], one run_chunk piece (3 GB budget) [STRATA_CHUNK_BUDGET_GB],
+routed sums device-direct [STRATA_ROUTED_HOST=1], --pcie 0.75, --pf-b 1.43, --vram-lru [--no-vram-lru],
+--route-bias 1.0 and --route-bias-file 0.6 (Mal's calls; decode-only - the prompt is exact) [--route-bias 0 --route-bias-file 0],
+fused finish+predict [STRATA_NO_FUSE_PREDICT=1], Engram 32 threads + 2M-row cache [STRATA_ENGRAM_CACHE_ROWS=0],
+Engram raw block-device reads for files with >= 1024 extents [STRATA_ENGRAM_RAWDEV=0/1]. STRATA_PROM=1 stays OFF (+0.6% ppl).
+
+### Engram tables (moved 2026-10-11 night)
+`--engram "/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"` (layer 14 on Crucial MX500 SATA ntfs3,
+layer 1 on SSD NVME ntfs3; each dir has the full index). Built by `tools/v41/extract_engram.py` (verified 2000 random
+rows/tensor). The SSD NVME file has 62,112 extents (drive 99% full) -> raw /dev/nvme0n1p3 reads via FIEMAP (Mal is in
+the `disk` group; 256 spans checked at open). Decode Engram 10 -> 1 ms/token. The old FP8 checkpoint on NVME1TB (exFAT,
+~13K random reads/s) still works with the old --engram path. Disk space now: SSD NVME ~7 GB free, Crucial1TB ~17 GB.
+Mal deleted SSD NVME's pagefile.sys (Windows recreates it).
+
+### Commits tonight (after ee9dbec8)
+1f7d8a4d decode profiler STRATA_DEC_PROF + --bias-prompt quality proxy + file readahead hook (off: no gain) ·
+3532f148 tuned defaults + extract_engram.py · 3d4328cd Engram raw reads + fused finish_predict + file penalty default ·
+18a01111 biases decode-only (prompt exact).
+
+### Decode profile (STRATA_DEC_PROF=1, per token, file penalty 0.6): begin (Engram) 1.4 ms, predict 0.4, attn_router
+~20.5, tier ~23.6 (first 64 tokens, includes cold file reads), finish 2.7.  nsys (--cuda-graph-trace=node): GPU kernel
+time ~20 ms/token (~5,350 kernels; dense mat-vec ~8 ms; k_bin_bcast/rms_norm/scale/unary ~1,300+ tiny kernels), host
+does ~380 cudaStreamSynchronize + ~110 graph launches per token -> GPU idle ~60%.
+
+### NEXT (in order)
+1. Decode dense half (attn_router ~20 ms/token): per-layer syncs + readbacks (ids/wts/fn = 3 tensor_get), merge into one
+   readback; look at the ~1,300 k_bin_bcast/scale/unary kernels per token (fusion, as the V4-0731 engine did);
+   GPU-side expert dispatch for VRAM hits without a host round trip.
+2. Decode tier (~24 ms/token cold): remaining file/CPU misses; R1 merged (16b05583).
+3. Prefill > 300 at 8K: expert H2D runs ~10 GB/s effective (copy engine ~40% busy; pinned copies median 13 GB/s); prestage
+   the next layer's file-tier experts from the slab too (VRAM permitting); the dense half 11 s.
+4. Wrapper: tools/v41/serve/strata-ds41-quetza.wrapper exists, NOT installed; the --serve path does not defer the VRAM
+   cache (prompt-batch / enc-skip / prestage are one-shot only) and failed graph allocation with --arena-gib 60 - needs
+   the defer/release logic per request before it is useful.
+
+### Paste-able resume prompt
+    Continue the DeepSeek-V4.1-Flash Strata engine work for Mal in ~/AI/Strata-DS4 (branch deepseek4; GitHub remote `ds4`
+    = Indras-Mirror/Strata-DSV4.1, pushing progress is OK'd). Read docs/ds4/V41_RESUME_PROMPT.md section "HANDOFF
+    2026-10-11 NIGHT" fully first. State: prefill 219-227 tok/s at 8K / 288 at 16K (exact), decode 21.1 tok/s with
+    the default route-bias 1.0 + file penalty 0.6 (Mal's calls; decode-only). Mal's targets: prefill 300-400, decode
+    20-30 "without losing too much quality"; soft routing only (every expert reachable), report ppl cost of anything
+    lossy. Work inline (no workers unless Mal asks). Rules: GPU runs via `STRATA_NO_LARGEPAGES=1 bash
+    tools/ds4/memguard.sh 84 70 -- [env VARS=..] build-ds4-gpu/ds41_generate ...` (env vars INSIDE the scope);
+    --engram "/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"; verify exactness with --dump-last /
+    --dump-logits md5 (8192 code prompt default = 4d229102872a; decode logits vs a saved dump); never pkill -f a
+    pattern that matches your own command line (use PIDs); don't rebuild build-ds4-gpu while a script is launching
+    it. Next: decode dense half (syncs/readbacks/tiny kernels), then prefill H2D, then the serve wrapper.
+    Commit with "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>".
 
 ## HANDOFF 2026-10-11 EVENING (inline conductor, workers stopped) - prefill 176/203 tok/s, decode 15.9 (18.8 with file penalty)
 
