@@ -1,7 +1,46 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-12 ~08:30 by Claude (arena verdict in; continuing the queue: fq patch, then MTP).
-**READ §UPDATE 2026-10-12 ~08:00 FIRST**, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**READ §UPDATE 2026-10-12 ~10:15 FIRST**, then §UPDATE ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## UPDATE 2026-10-12 ~10:15 (Mal shut the PC down mid-run) - READ FIRST
+
+HEAD = 3f8c4f67 + this doc.  Done this session:
+- **fq patch APPLIED** to third_party/llama.cpp (untracked tree is now patched; build-ds4-gpu configured
+  -DSTRATA_DSV41_FQ_OP=ON).  test_ds41_fq --cuda bit for bit; 8K md5 4d229102872a; decode p256 x 256 = 27.37 / 26.62
+  tok/s (was 24.4-25.2 today), 28.9 tok/s on a 384-token run.  Two runs' tokens differ at token 86 ONLY because the
+  VRAM cache size differed (1547 vs 1540 slots -> cache-aware route bias): use --slots N for reproducible A/Bs.
+- Arena verdict: keep 60 GiB (see below).  128 GB RAM test deferred (note above).
+- **Speculative file-tier reads** (3f8c4f67, OPT-IN STRATA_SPEC_TOP=4/8, default 0): predicting 2 layers ahead catches
+  60-81% of NVMe misses (tokens bit-identical, --slots 1500), tier -1.8 ms/token, but finish graph +1.5 and issuing
+  +1.3 ms -> break-even (24.97-25.10 vs 25.56).  Gotchas fixed: argsort_top_k is a VIEW (row stride NE), 8 readers +
+  notify_all preempted the decode thread (now 4 + notify_one, that variant measured only under export contention -
+  re-measure on a quiet box).  Wrong-guess reads slow layer-1 Engram (same NVMe).
+- **DSpark = V4.1's native drafter** (the mtp.* weights).  From DeepSeek model.py (~/AI/gsq-rco/dsv41-inference):
+  3 blocks run as ONE stack, block_size 5 (1 real token + 4 noise id 128799) drafted in one pass, input main_hidden =
+  HC-mean of trunk layers 37/38/39 concatenated (15360) -> main_proj -> main_norm; each block = window-128 attention
+  (DSparkAttention, keeps its own window KV of main_kv) + MoE 128 experts top-3 + shared expert + mHC; stage 2 has
+  norm + markov_head (embed/head rank 256, sequential logit bias) + confidence_head; output head = trunk head.weight.
+  Mal: wants draft ~6 or less (had good results with 6); native block is 5.
+- **Sidecar exported + verified**: /media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf (8.42 GB, 347 tensors):
+  mtp.0-2 experts MXFP4 = lossless byte repack of the FP4 (36 sampled experts bit-exact), other 2-D weights Q8_0
+  (worst rel RMS 6e-3), norms/router/mHC F32, vision.* + aligner.* (Q8_0) + image_* .  tools/v41/v41_sidecar.py.
+  Resident cost for DSpark in VRAM ~2.7 GB per block if all experts resident (decide: all 3 blocks ~8 GB is too much ->
+  experts via tier or keep only hot ones; measure).
+- **Offline acceptance test** (tools/v41/dspark_accept.py): engine dump STRATA_DUMP_MAIN=F (last 128 prompt tokens run
+  as steps, then decode) -> ~/AI/v41-dev/dspark/main_p256.bin (511 records) + gen_p256.txt.  The script was LOADING
+  when Mal shut down - NO RESULT YET.  Rerun (CPU, ~10 GB RAM, engine must NOT be running):
+  `python3 tools/v41/dspark_accept.py ~/AI/v41-dev/dspark/main_p256.bin ~/AI/v41-dev/dspark/gen_p256.txt --max 64`
+  (unverified: first real run of the loader - expect fixups; prints mean accepted length, per-depth tokens/pass,
+  confidence calibration).  Reference: V4 DSpark in llama.cpp = 3.4 accepted / block of 5 (FINDINGS s7).
+- Vision: exported only; no engine code.  Plan (Mal): Q8_0 (or less if viable), lives in RAM/NVMe, loaded on demand.
+
+NEXT (Mal's priorities): (1) DSpark acceptance number -> if good, engine: DSpark stack as ggml graph (resident dense,
+experts resident or tiered), main_hidden capture at layers 37-39 (read_state per step is the slow measurement path -
+do it in-graph), window KV, then verify pass of 1+5 tokens (pass_m / run_multi + rollback via snapshot), draft depth
+configurable 1-5, use confidence to cut.  (2) Dense half host overhead (~5 ms/token syncs + tiny kernels) - Mal wants
+this.  (3) vision engine.  (4) stashed span-upload change, fast exact quick path, text-log poem check (from ~08:00).
+HF upload still awaiting Mal's answers (public/private, repo name, model card) - ~25 h at 1.85 MB/s, 4 x ~41 GB parts.
 
 ## UPDATE 2026-10-12 ~08:00 (supersedes MORNING where they differ) - READ FIRST
 
