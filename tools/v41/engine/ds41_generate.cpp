@@ -363,7 +363,7 @@ int main(int argc, char ** argv) {
     std::vector<int> ids1((size_t) top_k);
     std::vector<float> w1((size_t) top_k), routed1((size_t) n_embd), logits1((size_t) nv);
     // --serve's short-turn passes (STRATA_SERVE_PASS_M tokens per dense pass; 1 = single decode steps)
-    const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 8);
+    const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 16);
     std::vector<float> crouted_m((size_t) pass_max * n_embd);
     std::string ferr;
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
