@@ -88,7 +88,7 @@ remaining CPU / file work, MTP drafting.
   runs once per layer over the whole batch, so a layer's ~5 GB of experts crosses PCIe once instead of once per chunk.
 - **File-tier prefetch** (default on, `--no-chunk-prefetch`): layer l+1's file-tier experts are read with O_DIRECT
   into one of two pinned slabs while layer l computes (SSD wait 46 s -> 0.4 s on 4096 tokens).
-- **Encoder-only skip** (default on for one-shot runs, `--no-enc-skip`): a prompt token older than the last
+- **Encoder-only skip** (default on, `--serve` included, `--no-enc-skip`): a prompt token older than the last
   `128 × 20 = 2560` positions is never read above layer 20 except through compressed KV that layers <= 20 produce,
   so layers 21-39 only run the tail. Exact (byte-identical last-token logits), -23% wall at 8192 tokens.
 - **Determinism**: CUB's GPU top-k returns the indexer's selection in a run-dependent order; the selected ids are
@@ -118,9 +118,33 @@ STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_ge
 
 `STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. `--ppl` /
 `--dump-logits F` / `--dump-last F` for quality checks; `test_ds41_moe_gpu GGUF --layers 0,20,39 --tokens 2 --gpu
---chunk 64` checks the expert tier against a dequantised F32 reference. An OpenAI/Anthropic server
-(`tools/v41/serve`, DSML tool calls) exists but does not use the fast prompt path yet. Full engineering log, every
-measurement and the next steps: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
+--chunk 64` checks the expert tier against a dequantised F32 reference. Full engineering log, every measurement and
+the next steps: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
+
+### Serving it (OpenAI + Anthropic API, tool calls)
+
+```bash
+# Strata's server (~/AI/Strata/serve) with V4.1's tokenizer, DeepSeek's chat encoder, DSML tool calls, reasoning effort
+~/AI/Strata/.venv/bin/python tools/v41/serve/serve_ds41.py --engine strata --config tools/v41/serve/strata-ds41.json --port 8150
+# or with QuetzaCodetl in front (starts the server, attaches if it is already up)
+tools/v41/serve/strata-ds41-quetza.wrapper
+```
+
+`ds41_generate --serve` runs every request the way the one-shot path does, measured on the same box at 512K context:
+
+| Request | Path | Time |
+| --- | --- | --- |
+| 8192-token prompt | layer-major, VRAM cache closed, exact (md5 = the one-shot path) | 32.7 s (250 tok/s) |
+| new turn of 41 / 86 tokens on a cached conversation | decode steps, VRAM cache open | 1.5 / 3.4 s |
+| new turn of 513 tokens | layer-major (a short batch still streams almost every expert: ~18 s floor) | 18.6 s |
+| the same prompt again (regenerate) | snapshot + saved logits | no prefill |
+| decode | route bias 1.0 + file penalty 0.6 | 22-26 tok/s |
+
+Turns of up to 384 new tokens (`STRATA_SERVE_STEP_MAX`) run as decode steps, with the decode biases; longer ones
+run as an exact prompt batch, after which the VRAM cache is re-seeded (~0.55 s). A conversation that extends the last
+request continues from it; one whose re-rendered history differs (DeepSeek's encoder drops earlier turns' thinking)
+restores the snapshot taken at the end of the last prompt. A 512-token prefix reused + 7680 new tokens gives the same
+bytes as the fresh 8192-token prompt.
 
 ---
 

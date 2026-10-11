@@ -51,9 +51,9 @@ does ~380 cudaStreamSynchronize + ~110 graph launches per token -> GPU idle ~60%
 2. Decode tier (~24 ms/token cold): remaining file/CPU misses; R1 merged (16b05583).
 3. Prefill > 300 at 8K: expert H2D runs ~10 GB/s effective (copy engine ~40% busy; pinned copies median 13 GB/s); prestage
    the next layer's file-tier experts from the slab too (VRAM permitting); the dense half 11 s.
-4. Wrapper: tools/v41/serve/strata-ds41-quetza.wrapper exists, NOT installed; the --serve path does not defer the VRAM
-   cache (prompt-batch / enc-skip / prestage are one-shot only) and failed graph allocation with --arena-gib 60 - needs
-   the defer/release logic per request before it is useful.
+4. ~~Wrapper~~ DONE 2026-10-11 ~22:20 (ea04b97f): --serve defers / releases the VRAM cache per request, enc-skip on,
+   short turns (<= 384 new tokens) as decode steps, regenerate = snapshot + saved logits; wrapper INSTALLED as
+   ~/.local/bin/strata-ds41-quetza (port 8150, 512K ctx); HTTP OpenAI + Anthropic tool calls checked end to end.
 
 ### Paste-able resume prompt
     Continue the DeepSeek-V4.1-Flash Strata engine work for Mal in ~/AI/Strata-DS4 (branch deepseek4; GitHub remote `ds4`
