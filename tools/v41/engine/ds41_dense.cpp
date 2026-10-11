@@ -184,6 +184,10 @@ struct Ds41Dense::Impl {
     std::vector<int32_t> host_ids;
     const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap
     std::vector<std::vector<float>> eng_rows;
+    // The pass's Engram reads, started (async) by upload_inputs and waited at the first Engram layer's span /
+    // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
+    // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
+    std::shared_ptr<Ds41Engram::Batch> eng_batch;
 
     // ---- graphs
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
@@ -873,6 +877,19 @@ static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t 
     }
 }
 
+// Wait for the pass's Engram reads (started by upload_inputs) and push the rows into the state tensor's columns.  A
+// no-op once done (eng_batch is null), so it is safe to call at every layer - but the caller gates it on L.eslot >= 0
+// so the layers BELOW the first Engram layer run while the disk is still reading.  The whole pass's rows (both Engram
+// slots, all n columns) go up in one shot, so the second Engram layer (14) is a plain read of the same tensor.
+static bool engram_ready(Ds41Dense::Impl & im) {
+    if (!im.eng_batch) return true;
+    if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
+    im.eng_batch.reset();
+    for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
+        ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+    return true;
+}
+
 // Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
@@ -946,12 +963,14 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         ggml_backend_tensor_set(im.i_sidx, si.data(), 0, si.size() * 4);
         ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
     }
-    // Engram rows
+    // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
+    // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
+    // embeddings upload, the init graph and the layers below it.  A tiny batch (decode) still runs on the caller.
     if (im.engram.enabled()) {
+        if (!engram_ready(im)) return false;    // flush a still-pending batch from a previous pass first
         for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
-        if (!im.engram.rows(pos0, n, im.eng_rows, im.err)) return false;
-        for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
-            ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+        im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+        if (!im.eng_batch) return false;
     }
     return true;
 }
@@ -1061,6 +1080,7 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
     if (!upload_span(im, col0, n)) return false;
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // the Engram add feeds this layer's K/V
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params pk = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gck = ggml_init(pk);
@@ -1073,6 +1093,7 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
     if (!upload_span(im, col0, n)) return false;
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // wait the pass's Engram reads here
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gc = ggml_init(p);
@@ -1117,6 +1138,9 @@ const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
     const int64_t n = im.n;
+    // Engram layer: wait the pass's reads (started in upload_inputs) before the graph that reads i_eng runs.  For the
+    // chunk path this is the first Engram layer too, so the layers below it ran while the disk was reading.
+    if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;
     const int64_t r = im.ly[(size_t) il].ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     ggml_cgraph * gf = nullptr;

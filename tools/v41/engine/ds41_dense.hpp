@@ -41,7 +41,7 @@ struct Ds41DenseConfig {
     /// Directories holding the HF shards with the Engram tables (model.safetensors.index.json in the first).
     /// Empty = no Engram (its add is skipped: a debugging mode, the model is then not the model).
     std::vector<std::string> engram_dirs;
-    int     engram_threads = 16;        ///< parallel row reads
+    int     engram_threads = 32;        ///< parallel row reads (the disk's queue depth; cold peaks at 32-64)
     /// KV caches (window ring, compressed rows, indexer keys) element type: GGML_TYPE_F32 / BF16, or -1 = auto: BF16
     /// with act_quant (every cached value is then an FP8/FP4 grid point times a power-of-two / E4M3 scale: <= 7
     /// significant bits, exact in BF16 - half the VRAM of F32 at 512K), F32 without.
