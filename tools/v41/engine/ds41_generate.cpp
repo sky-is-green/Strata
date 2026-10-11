@@ -7,8 +7,8 @@
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--serve] [--quiet]
-//                 [--enc-skip] [--enc-replay N] [--dump-last F]
-// --enc-skip (layer-major batches only): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
+//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
+// --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
@@ -65,7 +65,7 @@ struct Args {
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = false, arena_adapt = false, chunk_mmq = false;
     bool act_quant = true, chunk_prefetch = true;
-    bool enc_skip = false;        // --enc-skip: only run the tokens before the replay window through layers 21-39
+    int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
@@ -119,7 +119,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--dump-last") a.dump_last = next();
-        else if (k == "--enc-skip") a.enc_skip = true;
+        else if (k == "--enc-skip") a.enc_skip = 1;
+        else if (k == "--no-enc-skip") a.enc_skip = 0;
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
@@ -204,10 +205,12 @@ int main(int argc, char ** argv) {
     // through the per-layer 128-token window, so for a long prompt they can stop after the KV-writing part of layer
     // 20 (the layer-major batch path only; the chunk path has no per-layer column split, --ppl/--dump-logits need
     // every row's logits, which the skipped rows do not have).
-    bool enc_skip = a.enc_skip;
+    // default ON (byte-identical last-row logits vs the full path, 8192 tokens, 2026-10-11) for one-shot layer-major runs;
+    // --serve keeps it opt-in until the reuse path is exercised
+    bool enc_skip = a.enc_skip == 1 || (a.enc_skip < 0 && !a.serve && PB > 1);
     if (enc_skip && a.enc_replay < 1) { std::fprintf(stderr, "ds41_generate: --enc-replay must be >= 1\n"); return 2; }
     if (enc_skip && (a.ppl || !a.dump_logits.empty())) {
-        std::fprintf(stderr, "note: --enc-skip disabled (--ppl/--dump-logits need every row's logits, the old full path)\n");
+        if (a.enc_skip == 1) std::fprintf(stderr, "note: --enc-skip disabled (--ppl/--dump-logits need every row's logits, the old full path)\n");
         enc_skip = false;
     }
     if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
@@ -351,7 +354,11 @@ int main(int argc, char ** argv) {
     if (PB > 0) brouted.resize((size_t) n_embd * (size_t) PB);
     // a single run_chunk call streams layer l's experts once for its n tokens; the card's chunk buffers (dominated by
     // c_parts = n * top_k * n_embd * 4) must fit ~1 GiB, so a larger batch is run in pieces (each streams once again)
-    const int piece = (int) std::max<int64_t>(1, (int64_t) 1.0e9 / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
+    // budget 3 GB by default (STRATA_CHUNK_BUDGET_GB): at B=8192 the old 1 GB cap split every layer into 2 pieces and each
+    // piece re-uploaded the whole layer over PCIe (1.97M vs 0.98M expert copies); the prompt has ~12 GiB of VRAM free
+    // (the VRAM expert cache is only seeded after the prompt, from the memory measured then)
+    const double chunk_budget = std::getenv("STRATA_CHUNK_BUDGET_GB") ? std::atof(std::getenv("STRATA_CHUNK_BUDGET_GB")) * 1e9 : 3.0e9;
+    const int piece = (int) std::max<int64_t>(1, (int64_t) chunk_budget / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
     std::vector<float> last_logits((size_t) nv);
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
