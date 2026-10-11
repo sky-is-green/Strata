@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-11 ~13:10 by `strata-ds4-gpu` (Claude, conductor session `636553.13852289`).
+**Last updated:** 2026-10-11 ~20:15 by Claude (inline conductor, session 636553.13852289).
 **READ §HANDOFF 2026-10-11 NIGHT FIRST** (then EVENING, 13:10) - it supersedes the 07:20 handoff below where they differ.
 
 ## HANDOFF 2026-10-11 NIGHT (~20:15) - prefill 219-227 tok/s (8K) / 288 (16K), decode 21.1 tok/s - READ THIS FIRST
