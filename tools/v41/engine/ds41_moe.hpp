@@ -53,6 +53,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <mutex>
 #include <vector>
 
 namespace strata::v41 {
@@ -232,6 +233,12 @@ private:
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const;
+    /// read_part's aligned bounces (one per concurrent part, kept for the next call)
+    uint8_t* take_bounce() const;
+    void give_bounce(uint8_t* p) const;
+    mutable std::mutex bmu_;
+    mutable std::vector<uint8_t*> bfree_, ball_;
+    bool part_direct_ = true;    ///< read_part through the O_DIRECT twin (STRATA_DECODE_DIRECT=0: buffered)
     std::string path_;
     int fd_ = -1;
     int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)

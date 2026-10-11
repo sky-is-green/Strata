@@ -53,6 +53,7 @@ namespace {
 constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
 constexpr int kMaxTok = 4;     ///< tokens one run_multi call takes (draft verify: last token + up to 3 drafts)
 constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct experts of one run_multi call
+constexpr size_t kMetaBytes = 16384;   ///< run(): one call's grouped-launch metadata (<= 12 launches x ~200 B)
 constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what route_probe tokenises)
 
 [[maybe_unused]] double now_ms() {
@@ -135,6 +136,8 @@ struct Gpu {
     strata::kernels::NativeExpertLayout gl;
     std::vector<strata::kernels::NativeExpertLayout> gll;   ///< per model layer (all == gl for a uniform geometry)
     cudaStream_t s = nullptr;
+    void *d_meta = nullptr;            ///< run(): grouped-launch metadata (device side of h_meta)
+    uint8_t* h_meta = nullptr;         ///< pinned staging for it
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
     cudaEvent_t ev[4] = {};
@@ -200,7 +203,8 @@ struct Gpu {
         for (auto& e : ev)
             if (e) cudaEventDestroy(e);
         void* bufs[] = {d_x, d_xq, d_parts, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok, d_scratch,
-                        d_stage, d_pf};
+                        d_stage, d_pf, d_meta};
+        if (h_meta) cudaFreeHost(h_meta);
         for (void* p : bufs)
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
@@ -1091,6 +1095,8 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
+    ck(cudaMalloc(&gp.d_meta, kMetaBytes), "d_meta");
+    ck(cudaMallocHost((void**) &gp.h_meta, kMetaBytes), "h_meta");
     if (cfg.pf_b > 0) {
         ck(cudaStreamCreateWithFlags(&gp.s_pf, cudaStreamNonBlocking), "pf stream");
         ck(cudaMalloc(&gp.d_pf, (size_t) Ds41MoeConfig::kMaxPf * (size_t) im_->blob), "d_pf");
@@ -1712,21 +1718,35 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // ---- one group's metadata, then the grouped kernel: w 0 = the GPU's hits, 1 = the PCIe share ----
     // one launch per format class among the entries (dst = routing index -> the expert's class); the metadata
     // buffers are reused between launches on the same stream, so they are uploaded per launch, in order
+    // the five metadata arrays of a launch go into one region of the pinned h_meta block and up in ONE async copy
+    // (they were five pageable copies per launch, ~20 per layer); regions are never reused within this call, and the
+    // next call starts after this one's layer sync, so no copy can read a region that is being rewritten
+    size_t meta_at = 0;
     auto launch_group1 = [&](const strata::kernels::NativeExpertLayout& GL, int n, const std::vector<unsigned long long>& ptr,
                              const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
                              const std::vector<int32_t>& tok) {
+        auto al = [](size_t x) { return (x + 15) & ~(size_t) 15; };
+        size_t o_ptr = meta_at, o_st = al(o_ptr + 8 * (size_t) n), o_ng = al(o_st + 4 * (size_t) (n + 1)),
+               o_dst = al(o_ng + 4), o_tok = al(o_dst + 4 * (size_t) n), end = al(o_tok + 4 * (size_t) n);
+        if (end > kMetaBytes) {   // cannot happen with top-k 6 (<= 12 launches); stay correct anyway
+            ck(cudaStreamSynchronize(gp.s), "meta wrap");
+            meta_at = 0;
+            o_ptr = 0, o_st = al(8 * (size_t) n), o_ng = al(o_st + 4 * (size_t) (n + 1)), o_dst = al(o_ng + 4),
+            o_tok = al(o_dst + 4 * (size_t) n), end = al(o_tok + 4 * (size_t) n);
+        }
         const int32_t one = n;
-        ck(cudaMemcpyAsync(gp.d_grp_ptr, ptr.data(), sizeof(unsigned long long) * n, cudaMemcpyHostToDevice, gp.s),
-           "grp_ptr");
-        ck(cudaMemcpyAsync(gp.d_grp_start, start.data(), sizeof(int32_t) * (n + 1), cudaMemcpyHostToDevice, gp.s),
-           "grp_start");
-        ck(cudaMemcpyAsync(gp.d_ngroups, &one, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "ngroups");
-        ck(cudaMemcpyAsync(gp.d_ent_dst, dst.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_dst");
-        ck(cudaMemcpyAsync(gp.d_ent_tok, tok.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_tok");
-        strata::kernels::native_expert_grouped(GL, (const unsigned long long*) gp.d_grp_ptr,
-                                              (const int32_t*) gp.d_grp_start, (const int32_t*) gp.d_ngroups,
-                                              (const int32_t*) gp.d_ent_dst, (const int32_t*) gp.d_ent_tok,
-                                              kMaxParts, n, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, n);
+        std::memcpy(gp.h_meta + o_ptr, ptr.data(), sizeof(unsigned long long) * (size_t) n);
+        std::memcpy(gp.h_meta + o_st, start.data(), sizeof(int32_t) * (size_t) (n + 1));
+        std::memcpy(gp.h_meta + o_ng, &one, sizeof(int32_t));
+        std::memcpy(gp.h_meta + o_dst, dst.data(), sizeof(int32_t) * (size_t) n);
+        std::memcpy(gp.h_meta + o_tok, tok.data(), sizeof(int32_t) * (size_t) n);
+        uint8_t* dm = (uint8_t*) gp.d_meta;
+        ck(cudaMemcpyAsync(dm + o_ptr, gp.h_meta + o_ptr, end - o_ptr, cudaMemcpyHostToDevice, gp.s), "grp meta");
+        strata::kernels::native_expert_grouped(GL, (const unsigned long long*) (dm + o_ptr), (const int32_t*) (dm + o_st),
+                                              (const int32_t*) (dm + o_ng), (const int32_t*) (dm + o_dst),
+                                              (const int32_t*) (dm + o_tok), kMaxParts, n, gp.d_xq, gp.d_scratch,
+                                              (float*) gp.d_parts, gp.s, n);
+        meta_at = end;
     };
     auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr,
                             const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
@@ -3275,6 +3295,24 @@ Ds41FileBlobs::Ds41FileBlobs(std::string gguf) : path_(std::move(gguf)) {}
 Ds41FileBlobs::~Ds41FileBlobs() {
     if (fd_ >= 0) ::close(fd_);
     if (dfd_ >= 0) ::close(dfd_);
+    for (uint8_t* p : ball_) std::free(p);
+}
+
+uint8_t* Ds41FileBlobs::take_bounce() const {
+    std::lock_guard<std::mutex> lk(bmu_);
+    if (!bfree_.empty()) {
+        uint8_t* p = bfree_.back();
+        bfree_.pop_back();
+        return p;
+    }
+    uint8_t* p = (uint8_t*) std::aligned_alloc(4096, (scratch_ + 4095) & ~(size_t) 4095);
+    if (p) ball_.push_back(p);
+    return p;
+}
+
+void Ds41FileBlobs::give_bounce(uint8_t* p) const {
+    std::lock_guard<std::mutex> lk(bmu_);
+    bfree_.push_back(p);
 }
 
 bool Ds41FileBlobs::open(std::string& err) {
@@ -3346,6 +3384,10 @@ bool Ds41FileBlobs::open(std::string& err) {
     // STRATA_BLOB_DIRECT=0 keeps the buffered path; a filesystem that refuses O_DIRECT just leaves dfd_ = -1.
     const char* dv = std::getenv("STRATA_BLOB_DIRECT");
     if (!(dv && dv[0] == '0')) dfd_ = ::open(path_.c_str(), O_RDONLY | O_DIRECT);
+    // decode misses (read_part) through it too: random 6.75 MB blobs 1.43 vs 1.99 ms cold (rdbench, SSD NVME), and no
+    // page-cache churn inside the 84 GiB cgroup that also holds the pinned arena
+    const char* pd = std::getenv("STRATA_DECODE_DIRECT");
+    part_direct_ = !(pd && pd[0] == '0');
     uint64_t smax = 0;
     for (size_t c = 0; c < gu_rb_.size(); ++c) {
         smax = std::max<uint64_t>(smax, (uint64_t) gu_rb_[c] * (uint64_t) g_.n_ff);
@@ -3449,11 +3491,14 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     if (part + 1 < nparts) hi &= ~(uint64_t) 4095;
     else hi = total;
     uint64_t at = 0;
+    uint8_t* bb = part_direct_ && dfd_ >= 0 ? take_bounce() : nullptr;
     for (const Span& x : s) {
         const uint64_t a = std::max(lo, at), b = std::min(hi, at + x.bytes);
-        if (a < b) pread_all(fd_, dst + a, x.off + (a - at), b - a);
+        if (a < b && !(bb && read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_)))
+            pread_all(fd_, dst + a, x.off + (a - at), b - a);
         at += x.bytes;
     }
+    if (bb) give_bounce(bb);
 }
 
 std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& path, std::string& err) {

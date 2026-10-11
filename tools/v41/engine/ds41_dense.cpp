@@ -872,6 +872,14 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
 #endif
     im.host_ids.resize((size_t) (im.NU * NC));
     im.host_wts.resize((size_t) (im.NU * NC));
+#ifdef DS41_HAVE_CUDA
+    // pinned too: attn_router reads fn / ids / wts back with three async copies and one sync (truly async only from
+    // pinned memory)
+    if (!im.cpu) {
+        ggml_backend_cuda_register_host_buffer(im.host_ids.data(), im.host_ids.size() * 4);
+        ggml_backend_cuda_register_host_buffer(im.host_wts.data(), im.host_wts.size() * 4);
+    }
+#endif
     return true;
 }
 
@@ -1138,9 +1146,10 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     ggml_free(gc);
     if (!ok) return false;
     // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
-    ggml_backend_tensor_get(im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
-    ggml_backend_tensor_get(im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
-    ggml_backend_tensor_get(im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ggml_backend_synchronize(im.backend);
     return true;
 }
 
@@ -1196,9 +1205,11 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const bool ok = im.compute(gf, cached);
     if (gc) ggml_free(gc);
     if (!ok) return false;
-    ggml_backend_tensor_get(im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
-    ggml_backend_tensor_get(im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_tensor_get(im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
+    // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
+    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
+    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
+    ggml_backend_synchronize(im.backend);
     std::memcpy(ids, im.host_ids.data(), (size_t) (im.NU * n) * 4);
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
     *fn_host = im.host_fn.data();
