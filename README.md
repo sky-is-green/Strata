@@ -3,6 +3,10 @@
 <p align="center"><b>DeepSeek-V4.1-Flash (40 layers × 384 experts) on one gaming PC - 152 GiB of experts across VRAM, pinned RAM and NVMe</b><br>
 DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
 
+<p align="center"><b>RTX 4090 + Ryzen 7 5700X + 90 GB DDR4:&nbsp; prefill 221-269 tok/s (exact) &nbsp;·&nbsp; decode 25-28 tok/s</b><br>
+(8K prompt 221 tok/s one-shot, 20K prompt 266 tok/s in the server, logits byte-identical to the unoptimised path;
+decode 25.5-26.3 tok/s benchmark, 22.7-28.2 tok/s in a live agent session, 27.7 with the opt-in ggml patch)</p>
+
 > **Status: experimental, single-developer research code, measured on one PC.** The V4.1 engine generates correct
 > text, its GPU prompt path is deterministic (byte-identical logits run to run), and it serves an OpenAI / Anthropic
 > API with tool calls (one sequence at a time).  The GSQ model file it runs is not published.
