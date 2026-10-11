@@ -8,6 +8,35 @@ A DeepSeek-V4 engine built on <a href="https://github.com/Niko1221/Strata">Strat
 > chat UI of its own yet, and serves one sequence at a time. Expect rough edges. The upstream Strata README (the
 > Qwen3.8-Flash engine this is built on) is in [README.strata.md](README.strata.md).
 
+## New: DeepSeek-V4.1-Flash (GSQ mixed tiers) - work in progress
+
+`tools/v41/` is a second, separate engine for **DeepSeek-V4.1-Flash** (40 layers × 384 experts, top-6, Engram
+n-gram memory, shared compressed-KV / indexer layers). It runs a custom **GSQ** quant (GPTQ-style per-expert tier
+allocation: PTQ1_0 ternary 1.75 bpw, Q2_0 2.25 bpw and Q3_K experts; 152 GiB single file) whose experts live in three
+tiers: a VRAM cache, a pinned 60 GiB RAM arena, and the NVMe file itself (O_DIRECT reads).
+
+Quality of the GSQ file (head gate, held-out eval): ppl 5.645 vs 4.915 for the FP8 teacher (+14.9%), top-1 0.674 vs
+0.701; per domain agent 2.118 vs 2.121, reasoning 6.19 vs 5.83, code 1.98 vs 1.74. Engine on the 4090: 4096-token code
+ppl 2.380, top-1 0.822, and the GPU prompt path is deterministic (byte-identical logits run to run).
+
+Measured on the same PC (RTX 4090, 90 GB RAM, NVMe at ~4.5 GB/s), 2026-10-11:
+
+| | tok/s |
+|---|---|
+| Prefill, 8192-token prompt, chunked (start of 2026-10-11) | ~54 |
+| + layer-major prompt batches (`--prompt-batch`, default 8192) | 102.6 |
+| + next-layer file-tier prefetch into pinned slabs (O_DIRECT, 4.5 GB/s) | 105.9 |
+| + `--enc-skip` (layers past the last KV source only run the last 2560 tokens; exact) | **135.5** |
+| Decode, short prompt, `--route-bias 1.0` (selection-only bonus for VRAM-resident experts, nothing pruned) | 15.5 |
+| Decode after an 8192-token prompt | 6-10 |
+
+Prefill is now bound by PCIe uploads of streamed experts (5-8 GB/s in situ vs 24 GB/s isolated) and by a duplicated
+expert stream at B=8192; decode by per-layer syncs and file-tier misses. Targets: prefill 300-400 tok/s, decode 20+.
+The OpenAI/Anthropic server wrapper (`tools/v41/serve`) exists but does not yet use the prompt-batch / prefetch paths.
+Full state, numbers and commands: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
+
+The rest of this README describes the **V4-Flash (0731)** engine (`tools/ds4/`).
+
 ## What this is
 
 [Strata](https://github.com/Niko1221/Strata) is an inference engine specialised for one MoE model
