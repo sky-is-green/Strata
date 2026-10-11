@@ -63,6 +63,12 @@ public:
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).
     bool begin(const int * tids, int n, int pos0);
+    /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
+    /// VRAM expert cache opens into it after the prompt.
+    void release_pass();
+    /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
+    /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
+    void set_route_bias(int il, const float * bias);
     /// Layer il of the current pass: Engram (layers 1/14), attention, hc, ffn_norm, router, shared expert.
     /// ids / wts: n * n_used (token-major); *fn_host: n * n_embd floats (the routed experts' input, valid until the
     /// next call).  `fn_dev` (optional): the same activations on the backend.

@@ -47,6 +47,9 @@ namespace {
 
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits;
+    std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
+    float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
+    float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed
     std::vector<std::string> engram;
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
@@ -101,6 +104,9 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--ppl") a.ppl = true;
         else if (k == "--no-actquant") a.act_quant = false;
         else if (k == "--serve") a.serve = true;
+        else if (k == "--prune") a.prune = next();
+        else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
+        else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
@@ -213,9 +219,32 @@ int main(int argc, char ** argv) {
     mc.chunk_mmq = a.chunk_mmq;
     mc.skip_miss = a.skip_miss;
     mc.skip_file = a.skip_file;
+    // soft / hard pruning (the GLM recipe, as tools/ds4/ds4_generate): listed experts take no VRAM slot and no arena space;
+    // with --prune-penalty X they keep a selection bias -X (still chosen when the router prefers them by more than X, then
+    // read from the file tier), without it they are never routed
+    std::vector<char> pruned;
+    int64_t n_pruned = 0;
+    if (!a.prune.empty()) {
+        pruned.assign((size_t) (TG.n_layers * TG.n_experts), 0);
+        std::FILE * pf = std::fopen(a.prune.c_str(), "r");
+        if (!pf) { std::fprintf(stderr, "ds41_generate: cannot open %s\n", a.prune.c_str()); return 2; }
+        long l, e;
+        while (std::fscanf(pf, "%ld %ld", &l, &e) == 2)
+            if (l >= 0 && l < TG.n_layers && e >= 0 && e < TG.n_experts && !pruned[(size_t) (l * TG.n_experts + e)]) {
+                pruned[(size_t) (l * TG.n_experts + e)] = 1;
+                ++n_pruned;
+            }
+        std::fclose(pf);
+        std::fprintf(stderr, "prune: %lld (layer, expert) pairs %s (%s)\n", (long long) n_pruned,
+                     a.prune_penalty > 0 ? ("penalised -" + std::to_string(a.prune_penalty)).c_str() : "masked out of routing", a.prune.c_str());
+        mc.exclude = pruned;
+    }
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
+    // one-shot runs defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the
+    // cache opens into it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots
+    const bool defer_vram = !mc.cpu_only && !a.serve && a.prefill_chunk > 1;
+    std::vector<std::pair<int32_t, int32_t>> ranked;
     if (!mc.cpu_only) {
-        std::vector<std::pair<int32_t, int32_t>> ranked;
         if (!a.rank.empty()) {
             ranked = ds41_read_ranked(a.rank, err);
             if (ranked.empty()) { std::fprintf(stderr, "ds41_generate: --rank: %s\n", err.c_str()); return 1; }
@@ -224,11 +253,26 @@ int main(int argc, char ** argv) {
                 for (int64_t e = 0; e < TG.n_experts; ++e) ranked.emplace_back((int32_t) l, (int32_t) e);
         }
         const double t0 = now_ms();
-        if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str()); return 1; }
+        if (defer_vram ? !tier.build_arena_ranked(ranked, err) : !tier.seed_from_ranked(ranked, err)) {
+            std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
+            return 1;
+        }
         std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
     }
+    // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
+    auto apply_bias = [&]() {
+        if (n_pruned == 0 && a.route_bias == 0.0f) return;
+        std::vector<float> rb((size_t) TG.n_experts);
+        for (int64_t l = 0; l < TG.n_layers; ++l) {
+            for (int64_t e = 0; e < TG.n_experts; ++e)
+                rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
+                               : (a.route_bias != 0.0f && !mc.cpu_only && tier.resident(l, e)) ? a.route_bias : 0.0f;
+            dense.set_route_bias((int) l, rb.data());
+        }
+    };
+    apply_bias();   // the prune part now (the prompt routes with it); route_bias again once the VRAM cache is seeded
     std::fprintf(stderr, "loaded in %.1f s: %d layers, ctx %lld, prefill chunk %d, experts %s, %zu classes\n",
                  (now_ms() - t_load) / 1000.0, n_layer, (long long) ctx, a.prefill_chunk, tier.mode(), TG.cls_gu.size());
 
@@ -430,6 +474,18 @@ int main(int argc, char ** argv) {
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     const double prompt_ms = now_ms() - tp0;
+    if (defer_vram) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
+        dense.release_pass();
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
+        const double g = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+        tier.set_slot_gib(a.slots > 0 ? 0.0 : g);
+        const double ts = now_ms();
+        if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+        apply_bias();
+        std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
+                     fr / 1073741824.0, g, (long long) tier.resident(), (now_ms() - ts) / 1000.0);
+    }
     const Ds41MoeStats pst = tier.stats();
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,

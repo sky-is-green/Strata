@@ -961,6 +961,13 @@ std::vector<std::pair<int32_t, int32_t>> drop_excluded(const Ds41MoeImpl& im, co
     return kept;
 }
 
+bool Ds41MoeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
+    if (im_->cfg.cpu_only) return true;
+    return build_arena(arena_order(*im_, drop_excluded(*im_, ranked_all)), err);
+}
+
+void Ds41MoeTier::set_slot_gib(double gib) { im_->cfg.slot_gib = gib; }
+
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);

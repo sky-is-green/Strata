@@ -146,6 +146,7 @@ struct Ds41Dense::Impl {
         ggml_tensor * sel = nullptr;      // I32 [ITOP, NC]  top-k rows (index sources)
         ggml_tensor * selm = nullptr;     // F32 [ITOP, NC]  0 / -inf (row visible to the query)
         ggml_tensor * raw_snap = nullptr, * st_kv_snap = nullptr, * st_sc_snap = nullptr;   // snapshot()
+        ggml_tensor * rbias = nullptr;    // F32 [NE]        selection-only routing bias (set_route_bias), 0 = model routing
     };
     int snap_pos = -1;
     std::vector<Layer> ly;
@@ -505,7 +506,10 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), fn);
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_sqrt(gc, ggml_softplus(gc, rl));                                  // [NE, n]
-    ggml_tensor * ids = ggml_argsort_top_k(gc, ggml_add(gc, sc, im.BL(il, "exp_probs_b.bias")), (int) im.NU);   // [NU, n]
+    // selection = score + exp_probs_b + the selection-only rbias (soft prune / cache bonus); the weights below come
+    // from the unbiased scores, as model.py's Gate - all-zero rbias (the default) = the model's routing bit for bit
+    ggml_tensor * sel = ggml_add(gc, ggml_add(gc, sc, im.BL(il, "exp_probs_b.bias")), ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
+    ggml_tensor * ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
     ggml_tensor * wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
     if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
     wts = ggml_scale(gc, wts, (float) G.weights_scale);
@@ -541,7 +545,8 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, 1), b.cols2(im.pre_state, HC, 1));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
-    ggml_tensor * sc = ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias"));
+    ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
+                                ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
     *out = ggml_argsort_top_k(gc, sc, 16);
     ggml_set_output(*out);
     ggml_build_forward_expand(gf, *out);
@@ -675,6 +680,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         auto & L = im.ly[(size_t) l];
         L.raw = T(kvt, { im.DH, im.RAW });
         L.raw_snap = T(kvt, { im.DH, im.RAW });
+        L.rbias = T(GGML_TYPE_F32, { im.NE });   // zeroed with the buffer
         if (L.kv_src) {
             L.comp = T(kvt, { im.DH, im.cmax[L.ratio] + 1 });
             L.idxk = T(kvt, { im.ID, im.cmax[L.ratio] + 1 });
@@ -728,6 +734,22 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.host_ids.resize((size_t) (im.NU * NC));
     im.host_wts.resize((size_t) (im.NU * NC));
     return true;
+}
+
+void Ds41Dense::set_route_bias(int il, const float * bias) {
+    Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;
+    ggml_backend_tensor_set(im.ly[(size_t) il].rbias, bias, 0, (size_t) im.NE * 4);
+}
+
+void Ds41Dense::release_pass() {
+    Impl & im = *p_;
+    if (!im.allo_pass.a) return;
+    ggml_gallocr_free(im.allo_pass.a);
+    im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+    im.allo_pass.graph_epoch.clear();
+    im.allo_pass.compute_bufs.clear();
+    ++im.allo_pass.epoch;
 }
 
 bool Ds41Dense::begin(const int * tids, int n, int pos0) {

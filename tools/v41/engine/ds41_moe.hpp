@@ -337,6 +337,10 @@ public:
     /// (the same rule the cache follows, where the first seed takes the free slots), so a re-seed re-fills the
     /// cache and never re-reads the arena.
     bool build_arena(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
+    /// The RAM arena alone, in the order seed_from_ranked gives it (that seed then only opens + fills the VRAM cache)
+    bool build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
+    /// VRAM slot budget for a cache not opened yet (deferred seed: measured after the prompt freed its buffers)
+    void set_slot_gib(double gib);
 
     /// Ranks every (layer, expert) by routing frequency over the TRAIN half of a `ds4routes.bin` file
     /// (alternating 512-token blocks - the split `tools/ds4/route_skew.py` scores with), builds the host arena
