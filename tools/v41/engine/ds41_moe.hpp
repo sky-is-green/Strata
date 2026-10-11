@@ -403,6 +403,10 @@ public:
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
     bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);
+    /// `run` with the weighted sum computed on the card and written to the device row `out_dev` (n_embd floats, e.g.
+    /// the dense half's routed tensor): the same bits as `run`'s host sum, without its parts readback and upload.
+    /// GPU tier only (false in cpu_only).
+    bool run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev);
     /// The same with `x` already on the device (the engine's attention output).  CUDA modes only.
     bool run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out);
 

@@ -1601,7 +1601,7 @@ int64_t g_prof_n = 0;
 const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu pool", "layer sync", "d2h parts",
                                     "sum", "admission", "pcie budget"};
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
-             const void* x_dev, float* out) {
+             const void* x_dev, float* out, void* out_dev = nullptr) {
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
     double tp = prof ? now_ms() : 0;
     auto mark = [&](int i) { if (prof) { const double t = now_ms(); g_prof[i] += t - tp; tp = t; } };
@@ -2060,6 +2060,31 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         ck(cudaEventElapsedTime(&ms, gp.ev[ev_hit > 0 ? ev_hit : 0], gp.ev[ev_pcie]), "pcie elapsed");
         st.pcie_ms = ms;
     }
+    if (out_dev) {
+        // ---- the weighted sum on the card, straight into the caller's device row (run_to_dev): the pool's rows go
+        // up into their routing-index rows of d_parts (beside the card's own), the weights through the metadata
+        // block, and decode_rows_sum adds them in k order in double - the host loop below, bit for bit - with no
+        // parts readback and no host -> device trip for the sum
+        for (int i = 0; i < nk; ++i) {
+            const int k = cpu_keep[i];
+            if (wloc[k] == 0.0f) continue;
+            float* hrow = (float*) gp.h_parts + (size_t) k * (size_t) H;
+            std::memcpy(hrow, im.parts.data() + (size_t) k * (size_t) H, (size_t) H * 4);
+            ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) k * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
+                               gp.s), "cpu row h2d");
+        }
+        size_t o_w = (meta_at + 15) & ~(size_t) 15;
+        if (o_w + sizeof(float) * (size_t) K > kMetaBytes) {
+            ck(cudaStreamSynchronize(gp.s), "meta wrap");
+            o_w = 0;
+        }
+        std::memcpy(gp.h_meta + o_w, wloc, sizeof(float) * (size_t) K);
+        ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + o_w, gp.h_meta + o_w, sizeof(float) * (size_t) K, cudaMemcpyHostToDevice,
+                           gp.s), "sum weights");
+        strata::kernels::decode_rows_sum((const float*) gp.d_parts, (const float*) ((uint8_t*) gp.d_meta + o_w), (int) K, H,
+                                         (float*) out_dev, gp.s);
+        ck(cudaStreamSynchronize(gp.s), "sum sync");
+    } else {
     ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
                        cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     ck(cudaStreamSynchronize(gp.s), "parts sync");
@@ -2099,6 +2124,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         }
         out[i] = (float) s;
     }
+    }   // host sum
 
     mark(6);
     // ---- admission: a compulsory miss takes a free slot and is filled for the NEXT token ----
@@ -3013,6 +3039,17 @@ bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const
     if (im_->cfg.cpu_only) return cpu_run(*im_, layer, ids6, w6, x, out);
 #if defined(DS4_MOE_CUDA)
     return gpu_run(*im_, layer, ids6, w6, x, nullptr, out);
+#else
+    return false;
+#endif
+}
+
+bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
+    if (!im_->inited || !im_->pool) return false;
+    if (!ids6 || !w6 || !x || !out_dev) return false;
+    if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
+#if defined(DS4_MOE_CUDA)
+    return gpu_run(*im_, layer, ids6, w6, x, nullptr, nullptr, out_dev);
 #else
     return false;
 #endif

@@ -371,6 +371,9 @@ int main(int argc, char ** argv) {
     // top STRATA_ADVISE_TOP (8) file-tier experts to the kernel (page-cache readahead; the SSD is idle in decode)
     const int advise_ahead = std::getenv("STRATA_ADVISE_AHEAD") ? std::atoi(std::getenv("STRATA_ADVISE_AHEAD")) : 0;
     const int advise_top = std::getenv("STRATA_ADVISE_TOP") ? std::atoi(std::getenv("STRATA_ADVISE_TOP")) : 8;
+    // decode: the tier sums the routed experts on the card straight into the dense half's routed tensor (same bits as
+    // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
+    float * const rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
     double dp[5] = {0, 0, 0, 0, 0};
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
@@ -398,14 +401,17 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
-            if (!tier.run(l, ids1.data(), w1.data(), fn, routed1.data())) { ferr = "tier.run failed"; return false; }
+            const bool tok = rdev1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rdev1)
+                                   : tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
+            if (!tok) { ferr = "tier.run failed"; return false; }
             if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
+            const float * rsum = rdev1 ? nullptr : routed1.data();   // null: already in the routed tensor
             if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer) {
                 int t16[16];
-                if (!dense.finish_predict(l, routed1.data(), l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
+                if (!dense.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
                 for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                 have_pred = true;
-            } else if (!dense.finish(l, routed1.data())) { ferr = dense.last_error(); return false; }
+            } else if (!dense.finish(l, rsum)) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
         }
         if (dprof && ++dp_n % 64 == 0)

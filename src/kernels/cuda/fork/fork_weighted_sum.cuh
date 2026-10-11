@@ -22,3 +22,25 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
     weighted_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, n, out);
     check("weighted_rows_sum");
 }
+
+// Decode (one token): out[i] = sum over k of w[k] * parts[k][i], k in routing order, accumulated in DOUBLE and rounded
+// once - the host loop it replaces (ds41_moe gpu_run) bit for bit: a float x float product is exact in double, so
+// fused or not the sum is the same; w[k] == 0 (a dropped miss: its row was never computed) is skipped, as there.
+__global__ void decode_rows_sum_kernel(const float* __restrict__ parts, const float* __restrict__ w, int K, int64_t H,
+                                       float* __restrict__ out) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < H; i += (int64_t) gridDim.x * blockDim.x) {
+        double s = 0.0;
+        for (int k = 0; k < K; ++k) {
+            const float wk = w[k];
+            if (wk == 0.0f) continue;
+            s = __dadd_rn(s, __dmul_rn((double) wk, (double) parts[(int64_t) k * H + i]));
+        }
+        out[i] = (float) s;
+    }
+}
+
+void decode_rows_sum(const float* parts, const float* w, int K, int64_t H, float* out, void* stream) {
+    const unsigned blocks = (unsigned) std::min<int64_t>((H + 255) / 256, 1024);
+    decode_rows_sum_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, out);
+    check("decode_rows_sum");
+}
