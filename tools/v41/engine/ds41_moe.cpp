@@ -138,6 +138,7 @@ struct Gpu {
     cudaStream_t s = nullptr;
     void *d_meta = nullptr;            ///< run(): grouped-launch metadata (device side of h_meta)
     uint8_t* h_meta = nullptr;         ///< pinned staging for it
+    uint8_t* h_fstage = nullptr;       ///< run(): file-tier misses read here (pinned), then DMA'd (kMaxParts blobs)
     void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_grp_ptr = nullptr, *d_grp_start = nullptr,
          *d_ngroups = nullptr, *d_ent_dst = nullptr, *d_ent_tok = nullptr, *d_scratch = nullptr, *d_stage = nullptr;
     cudaEvent_t ev[4] = {};
@@ -205,6 +206,7 @@ struct Gpu {
         void* bufs[] = {d_x, d_xq, d_parts, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok, d_scratch,
                         d_stage, d_pf, d_meta};
         if (h_meta) cudaFreeHost(h_meta);
+        if (h_fstage) cudaFreeHost(h_fstage);
         for (void* p : bufs)
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
@@ -1892,6 +1894,45 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         ev_pcie = 3;
     }
 
+    // ---- file-tier misses (in neither VRAM nor the RAM arena) on the card: read with O_DIRECT into a pinned staging
+    // block on reader threads WHILE the pool computes the arena misses below, then DMA'd into free d_stage slots and
+    // run by the grouped kernel - the pool took ~1.4 ms per such expert after its ~2 ms read, the DMA ~0.35 ms.
+    // STRATA_FILE_GPU=0: the pool computes them (the old path); off with arena_adapt (it reads into arena slots).
+    static const bool file_gpu = !(std::getenv("STRATA_FILE_GPU") && std::getenv("STRATA_FILE_GPU")[0] == '0');
+    int32_t fg_k[kMaxParts];
+    int nfg = 0;
+    if (file_gpu && !im.cfg.arena_adapt && nk > 0) {
+        int keep = 0;
+        for (int i = 0; i < nk; ++i) {
+            const int32_t k = cpu_keep[i];
+            if (!gp.arena.ptr(layer, ids6[k]) && np + nfg < kMaxParts) {
+                fg_k[nfg++] = k;
+                cpu_k[k] = false;   // the sum reads its row from the card's parts
+            } else {
+                cpu_keep[keep++] = k;
+            }
+        }
+        nk = keep;
+    }
+    std::vector<std::thread> frd;
+    std::atomic<size_t> fnx{0};
+    double tfg = 0;
+    if (nfg > 0) {
+        if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
+        tfg = now_ms();
+        const int parts = std::max(1, std::min(8, 8 / nfg));
+        const size_t tasks = (size_t) nfg * (size_t) parts;
+        const int nth = (int) std::min<size_t>(8, tasks);
+        for (int q = 0; q < nth; ++q)
+            frd.emplace_back([&, parts, tasks]() {
+                for (size_t r; (r = fnx.fetch_add(1)) < tasks;) {
+                    const size_t b = r / (size_t) parts;
+                    im.blobs->read_part(layer, ids6[fg_k[b]], (int) (r % (size_t) parts), parts,
+                                        gp.h_fstage + b * (size_t) B);
+                }
+            });
+    }
+
     mark(2);
     // ---- the CPU tier on what is left, WHILE the card works ----
     if (nk > 0) {
@@ -2016,6 +2057,23 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         }
     }
 
+    if (nfg > 0) {   // the file-tier blobs are home: up to the card, one grouped launch behind the hits / PCIe share
+        for (auto& t : frd) t.join();
+        im.st.file_tier += nfg;
+        im.st.file_ms += now_ms() - tfg;
+        std::vector<unsigned long long> ptr((size_t) nfg);
+        std::vector<int32_t> start((size_t) nfg + 1), dst((size_t) nfg, 0), tok((size_t) nfg, 0);
+        for (int j = 0; j < nfg; ++j) {
+            uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (np + j) * (size_t) B;
+            ck(cudaMemcpyAsync(to, gp.h_fstage + (size_t) j * (size_t) B, (size_t) BLX(ids6[fg_k[j]]), cudaMemcpyHostToDevice,
+                               gp.s), "file dma");
+            ptr[(size_t) j] = (unsigned long long) to;
+            start[(size_t) j] = j;
+            dst[(size_t) j] = fg_k[j];
+        }
+        start[(size_t) nfg] = nfg;
+        launch_group(1, nfg, ptr, start, dst, tok);
+    }
     mark(3);
     ck(cudaStreamSynchronize(gp.s), "layer sync");
     if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter
@@ -2097,14 +2155,17 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         for (int64_t k = 0; k < K; ++k) {
             if (cpu_k[k]) continue;
             const uint8_t* p = gp.arena.ptr(layer, ids6[k]);
+            for (int j = 0; j < nfg && !p; ++j)   // a file-tier miss run on the card: its staged bytes
+                if (fg_k[j] == k) p = gp.h_fstage + (size_t) j * (size_t) B;
             if (!p) continue;
             ds41_moe_cpu_expert(im.fl[(size_t) im.g.cls(layer, ids6[k])], H, im.g.n_ff, p, gp.h_x, ref.data(), *im.pool);
             double num = 0, den = 0;
             const float* g = gpu_parts + (size_t) k * (size_t) H;
             for (int64_t i = 0; i < H; ++i) { const double d = g[i] - ref[(size_t) i]; num += d * d; den += (double) ref[(size_t) i] * ref[(size_t) i]; }
-            bool is_pcie = false;
+            bool is_pcie = false, is_file = false;
             for (int j = 0; j < np; ++j) is_pcie = is_pcie || pcie_i[j] == k;
-            std::fprintf(stderr, "[chk] L%lld e%d %s rel %.3e\n", (long long) layer, ids6[k], is_pcie ? "pcie" : "hit ",
+            for (int j = 0; j < nfg; ++j) is_file = is_file || fg_k[j] == k;
+            std::fprintf(stderr, "[chk] L%lld e%d %s rel %.3e\n", (long long) layer, ids6[k], is_file ? "file" : is_pcie ? "pcie" : "hit ",
                          std::sqrt(num / std::max(den, 1e-30)));
         }
     }
@@ -2148,7 +2209,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     mark(7);
     if (prof) ++g_prof_n;
     st.hits = nh;
-    st.pcie = np;
+    st.pcie = np + nfg;   // file-tier misses run on the card count with the PCIe share (DMA'd too)
     st.cpu = nk;
     st.wall_ms = now_ms() - t0;
     im.st.add(st);
