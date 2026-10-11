@@ -350,6 +350,7 @@ int main(int argc, char ** argv) {
     const int SB = std::max(1, S);                 // the dense sub-batch size
     std::vector<int> cids((size_t) NP * top_k);
     std::vector<float> cw((size_t) NP * top_k), crouted((size_t) NP * n_embd), clog;
+    const bool routed_host = std::getenv("STRATA_ROUTED_HOST") != nullptr;
     std::vector<float> brouted;                    // the layer-major path's routed sums (n_embd * B)
     if (PB > 0) brouted.resize((size_t) n_embd * (size_t) PB);
     // a single run_chunk call streams layer l's experts once for its n tokens; the card's chunk buffers (dominated by
@@ -408,16 +409,24 @@ int main(int argc, char ** argv) {
                     }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
+                    // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
+                    // host round trip per layer); CPU / STRATA_ROUTED_HOST=1: through the host as before
+                    float * rdev = routed_host ? nullptr : dense.routed_dev();
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
-                        if (!tier.run_chunk(l, pn, dense.batch_ids() + (size_t) s * top_k,
-                                            dense.batch_wts() + (size_t) s * top_k,
-                                            dense.batch_fn() + (size_t) s * n_embd,
-                                            brouted.data() + (size_t) s * n_embd)) { ferr = "tier run refused"; return false; }
+                        const bool ok = rdev ? tier.run_chunk_dev(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                                                                  dense.batch_wts() + (size_t) s * top_k,
+                                                                  dense.batch_fn() + (size_t) s * n_embd,
+                                                                  rdev + (size_t) s * n_embd)
+                                             : tier.run_chunk(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                                                              dense.batch_wts() + (size_t) s * top_k,
+                                                              dense.batch_fn() + (size_t) s * n_embd,
+                                                              brouted.data() + (size_t) s * n_embd);
+                        if (!ok) { ferr = "tier run refused"; return false; }
                     }
                     t0 = now_ms();
                     fd_tier += t0 - t1;
-                    if (!dense.upload_routed(brouted.data(), B)) { ferr = dense.last_error(); return false; }
+                    if (!rdev && !dense.upload_routed(brouted.data(), B)) { ferr = dense.last_error(); return false; }
                     for (int s = d0; s < B; s += SB) {
                         const int sn = std::min(SB, B - s);
                         if (!dense.finish_span(l, s, sn)) { ferr = dense.last_error(); return false; }

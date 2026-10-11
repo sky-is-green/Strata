@@ -6,7 +6,10 @@
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
-#include "ggml-impl.h"   // ggml_cgraph::uid (graph reuse)
+#include "ggml-impl.h"
+#ifdef DS41_HAVE_CUDA
+#include "ggml-cuda.h"
+#endif   // ggml_cgraph::uid (graph reuse)
 
 #include <algorithm>
 #include <array>
@@ -836,6 +839,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.host_fn.resize((size_t) (D * NC));
+#ifdef DS41_HAVE_CUDA
+    // pinned: the fn rows go device -> host -> the tier's device input every layer (pageable copies ran at ~2 GB/s)
+    if (!im.cpu && !im.host_fn.empty()) ggml_backend_cuda_register_host_buffer(im.host_fn.data(), im.host_fn.size() * 4);
+#endif
     im.host_ids.resize((size_t) (im.NU * NC));
     im.host_wts.resize((size_t) (im.NU * NC));
     return true;
@@ -1086,6 +1093,8 @@ bool Ds41Dense::upload_routed(const float * routed_host, int B) {
     ggml_backend_tensor_set(im.routed, routed_host, 0, (size_t) B * im.D * 4);
     return true;
 }
+
+float * Ds41Dense::routed_dev() { return p_->cpu || !p_->routed ? nullptr : (float *) p_->routed->data; }
 
 bool Ds41Dense::finish_span(int il, int col0, int n) {
     Impl & im = *p_;

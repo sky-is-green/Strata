@@ -95,6 +95,9 @@ public:
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
     bool upload_routed(const float * routed_host, int B);
+    /// The routed-sum input tensor's device memory (columns of n_embd floats; null on the CPU backend): the tier can
+    /// write a layer-major batch's routed sums straight into it (run_chunk_dev) instead of upload_routed's host trip.
+    float * routed_dev();
     bool finish_span(int il, int col0, int n);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
     /// VRAM expert cache opens into it after the prompt.
