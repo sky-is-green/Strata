@@ -2,6 +2,7 @@
 #include "ds41_engram.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -137,6 +138,13 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
     for (int i = 0; i < std::max(1, threads); ++i)       // the pool is the disk's queue depth
         workers_.emplace_back([this] { pump(); });
     nthreads_ = (int64_t) workers_.size();
+    {
+        const char * env = std::getenv("STRATA_ENGRAM_CACHE_ROWS");
+        cache_cap_ = env ? (size_t) std::atoll(env) : (size_t) 2000000;
+        cache_pool_.assign(cache_cap_ * (size_t) (dim_ + dim_ / 32), 0);
+        cache_idx_.reserve(cache_cap_);
+        cache_used_ = 0;
+    }
     return true;
 }
 
@@ -272,13 +280,34 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
         rb.push_back((uint32_t) m);
         const size_t u = uq.size();
         const uint64_t bw = T.off_w, bs = T.off_s;
+        // row cache: a cached row is dequantized into its slots now and never read; groups span uncached rows only
+        std::vector<char> hit(u, 0);
+        if (cache_cap_) {
+            float * oe = out[(size_t) e].data();
+            for (size_t k = 0; k < u; ++k) {
+                if ((uint64_t) uq[k] >= (uint64_t) T.rows) continue;
+                auto it = cache_idx_.find(((uint64_t) e << 32) | uq[k]);
+                if (it == cache_idx_.end()) { ++cache_miss_; continue; }
+                ++cache_hits_;
+                hit[k] = 1;
+                const uint8_t * w = &cache_pool_[(size_t) it->second * (size_t) (dim + srsz)];
+                const uint8_t * sc = w + dim;
+                float * o0 = oe + (size_t) (uint32_t) pk[rb[k]] * (size_t) dim;
+                for (int64_t q = 0; q < srsz; ++q) {
+                    const float f = std::ldexp(1.0f, (int) sc[q] - 127);
+                    for (int64_t x = 0; x < 32; ++x) o0[q * 32 + x] = fp8_e4m3(w[q * 32 + x]) * f;
+                }
+                for (uint32_t p = rb[k] + 1; p < rb[k + 1]; ++p)
+                    std::memcpy(oe + (size_t) (uint32_t) pk[p] * (size_t) dim, o0, (size_t) dim * sizeof(float));
+            }
+        }
         size_t i = 0;
         while (i < u) {
-            if ((uint64_t) uq[i] >= (uint64_t) T.rows) { ++i; continue; }   // out of range: slots stay 0, bad already set
+            if ((uint64_t) uq[i] >= (uint64_t) T.rows || hit[i]) { ++i; continue; }   // out of range (bad set) / cached
             const uint64_t pw = bw + (uint64_t) uq[i] * (uint64_t) dim;
             const uint64_t page = pw & ~(uint64_t) 4095;
             size_t j = i + 1;
-            while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows &&
+            while (j < u && (uint64_t) uq[j] < (uint64_t) T.rows && !hit[j] &&
                    ((bw + (uint64_t) uq[j] * (uint64_t) dim) & ~(uint64_t) 4095) == page) ++j;
             const uint64_t w0 = bw + (uint64_t) uq[i] * (uint64_t) dim;
             const uint64_t w1 = bw + (uint64_t) uq[j - 1] * (uint64_t) dim + (uint64_t) dim;
@@ -312,6 +341,15 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                     const uint32_t row = uq[uu];
                     const uint8_t * w = bw + (uint64_t) (row - r0) * (uint64_t) dim;
                     const uint8_t * s = bs + (uint64_t) (row - r0) * (uint64_t) srsz;
+                    if (cache_cap_ && cache_used_ < cache_cap_) {   // keep the raw row (fill-until-full)
+                        std::lock_guard<std::mutex> lk(cache_mu_);
+                        if (cache_used_ < cache_cap_ && cache_idx_.emplace(((uint64_t) G.e << 32) | row, (uint32_t) cache_used_).second) {
+                            uint8_t * d = &cache_pool_[cache_used_ * (size_t) (dim + srsz)];
+                            std::memcpy(d, w, (size_t) dim);
+                            std::memcpy(d + dim, s, (size_t) srsz);
+                            ++cache_used_;
+                        }
+                    }
                     const uint32_t p0 = rb[uu];
                     float * o0 = oe + (size_t) (uint32_t) pk[p0] * (size_t) dim;   // dequantize straight into the first slot
                     for (int64_t q = 0; q < srsz; ++q) {
@@ -324,7 +362,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
             }
         };
         b->read_task = t;
-        if (t->n <= 2 * nthreads_) {                 // tiny batch (decode): run on the caller, no queue round-trip
+        if (nthreads_ <= 0 || t->n < 4) {            // tiny batch: run on the caller, no queue round-trip.  (Was n <= 2 *
+                                                     // nthreads: a decode token's ~48 preads then ran serially, ~11 ms cold.)
             t->parts = 1;
             t->pending.store(1);
             t->fn(0, t->n);

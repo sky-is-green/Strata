@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -969,8 +970,21 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     if (im.engram.enabled()) {
         if (!engram_ready(im)) return false;    // flush a still-pending batch from a previous pass first
         for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
-        im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
-        if (!im.eng_batch) return false;
+        if (n <= 64) {   // decode / verify: the rows are needed at layer 1 - read them now (synchronously)
+            static const bool eprof = std::getenv("STRATA_ENG_PROF") != nullptr;
+            static double eng_ms = 0; static long eng_n = 0;
+            const auto te = std::chrono::steady_clock::now();
+            if (!im.engram.rows(pos0, n, im.eng_rows, im.err)) return false;
+            if (eprof) {
+                eng_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - te).count();
+                if (++eng_n % 64 == 0) std::fprintf(stderr, "engram decode reads: %.3f ms/call over %ld calls\n", eng_ms / eng_n, eng_n);
+            }
+            for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
+                ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+        } else {
+            im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
+            if (!im.eng_batch) return false;
+        }
     }
     return true;
 }

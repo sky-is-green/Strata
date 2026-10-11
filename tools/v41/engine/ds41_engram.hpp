@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace strata::v41 {
@@ -55,12 +56,23 @@ public:
     uint64_t bytes_read() const { return bytes_; }
     /// row reads (pread syscalls) issued by the fast path (stats)
     uint64_t row_reads() const { return reads_; }
+    uint64_t cache_hits() const { return cache_hits_; }   ///< unique rows served from the row cache
+    uint64_t cache_misses() const { return cache_miss_; }
 
 private:
     struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0; };
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;
+    // Row cache: raw rows (dim weight bytes + dim/32 scale bytes) already read, keyed (layer slot << 32 | row).  Filled
+    // by every read until `cache_cap_` rows (STRATA_ENGRAM_CACHE_ROWS, default 2M ~ 0.6 GB; 0 = off), never evicted:
+    // a prompt's rows are all cached as it is read, so decode n-grams that repeat the context skip the disk (the Engram
+    // table sits on exFAT here: ~13K random reads/s - a decode token's ~48 reads cost ~10 ms cold).
+    std::unordered_map<uint64_t, uint32_t> cache_idx_;
+    std::vector<uint8_t> cache_pool_;
+    size_t cache_cap_ = 0, cache_used_ = 0;
+    uint64_t cache_hits_ = 0, cache_miss_ = 0;
+    std::mutex cache_mu_;
     std::vector<int64_t> hist_;      // compressed ids by position
     std::vector<int64_t> offsets_;   // [slot * cols + col] bucket range start
     int64_t cols_ = 0, dim_ = 0;
