@@ -55,18 +55,20 @@ struct Args {
     float route_bias_file = 0.0f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena)
     int   bias_prompt = 0;          // --bias-prompt N: quality proxy - apply route bias during the prompt, treating the first N
                                     // ranked experts as VRAM-resident (what the deferred seed will cache)
-    float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed
+    float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
+                                  // ~4x decode; 4096-tok ppl code 2.38 -> 2.67, agentic 15.1 -> 6.9; --route-bias 0 = exact routing)
     std::vector<std::string> engram;
     int n_predict = 64;
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
-    double vram_margin_gib = 1.0, pcie = 0.25, arena_gib = 60.0, pf_b = 0.0;
+    // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
+    double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
     int threads = 0, prefill_chunk = 0, prompt_batch = 8192;   // prompt_batch: layer-major batch B (0 = the chunk path)
     int64_t ctx = 0;
     float temp = 0.0f;
     uint64_t seed = 1;
     std::vector<int> stop;
-    bool ppl = false, serve = false, quiet = false, vram_lru = false, arena_adapt = false, chunk_mmq = false;
+    bool ppl = false, serve = false, quiet = false, vram_lru = true, arena_adapt = false, chunk_mmq = false;
     bool act_quant = true, chunk_prefetch = true;
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
@@ -98,6 +100,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
         else if (k == "--vram-lru") a.vram_lru = true;
+        else if (k == "--no-vram-lru") a.vram_lru = false;
         else if (k == "--arena-adapt") a.arena_adapt = true;
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
