@@ -333,6 +333,8 @@ struct Ds41MoeStats {
     int64_t prefetch_issued = 0;    ///< DMAs the prefetch started (useful or not)
     int64_t prefetch_dummy = 0;     ///< guesses outside the arena (the DMA happens; the bytes are zeros)
     int64_t advised = 0;            ///< file-tier experts hinted for readahead (advise_file)
+    int64_t spec_issued = 0;        ///< speculative file-tier reads started (spec_read)
+    int64_t spec_hits = 0;          ///< file-tier misses served from a speculative read
     int64_t cpu = 0;                ///< computed by the CPU pool
     int64_t pcie = 0;               ///< misses DMA'd to the GPU and computed there
     int64_t file_tier = 0;          ///< reads served by the blob source instead of the arena
@@ -400,6 +402,9 @@ public:
     /// arena, ask the kernel to read their bytes into the page cache now (posix_fadvise WILLNEED), so the tier's
     /// buffered read later is a page-cache copy.  The SSD is otherwise idle in decode, so a wrong guess costs ~nothing.
     void advise_file(int64_t layer, const int32_t* ids, int n);
+    /// Decode speculative reads: start O_DIRECT reads of `ids` (a later layer's predicted experts) that are neither
+    /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only.
+    void spec_read(int64_t layer, const int32_t* ids, int n);
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
     bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);

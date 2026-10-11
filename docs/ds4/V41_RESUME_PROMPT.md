@@ -37,6 +37,24 @@ stick + add 64 GB); my estimate: decode ~28-30 tok/s at today's biases (NVMe mis
 file penalty; prefill ~unchanged.  Caution: known bad byte lane @56.6 GB (memory note ram-fault-2026-09-18), 4x mixed
 DIMMs may downclock.
 
+**LATER (Mal 2026-10-12, not now): the 128 GB RAM question as a quality test.**  Decode p256 x 256 with
+--route-bias-file 0 and 0.3 at --arena-gib 60 and 65.  If the bigger arena closes much of the speed gap at a low file
+penalty, 128 GB buys near-exact routing (code ppl 2.87 -> ~2.67) at close to today's speed; if not, skip the RAM.
+
+**Decode budget + small-win ideas (~08:45, from the arena logs + NIGHT-2 profile, ~39 ms/token):**
+dense half ~19 ms (GPU ~14, rest host syncs/launches), tier ~16 ms (layer sync ~6, NVMe reads ~5.7 = 2.4 reads/token at
+~2.3 ms each ON the critical path - read only after routing is known, cpu-tier experts ~1.8).  Ideas, smallest first:
+1. fq patch (+5%, applying now).
+2. Speculative file-tier reads: Ds41MoeTier::prefetch turns a predicted file-tier expert into a DUMMY DMA (wasted).
+   Instead start its O_DIRECT read k=2-4 layers ahead (dense.predict(l+k), like STRATA_ADVISE_AHEAD - which is useless
+   now: it hints the page cache, but the reads are O_DIRECT) into a small pinned stash; the miss path checks the stash
+   first.  The SSD is idle during decode, so wrong guesses only cost bandwidth.  FIRST measure: how many of a token's
+   actual file misses are in predict(l+k)'s top-16, for k = 1..4.
+3. Second NVMe: mirror the hottest file-tier experts (by rank.bin) onto NVME1TB (970 EVO Plus, 48 GB free, exFAT - needs
+   O_DIRECT; reformat ext4 per the NInfer note) and split each read_part across both drives (~2.3 -> ~1.3 ms per read).
+4. Dense half host overhead (~5 ms/token of syncs / tiny kernels) - biggest remaining lever, more work (fusion).
+Swap/zram is not a lever: the arena is pinned and the engine scope has MemorySwapMax=0.
+
 Queue now: (a) read arena results, decide arena; (b) MTP head export Q8_0 + engine draft/verify; (c) vision export +
 engine/shim; (d) fq patch apply (Mal OK'd) + verify; (e) stashed span-upload change validate; (f) a fast exact quick
 path idea; (g) watch the text log on Mal's next session (poem request thought 6,590 tokens - loop or long thinking?).

@@ -201,6 +201,7 @@ struct Ds41Dense::Impl {
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
     std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
+    std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
     ~Impl() {
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -696,7 +697,8 @@ static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64
 }
 
 // finish (n = 1) + the next layer's routing prediction on the state it writes (build_predict's ops on the cpy result)
-static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * gc, int next_il, ggml_tensor ** pout) {
+static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * gc, int next_il, ggml_tensor ** pout,
+                                          int ahead = 0, std::vector<ggml_tensor *> * aout = nullptr) {
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
     const int64_t D = im.D, HC = im.HC;
@@ -710,6 +712,18 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1));
+    // the layers after next_il on the same state (speculative reads): their scores are stacked under next_il's so ONE
+    // argsort gives all the rows and ONE readback fetches them ([16, 1 + ahead] I32)
+    for (int a = 1; a <= ahead && aout; ++a) {
+        const int il = next_il + a;
+        if (il >= (int) im.ly.size()) break;
+        ggml_tensor * ra = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), b.rms_w(xp, im.BL(il, "ffn_norm.weight")));
+        ggml_mul_mat_set_prec(ra, GGML_PREC_F32);
+        ggml_tensor * sa = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, ra)), im.BL(il, "exp_probs_b.bias")),
+                                    ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
+        sc = ggml_concat(gc, sc, sa, 1);
+        aout->push_back(nullptr);   // a row of *pout
+    }
     *pout = ggml_argsort_top_k(gc, sc, 16);
     ggml_set_output(*pout);
     ggml_build_forward_expand(gf, *pout);
@@ -1297,6 +1311,40 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
     int32_t buf[16];
     ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
+    return true;
+}
+
+bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_il, int * top_ids, int n_top, int ahead,
+                                     int * ahead_ids) {
+    Impl & im = *p_;
+    (void) il;
+    if (ahead <= 0 || !ahead_ids) return finish_predict(il, routed_sum, next_il, top_ids, n_top);
+    if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
+    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
+    const Impl::GKey key { next_il, 6, ahead, 1 };
+    auto it = im.graphs.find(key);
+    if (it == im.graphs.end()) {
+        ggml_tensor * o = nullptr;
+        std::vector<ggml_tensor *> ao;
+        ggml_cgraph * gf = build_finish_predict(im, im.gctx, next_il, &o, ahead, &ao);
+        it = im.graphs.emplace(key, gf).first;
+        ao.insert(ao.begin(), o);   // [0] = next_il's prediction, [1 + a] = next_il + 1 + a's
+        im.fpredict_ahead[{ next_il, ahead }] = ao;
+    }
+    if (!im.compute(it->second, true)) return false;
+    const auto & ao = im.fpredict_ahead[{ next_il, ahead }];   // [0] = the output, then one entry per extra row
+    // argsort_top_k is a VIEW of the full argsort: row r starts at r * nb[1] (NE ids apart), not r * 16 - one copy of
+    // the span covering every row's first 16
+    const int rows = (int) ao.size();
+    const size_t rs = ao[0]->nb[1] / 4;
+    std::vector<int32_t> buf(rs * (size_t) (rows - 1) + 16);
+    ggml_backend_tensor_get(ao[0], buf.data(), 0, buf.size() * 4);
+    for (int i = 0; i < n_top; ++i) top_ids[i] = buf[(size_t) i];
+    for (int a = 0; a < ahead; ++a) {
+        if (a + 1 < rows) std::copy(buf.begin() + (ptrdiff_t) (rs * (size_t) (a + 1)), buf.begin() + (ptrdiff_t) (rs * (size_t) (a + 1) + 16),
+                                    ahead_ids + (size_t) a * 16);
+        else std::fill(ahead_ids + (size_t) a * 16, ahead_ids + (size_t) (a + 1) * 16, -1);
+    }
     return true;
 }
 

@@ -123,6 +123,11 @@ public:
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
     bool finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
+    /// finish_predict + the routing predictions of the `ahead` layers after next_il, from the same state, in the same
+    /// graph: ahead_ids[a * 16 ..] = layer next_il + 1 + a's top 16 (-1 past the last layer).  For speculative
+    /// file-tier reads; a hint only.
+    bool finish_predict_ahead(int il, const float * routed_sum, int next_il, int * top_ids, int n_top, int ahead,
+                              int * ahead_ids);
     /// Logits of rows row0..row0+nrows-1 of the pass after the last layer's finish: nrows * n_vocab floats.
     bool logits(int row0, int nrows, float * out);
     /// Conversation reuse: every cache is position-indexed except the window ring and the ratio-2 compressor state

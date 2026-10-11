@@ -375,18 +375,58 @@ int main(int argc, char ** argv) {
     // top STRATA_ADVISE_TOP (8) file-tier experts to the kernel (page-cache readahead; the SSD is idle in decode)
     const int advise_ahead = std::getenv("STRATA_ADVISE_AHEAD") ? std::atoi(std::getenv("STRATA_ADVISE_AHEAD")) : 0;
     const int advise_top = std::getenv("STRATA_ADVISE_TOP") ? std::atoi(std::getenv("STRATA_ADVISE_TOP")) : 8;
+    // STRATA_FILE_PRED=1 (measurement only, slower): at layer l, predict layers l+1..l+4 from the current state and count
+    // how many of the file-tier misses each layer actually routes were in that prediction's top 4 / 8 / 16 - the hit
+    // rate a speculative O_DIRECT read k layers ahead would get.  Printed after the decode line.
+    // speculative file-tier reads (decode, OPT-IN): finish(l)'s fused prediction graph also predicts layers
+    // l+2..l+1+SPEC_AHEAD; the file-tier experts among each prediction's top STRATA_SPEC_TOP are read ahead
+    // (tier.spec_read).  Measured 2026-10-12 (p256 x 256, --slots 1500, tokens identical): 61-81% of the file misses
+    // come from the stash and the tier gets ~1.8 ms/token faster, but the bigger finish graph (+1.5 ms) and issuing
+    // (+1.3 ms) eat it - net 24.97-25.10 vs 25.56 tok/s off.  Default 0 = off; try STRATA_SPEC_TOP=4.
+    const int spec_top = std::getenv("STRATA_SPEC_TOP") ? std::atoi(std::getenv("STRATA_SPEC_TOP")) : 0;
+    const int spec_ahead = std::getenv("STRATA_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_SPEC_AHEAD")) : 2;
+    // STRATA_SPEC_L1=1: also read the next layer's predicted file-tier experts (one layer of lead: mostly late)
+    const bool spec_l1 = std::getenv("STRATA_SPEC_L1") && std::getenv("STRATA_SPEC_L1")[0] == '1';
+    // STRATA_DUMP_MAIN=F (measurement only, slower): per decode step append {int32 token, int32 pos, 3 x n_embd f32} to F
+    // = the step's input token and the HC-mean of layers 37/38/39's output state (DeepSeek model.py's DSpark
+    // main_hidden), for the offline DSpark acceptance test (tools/v41/dspark_accept.py).  The one-shot run then feeds
+    // the last 128 prompt tokens (DSpark's attention window) as steps too.
+    const char * dump_main_path = std::getenv("STRATA_DUMP_MAIN");
+    std::FILE * dump_main = dump_main_path ? std::fopen(dump_main_path, "wb") : nullptr;
+    const int dm_layers[3] = { 37, 38, 39 };
+    std::vector<float> dm_x, dm_pre, dm_row;
+    int dm_tok = 0, dm_pos = 0;
+    const bool file_pred = std::getenv("STRATA_FILE_PRED") != nullptr;
+    constexpr int kFP = 4;
+    std::vector<int> fp_ids(file_pred ? (size_t) kFP * (size_t) n_layer * 16 : 0, -1);
+    long long fp_miss[kFP + 1] = {0}, fp_hit[kFP + 1][3] = {{0}}, fp_cand[kFP + 1][3] = {{0}};
     // decode: the tier sums the routed experts on the card straight into the dense half's routed tensor (same bits as
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
     float * const rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
-    double dp[5] = {0, 0, 0, 0, 0};
+    double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
         double ta = dprof ? now_ms() : 0;
+        if (dump_main) {
+            dm_tok = tok;
+            dm_pos = pos;
+            dm_row.assign((size_t) 3 * n_embd, 0.0f);
+        }
         if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
         if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
         bool have_pred = false;
         for (int l = 0; l < n_layer; ++l) {
+            if (file_pred) {
+                for (int k = 1; k <= kFP; ++k) {
+                    int * const pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) (l + k < n_layer ? l + k : 0)) * 16;
+                    if (l + k < n_layer && !dense.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);
+                    if (l + k < n_layer)   // file-tier candidates = the reads a speculative fetch would issue
+                        for (int i = 0; i < 16; ++i)
+                            if (pk[i] >= 0 && !tier.resident(l + k, pk[i]) && !tier.in_arena(l + k, pk[i]))
+                                for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
+                }
+            }
             if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
                 int ta[16];
                 if (dense.predict(l + advise_ahead, ta, 16)) tier.advise_file(l + advise_ahead, ta, advise_top);
@@ -405,6 +445,23 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
+            if (file_pred) {
+                for (int j = 0; j < top_k; ++j) {
+                    const int e = ids1[(size_t) j];
+                    if (e < 0 || tier.resident(l, e) || tier.in_arena(l, e)) continue;
+                    ++fp_miss[0];
+                    for (int k = 1; k <= kFP; ++k) {
+                        if (l - k < 0) continue;   // nothing predicted this layer k layers ago
+                        const int * pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) l) * 16;
+                        ++fp_miss[k];
+                        int at = 16;
+                        for (int i = 0; i < 16; ++i) if (pk[i] == e) { at = i; break; }
+                        if (at < 4) ++fp_hit[k][0];
+                        if (at < 8) ++fp_hit[k][1];
+                        if (at < 16) ++fp_hit[k][2];
+                    }
+                }
+            }
             const bool tok = rdev1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rdev1)
                                    : tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
             if (!tok) { ferr = "tier.run failed"; return false; }
@@ -412,15 +469,35 @@ int main(int argc, char ** argv) {
             const float * rsum = rdev1 ? nullptr : routed1.data();   // null: already in the routed tensor
             if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer) {
                 int t16[16];
-                if (!dense.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
+                if (spec_top > 0 && spec_ahead > 0) {
+                    int ahead[16 * 8];
+                    const int na = std::min(spec_ahead, 8);
+                    if (!dense.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = dense.last_error(); return false; }
+                    if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
+                    if (spec_l1) tier.spec_read(l + 1, t16, std::min(spec_top, 16));
+                    for (int a = 0; a < na; ++a) tier.spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
+                    if (dprof) { const double t = now_ms(); dp[5] += t - ta; ta = t; }
+                } else if (!dense.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
                 for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                 have_pred = true;
             } else if (!dense.finish(l, rsum)) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
+            for (int j = 0; dump_main && j < 3; ++j) {
+                if (l != dm_layers[j]) continue;
+                dense.read_state(dm_x, dm_pre);   // [n_embd, HC] for the one token
+                const size_t HC = dm_x.size() / (size_t) n_embd;
+                for (size_t h = 0; h < HC; ++h)
+                    for (int64_t d = 0; d < n_embd; ++d) dm_row[(size_t) j * n_embd + d] += dm_x[h * n_embd + d] / (float) HC;
+                if (j == 2) {
+                    std::fwrite(&dm_tok, 4, 1, dump_main);
+                    std::fwrite(&dm_pos, 4, 1, dump_main);
+                    std::fwrite(dm_row.data(), 4, dm_row.size(), dump_main);
+                }
+            }
         }
         if (dprof && ++dp_n % 64 == 0)
-            std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f (%ld steps)\n",
-                         dp[0] / dp_n, dp[1] / dp_n, dp[2] / dp_n, dp[3] / dp_n, dp[4] / dp_n, dp_n);
+            std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f spec %.2f (%ld steps)\n",
+                         dp[0] / dp_n, dp[1] / dp_n, dp[2] / dp_n, dp[3] / dp_n, dp[4] / dp_n, dp[5] / dp_n, dp_n);
         return true;
     };
     // a few tokens in ONE dense pass (the dense weights - ~8 GB - read once for m tokens, not per token), the routed
@@ -833,12 +910,19 @@ int main(int argc, char ** argv) {
     tier.reset_stats();
     const double tp0 = now_ms();
     std::vector<float> all;
-    const bool ok = feed(prompt.data(), (int) prompt.size(), 0, [&](int done) {
+    const int dm_tail = dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
+    const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
+    if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+    for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
+        if (!step(prompt[(size_t) i], i) || !dense.logits(0, 1, last_logits.data())) {
+            std::fprintf(stderr, "ds41_generate: dump-main prompt step: %s\n", ferr.c_str());
+            return 1;
+        }
     const double prompt_ms = now_ms() - tp0;
-    if (defer_vram) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
+    if (defer_vram && dm_tail == 0) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      seed_free, seed_gib, (long long) tier.resident(), seed_s);
@@ -885,10 +969,23 @@ int main(int argc, char ** argv) {
     const double dec_ms = now_ms() - td0;
     const Ds41MoeStats st = tier.stats();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
-                 "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms\n",
+                 "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used\n",
                  gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), (long long) st.hits,
                  (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
-                 100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms);
+                 100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
+                 (long long) st.spec_issued, (long long) st.spec_hits);
+    if (dump_main) std::fclose(dump_main);
+    if (file_pred) {
+        std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
+        for (int k = 1; k <= kFP; ++k)
+            std::fprintf(stderr, " | k=%d: %lld scored, in top4 %.1f%% top8 %.1f%% top16 %.1f%%", k, fp_miss[k],
+                         100.0 * fp_hit[k][0] / std::max(1LL, fp_miss[k]), 100.0 * fp_hit[k][1] / std::max(1LL, fp_miss[k]),
+                         100.0 * fp_hit[k][2] / std::max(1LL, fp_miss[k]));
+        std::fprintf(stderr, "\nfile-pred candidates (file-tier experts in the top 4/8/16, all layers):");
+        for (int k = 1; k <= kFP; ++k)
+            std::fprintf(stderr, " k=%d %lld/%lld/%lld", k, fp_cand[k][0], fp_cand[k][1], fp_cand[k][2]);
+        std::fprintf(stderr, "\n");
+    }
     tier.close();
     return 0;
 }

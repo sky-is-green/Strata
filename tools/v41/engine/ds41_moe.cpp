@@ -21,6 +21,8 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <array>
 #include <thread>
@@ -129,9 +131,108 @@ struct Arena {
     }
 };
 
+/// Decode speculative file-tier reads (Ds41MoeTier::spec_read): the experts the dense half predicts for a layer a few
+/// layers ahead that live only on NVMe are read (O_DIRECT, read_part split) into pinned slots by a persistent reader
+/// pool while the layers in between compute; gpu_run's file-miss path takes a matching slot instead of reading (waiting
+/// for it if the read is still running).  The SSD is otherwise idle in decode, so a wrong guess costs only bandwidth.
+/// A slot is tagged with the gpu_run call (`seq`) that will run its layer; it is reusable once that call has passed
+/// (its DMA is behind that call's layer sync) and its read is done.
+struct SpecStash {
+    static constexpr int kSlots = 24, kParts = 4, kThreads = 4;   // 8 readers preempted the decode thread
+    struct Slot { int64_t layer = -1, seq = -1; int32_t e = -1; int left = 0; };
+    Ds41BlobSource* src = nullptr;
+    int64_t stride = 0;
+    uint8_t* buf = nullptr;   // kSlots * stride, pinned
+    Slot slot[kSlots];
+    int next = 0;
+    std::mutex mu;
+    std::condition_variable cv_job, cv_done;
+    std::deque<std::pair<int, int>> q;   // (slot, part)
+    std::vector<std::thread> th;
+    bool stop = false;
+
+    bool open(Ds41BlobSource* s, int64_t b) {
+        src = s;
+        stride = b;
+        if (cudaMallocHost((void**) &buf, (size_t) kSlots * (size_t) stride) != cudaSuccess) {
+            (void) cudaGetLastError();
+            buf = nullptr;
+            return false;
+        }
+        for (int i = 0; i < kThreads; ++i)
+            th.emplace_back([this]() {
+                for (;;) {
+                    int si, part;
+                    int64_t layer;
+                    int32_t e;
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv_job.wait(lk, [&] { return stop || !q.empty(); });
+                        if (stop && q.empty()) return;
+                        si = q.front().first;
+                        part = q.front().second;
+                        q.pop_front();
+                        layer = slot[si].layer;
+                        e = slot[si].e;
+                    }
+                    src->read_part(layer, e, part, kParts, buf + (size_t) si * (size_t) stride);
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        if (--slot[si].left == 0) cv_done.notify_all();
+                    }
+                }
+            });
+        return true;
+    }
+    /// Queue a read of (layer, e) for gpu_run call `seq`; false when no slot is free (or it is already stashed).
+    bool issue(int64_t layer, int32_t e, int64_t seq, int64_t now_seq) {
+        std::lock_guard<std::mutex> lk(mu);
+        for (const Slot& x : slot)
+            if (x.layer == layer && x.e == e && x.seq == seq) return false;
+        for (int t = 0; t < kSlots; ++t) {
+            const int si = (next + t) % kSlots;
+            Slot& x = slot[si];
+            if (x.left != 0 || x.seq > now_seq) continue;   // reading, or waiting for its layer
+            x.layer = layer;
+            x.e = e;
+            x.seq = seq;
+            x.left = kParts;
+            for (int p = 0; p < kParts; ++p) {
+                q.emplace_back(si, p);
+                cv_job.notify_one();   // one reader per part (notify_all woke every reader for each part)
+            }
+            next = (si + 1) % kSlots;
+            return true;
+        }
+        return false;
+    }
+    /// The stashed bytes of (layer, e) for call `seq` (waits for a running read), or null.
+    const uint8_t* take(int64_t layer, int32_t e, int64_t seq) {
+        std::unique_lock<std::mutex> lk(mu);
+        for (int si = 0; si < kSlots; ++si) {
+            Slot& x = slot[si];
+            if (x.layer != layer || x.e != e || x.seq != seq) continue;
+            cv_done.wait(lk, [&] { return x.left == 0; });
+            return buf + (size_t) si * (size_t) stride;
+        }
+        return nullptr;
+    }
+    ~SpecStash() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+            q.clear();
+        }
+        cv_job.notify_all();
+        for (auto& t : th) t.join();
+        if (buf) cudaFreeHost(buf);
+    }
+};
+
 /// All the device state, so the CPU-only flavour has none of it to leak.
 struct Gpu {
     Arena arena;
+    std::unique_ptr<SpecStash> spec;   ///< spec_read's stash (opened on first use)
     std::unique_ptr<strata::core::ExpertCache> cache;
     strata::kernels::NativeExpertLayout gl;
     std::vector<strata::kernels::NativeExpertLayout> gll;   ///< per model layer (all == gl for a uniform geometry)
@@ -226,6 +327,7 @@ struct Gpu {
         }
         if (s_cp) cudaStreamDestroy(s_cp);
         free_mmq();
+        spec.reset();
         cache.reset();
         arena.close();
         *this = Gpu();
@@ -330,6 +432,8 @@ struct Ds41MoeImpl {
     std::unique_ptr<Gpu> gpu;         ///< null in a CPU-only tier
     std::vector<int64_t> last_use;    ///< arena_adapt: (layer, expert) -> the run() call that last used it
     int64_t tick = 0;
+    int64_t run_seq = 0;              ///< gpu_run calls (spec_read tags its slots with the call that will use them)
+    int64_t run_layer = -1;           ///< the layer of the last gpu_run call
     std::vector<int64_t> vlast;       ///< vram_lru: (layer, expert) -> the run() call that last used its VRAM copy
     std::vector<int64_t> vmiss;       ///< vram_lru: (layer, expert) -> the layer's call count at its last miss
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
@@ -1438,6 +1542,27 @@ void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
     }
 }
 
+void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n) {
+#if defined(DS4_MOE_CUDA)
+    Ds41MoeImpl& im = *im_;
+    if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || im.cfg.arena_adapt || !ids || n <= 0) return;
+    if (layer <= im.run_layer || layer >= im.g.n_layers || !im.g.routed(layer)) return;
+    Gpu& gp = *im.gpu;
+    if (!gp.spec) {
+        gp.spec = std::make_unique<SpecStash>();
+        if (!gp.spec->open(im.blobs, im.blob)) { gp.spec.reset(); return; }
+    }
+    const int64_t seq = im.run_seq + (layer - im.run_layer);   // decode: one gpu_run per layer
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= im.g.n_experts || resident(layer, e) || in_arena(layer, e)) continue;
+        if (gp.spec->issue(layer, e, seq, im.run_seq)) ++im.st.spec_issued;
+    }
+#else
+    (void) layer; (void) ids; (void) n;
+#endif
+}
+
 void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
@@ -1613,6 +1738,8 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     const int64_t B = im.blob;                        // staging STRIDE (the largest blob)
     auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;   // uniform (DS4) too: every slot fits any blob
+    ++im.run_seq;
+    im.run_layer = layer;
     if (lru && !im.cfg.arena_adapt) ++im.tick;   // (arena_adapt bumps it below)
     if (im.cfg.arena_adapt) {   // every lookup of this layer is a use (the LRU the arena swaps below evict by)
         const int64_t NX = im.g.n_experts;
@@ -1917,18 +2044,25 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     std::vector<std::thread> frd;
     std::atomic<size_t> fnx{0};
     double tfg = 0;
+    const uint8_t* fsrc[kMaxParts] = {};   // where each file-tier miss's bytes are: a spec_read slot or h_fstage
+    int fread_b[kMaxParts], nfr = 0;       // the ones read now
     if (nfg > 0) {
         if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
         tfg = now_ms();
-        const int parts = std::max(1, std::min(8, 8 / nfg));
-        const size_t tasks = (size_t) nfg * (size_t) parts;
+        for (int b = 0; b < nfg; ++b) {
+            fsrc[b] = gp.spec ? gp.spec->take(layer, ids6[fg_k[b]], im.run_seq) : nullptr;
+            if (fsrc[b]) ++im.st.spec_hits;
+            else { fsrc[b] = gp.h_fstage + (size_t) b * (size_t) B; fread_b[nfr++] = b; }
+        }
+        const int parts = nfr > 0 ? std::max(1, std::min(8, 8 / nfr)) : 1;
+        const size_t tasks = (size_t) nfr * (size_t) parts;
         const int nth = (int) std::min<size_t>(8, tasks);
         for (int q = 0; q < nth; ++q)
             frd.emplace_back([&, parts, tasks]() {
                 for (size_t r; (r = fnx.fetch_add(1)) < tasks;) {
-                    const size_t b = r / (size_t) parts;
+                    const int b = fread_b[r / (size_t) parts];
                     im.blobs->read_part(layer, ids6[fg_k[b]], (int) (r % (size_t) parts), parts,
-                                        gp.h_fstage + b * (size_t) B);
+                                        gp.h_fstage + (size_t) b * (size_t) B);
                 }
             });
     }
@@ -2065,7 +2199,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         std::vector<int32_t> start((size_t) nfg + 1), dst((size_t) nfg, 0), tok((size_t) nfg, 0);
         for (int j = 0; j < nfg; ++j) {
             uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (np + j) * (size_t) B;
-            ck(cudaMemcpyAsync(to, gp.h_fstage + (size_t) j * (size_t) B, (size_t) BLX(ids6[fg_k[j]]), cudaMemcpyHostToDevice,
+            ck(cudaMemcpyAsync(to, fsrc[j], (size_t) BLX(ids6[fg_k[j]]), cudaMemcpyHostToDevice,
                                gp.s), "file dma");
             ptr[(size_t) j] = (unsigned long long) to;
             start[(size_t) j] = j;
@@ -2156,7 +2290,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             if (cpu_k[k]) continue;
             const uint8_t* p = gp.arena.ptr(layer, ids6[k]);
             for (int j = 0; j < nfg && !p; ++j)   // a file-tier miss run on the card: its staged bytes
-                if (fg_k[j] == k) p = gp.h_fstage + (size_t) j * (size_t) B;
+                if (fg_k[j] == k) p = fsrc[j];
             if (!p) continue;
             ds41_moe_cpu_expert(im.fl[(size_t) im.g.cls(layer, ids6[k])], H, im.g.n_ff, p, gp.h_x, ref.data(), *im.pool);
             double num = 0, den = 0;
