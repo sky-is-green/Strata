@@ -24,7 +24,11 @@ Done since MORNING (all pushed, HEAD = 76d69d95 + this doc):
   shards incl. 1 (vision) and 44-46 (MTP).  Engram runtime tables: L1 on SSD NVME/AI/V41-Engram, L14 on
   Crucial1TB/V41-Engram (extracted, fast); shards 47/48 on NVME1TB are only the source.
 
-RUNNING at hand-off (background): **arena size test** ~/AI/v41-dev/arena/run.sh -> results.txt (one line per run:
+**ARENA RESULT (done ~08:20): keep --arena-gib 60.**  p256 x 256 decode: arena 60 = 25.21 / 24.41 tok/s (75 GB peak
+system RAM), 62 = 24.49 (77 GB), 65 = 24.70 (80 GB); NVMe reads 701/619 -> 620 -> 584 (-10%) but tok/s within noise
+(the file penalty already keeps decode off the file tier).  Implication for Mal's 128 GB idea: the speed slope is flat
+here; the realistic payoff is lowering the file penalty (quality) at similar speed - measure that before buying.
+(Original note:) **arena size test** ~/AI/v41-dev/arena/run.sh -> results.txt (one line per run:
 tier line, decode tok/s + file reads, peak system RAM GB) for --arena-gib 60, 62, 65, 60 (p256 x 256 one-shot).  Mal:
 total RAM ~77 or ~80 GB is OK only if measurably better (wants ~10 GB left for the desktop/Firefox; pinned memory
 cannot be reclaimed).  If 62/65 help clearly: set "--arena-gib" in tools/v41/serve/strata-ds41.json (engine default 60)
