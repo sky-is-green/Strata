@@ -2314,6 +2314,9 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             });
     };
     if (nF) {
+        // the bounce slots are shared by every class pass: the previous pass returned (non-last passes do not
+        // sync) with its DMAs out of them possibly still queued on s_cp - the readers must not overwrite them yet
+        ck(cudaStreamSynchronize(gp.s_cp), "bounce free");
         t_rd0 = now_ms();
         start_wave();
     }

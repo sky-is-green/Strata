@@ -71,6 +71,7 @@ double rel(const std::vector<float> & a, const std::vector<float> & b) {
 int main(int argc, char ** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu]\n"); return 2; }
     std::string path = argv[1];
+    int nchunk = 0;   // --chunk N: also N tokens at once through run_chunk (the prompt path), each row vs the reference
     std::vector<int> layers = { 0 };
     int ntok = 8;
     bool gpu = false;
@@ -83,6 +84,7 @@ int main(int argc, char ** argv) {
             while (std::getline(ss, x, ',')) layers.push_back(std::atoi(x.c_str()));
         } else if (a == "--tokens" && i + 1 < argc) ntok = std::atoi(argv[++i]);
         else if (a == "--gpu") gpu = true;
+        else if (a == "--chunk" && i + 1 < argc) nchunk = std::atoi(argv[++i]);
     }
     Ds41FileBlobs src(path);
     std::string err;
@@ -149,6 +151,49 @@ int main(int argc, char ** argv) {
             for (int64_t k = 0; k < K; ++k) std::printf(" %d", g.cls(l, ids[(size_t) k]));
             std::printf("  rel %.3e\n", r);
         }
+    }
+    // ---- prompt path: N tokens per layer through run_chunk (random picks over all experts: every class, mixed)
+    for (int l : (nchunk > 0 ? layers : std::vector<int>{})) {
+        std::vector<float> X((size_t) nchunk * D), W((size_t) nchunk * K), OUT((size_t) nchunk * D);
+        std::vector<int32_t> IDS((size_t) nchunk * K);
+        for (auto & v : X) v = nd(rng) * 0.3f;
+        for (int t = 0; t < nchunk; ++t)
+            for (int64_t k = 0; k < K; ++k) {
+                int32_t e;
+                do { e = (int32_t) (rng() % (uint64_t) g.n_experts); }
+                while (std::find(IDS.begin() + (size_t) t * K, IDS.begin() + (size_t) t * K + k, e) != IDS.begin() + (size_t) t * K + k);
+                IDS[(size_t) t * K + k] = e;
+                W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
+            }
+        if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+        int cf = 0, nan_rows = 0;
+        double cw = 0;
+        for (int t = 0; t < nchunk; ++t) {
+            std::vector<float> got(OUT.begin() + (size_t) t * D, OUT.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
+            bool fin = true;
+            for (float v : got) fin &= std::isfinite(v);
+            nan_rows += !fin;
+            for (int64_t k = 0; k < K; ++k) {
+                const int32_t e = IDS[(size_t) t * K + k];
+                src.read(l, e, blob.data());
+                ref_expert(g, g.cls(l, e), blob.data(), X.data() + (size_t) t * D, one.data());
+                for (int64_t i = 0; i < D; ++i) want[(size_t) i] += W[(size_t) t * K + k] * one[(size_t) i];
+            }
+            const double r = fin ? rel(got, want) : 1e9;
+            if (!(r < 3e-2)) {
+                std::printf("  row %d rel %.3e:", t, r);
+                for (int64_t k = 0; k < K; ++k) {
+                    const int32_t e = IDS[(size_t) t * K + k];
+                    std::printf(" e%d/c%d", e, g.cls(l, e));
+                }
+                std::printf("\n");
+            }
+            cw = std::max(cw, r);
+            cf += !(r < 3e-2);
+        }
+        worst = std::max(worst, cw);
+        fails += cf;
+        std::printf("%s L%d chunk %d tokens: %d rows off, %d non-finite, worst rel %.3e\n", cf ? "FAIL" : "ok  ", l, nchunk, cf, nan_rows, cw);
     }
     const Ds41MoeStats st = tier.stats();
     std::printf("stats: %lld hit, %lld cpu, %lld pcie, %lld file; worst rel %.3e -> %s\n", (long long) st.hits, (long long) st.cpu,
