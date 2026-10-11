@@ -1,7 +1,46 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-11 ~13:10 by `strata-ds4-gpu` (Claude, conductor session `636553.13852289`).
-**READ §HANDOFF 2026-10-11 13:10 (ENGINE SPEED) FIRST** - it supersedes the 07:20 handoff below where they differ.
+**READ §HANDOFF 2026-10-11 EVENING FIRST, then 13:10 (ENGINE SPEED)** - it supersedes the 07:20 handoff below where they differ.
+
+## HANDOFF 2026-10-11 EVENING (inline conductor, workers stopped) - prefill 176/203 tok/s, decode 15.9 (18.8 with file penalty)
+
+Repo renamed: GitHub **Indras-Mirror/Strata-DSV4.1** (local remote `ds4`; push `git push ds4 deepseek4:main`, Mal OK'd).
+README is V4.1-first. All commits below are on deepseek4 and pushed (52030f58+).
+
+### Prefill (8192-token code prompt, default flags, every step byte-identical last-row logits md5 4d229102872a)
+54 (chunk 2048) -> 102.6 layer-major (474f4ac1) -> 105.9 file-tier prefetch (3122a4c6) -> 133-140 enc-skip (72078b60;
+now DEFAULT for one-shot, 598c4937) -> 142.9 one run_chunk piece per layer (3 GB budget, STRATA_CHUNK_BUDGET_GB) ->
+149.1 layer prestage (992580ef: next layer's arena experts -> 3 GiB device region during its dense half,
+STRATA_PRESTAGE_GIB) -> 153.9 routed sums via run_chunk_dev + pinned host_fn (8a790ec1) -> **176.3** Engram async
+(3bd85015). 16K prompt: 203 tok/s (B=8192; B=16384 same speed, needs --prefill-chunk 256 to fit).
+Determinism: 8bd712bf (indexer top-k ids sorted) - GPU prompt path byte-identical run to run; S (dense sub-batch) changes
+the attention summation order (different but valid md5), B does not.
+Split now (8192): dense ~19 s, experts ~27 s. nsys (4096): pinned expert H2D median 13 GB/s (p90 23.5), copy engine busy
+only ~40% of the expert phase; pageable per-prompt H2D ~1.2 s/4K (the constant-size pageable copies are the one-time
+dense weight load). Expert kernels ~10 s GPU time per 4096 tokens (chunk prof undercounts them).
+STRATA_PROM=1: +6% speed but ppl 2.3799 -> 2.3946 (+0.6%, deterministic) -> stays OFF.
+Ideas not done: prestage file-tier experts too (slab -> device) when VRAM allows; pinned/async for remaining pageable
+uploads; dense half profile (19 s / 8192).
+
+### Decode (256-tok prompt p256.i32, 128 tokens, --pf-b 1.43 --pcie 0.75 --route-bias 1.0)
+13.2 at start of evening (regression found: Engram decode reads 11 ms/token: reader kept <= 2*nthreads groups on the
+caller -> serial with 32 threads; Engram table on exFAT NVME1TB = ~13K random reads/s vs ~290K/s on ntfs3 SSD NVME)
+-> b126e279 parallel small batches + 2M-row raw cache (STRATA_ENGRAM_CACHE_ROWS) -> **15.9**, logits identical.
+16b05583 r1 CPU-pool batch merged (bitwise, CPU expert ms 2.7 s -> 0.84 s per 128 tok).
+bee81052 `--route-bias-file X`: selection-only penalty on file-tier experts: 0.3 -> 16.47, **0.6 -> 18.81 tok/s**.
+QUALITY RUN in flight at hand-off time: quality_rb (decode-mode ppl, code + agentic_long 1024 tok) for base / rb1.0 /
+rb1.0+file0.6 / rb1.0+file1.0 / rb2.0 / prune65 -> logs /home/mal/AI/v41-dev/qual-HHMM.  Pick the default from it
+(Mal: soft only, report ppl cost).
+Dead end: --route-bias-arena (bonus for RAM-arena experts) made decode slower (pulls selection off VRAM) - removed.
+Next decode levers: Engram table to a fast FS (~200 GB needed; ask Mal - would take Engram 4.8 ms -> <1 ms/token);
+file-tier predicted prefetch (E3) for the remaining ~8 ms/token of file waits; dense half ~28 ms/token vs ~15 on the
+V4-0731 engine (nsys the decode dense half: per-layer syncs, small kernels); MTP drafting.
+
+### Process
+Workers (lm-prefill, engram-io, xk-kernels, pf-prefetch, enc-skip, gpu-determinism, pcie-h2d, engram-wire, h2d-2) are
+all done/killed; their branches stay local (v41-*). Mal asked the conductor to do the work inline (2026-10-11 ~16:40).
+GPU runs: always `STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 --`; env vars must go INSIDE (`-- env X=1 cmd`).
 
 ## HANDOFF 2026-10-11 13:10 (ENGINE SPEED) - GPU engine works; decode 3.4 -> 15.5 tok/s; prefill work in flight
 
