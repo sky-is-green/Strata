@@ -362,6 +362,9 @@ int main(int argc, char ** argv) {
     // ---- the forward pieces
     std::vector<int> ids1((size_t) top_k);
     std::vector<float> w1((size_t) top_k), routed1((size_t) n_embd), logits1((size_t) nv);
+    // --serve's short-turn passes (STRATA_SERVE_PASS_M tokens per dense pass; 1 = single decode steps)
+    const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 8);
+    std::vector<float> crouted_m((size_t) pass_max * n_embd);
     std::string ferr;
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
     static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
@@ -417,6 +420,30 @@ int main(int argc, char ** argv) {
         if (dprof && ++dp_n % 64 == 0)
             std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f (%ld steps)\n",
                          dp[0] / dp_n, dp[1] / dp_n, dp[2] / dp_n, dp[3] / dp_n, dp[4] / dp_n, dp_n);
+        return true;
+    };
+    // a few tokens in ONE dense pass (the dense weights - ~8 GB - read once for m tokens, not per token), the routed
+    // experts token by token from the VRAM cache (run_to_dev into the pass's routed rows): --serve's short turns.
+    // Row-batched matmuls: the same model, not the same bits as m single steps.
+    std::vector<int> mids;
+    std::vector<float> mw;
+    auto pass_m = [&](const int * toks, int m, int pos) -> bool {
+        mids.resize((size_t) m * top_k);
+        mw.resize((size_t) m * top_k);
+        if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
+        for (int l = 0; l < n_layer; ++l) {
+            const float * fn = nullptr;
+            if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            for (int t = 0; t < m; ++t) {
+                const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                        fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
+                                      : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                 fn + (size_t) t * n_embd, routed1.data());
+                if (!ok) { ferr = "tier.run failed"; return false; }
+                if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+            }
+            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+        }
         return true;
     };
     const int NP = std::max(1, a.prefill_chunk);
@@ -621,8 +648,11 @@ int main(int argc, char ** argv) {
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         int n_req = 0;
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
-        // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs as decode steps (0 = always layer-major)
-        const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 384;
+        // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs on the decode side - passes of
+        // STRATA_SERVE_PASS_M tokens with the VRAM cache and the decode biases (~40 tok/s) - instead of the exact
+        // layer-major batch (~16.8 s + n / 250 tok/s; measured crossover ~765 tokens); 0 = always the batch (every prompt
+        // token exact)
+        const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
         std::printf("READY %d stop\n", ctxv);
@@ -676,8 +706,8 @@ int main(int argc, char ** argv) {
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
             // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
-            // result) runs as decode steps instead, with the cache and the decode biases: the layer-major path streams
-            // nearly every expert of every layer whatever the batch size (~18 s for 40 tokens), a step ~45 ms
+            // result) runs on the decode side instead - small dense passes, the cache and the decode biases: the
+            // layer-major path streams nearly every expert of every layer whatever the batch size (~18 s for 40 tokens)
             const int delta = total - reused;
             const bool by_step = defer_vram && delta >= 1 && delta <= step_max;
             if (by_step && !cache_open) {
@@ -696,12 +726,17 @@ int main(int argc, char ** argv) {
                 std::printf("PP %d %d %.0f %.1f\n", reused + done, total, ms, 1000.0 * done / std::max(ms, 1e-9));
                 std::fflush(stdout);
             };
-            auto feed_steps = [&]() -> bool {   // the short-turn path: one decode step per prompt token
-                for (int i = 0; i < delta; ++i) {
-                    if (!step(ids[(size_t) (reused + i)], reused + i)) return false;
-                    if ((i + 1) % 64 == 0 && i + 1 < delta) pp(i + 1);
+            auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
+                int last_rows = 1;
+                for (int i = 0; i < delta; ) {
+                    const int m = std::min(pass_max, delta - i);
+                    if (!(m == 1 ? step(ids[(size_t) (reused + i)], reused + i) : pass_m(ids.data() + reused + i, m, reused + i))) return false;
+                    const int before = i;
+                    i += m;
+                    last_rows = m;
+                    if (i / 64 != before / 64 && i < delta) pp(i);
                 }
-                if (!dense.logits(0, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
                 pp(delta);
                 return true;
             };
