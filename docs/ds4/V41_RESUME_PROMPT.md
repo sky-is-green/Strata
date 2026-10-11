@@ -1,5 +1,123 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
+**Last updated:** 2026-10-11 ~13:10 by `strata-ds4-gpu` (Claude, conductor session `636553.13852289`).
+**READ §HANDOFF 2026-10-11 13:10 (ENGINE SPEED) FIRST** - it supersedes the 07:20 handoff below where they differ.
+
+## HANDOFF 2026-10-11 13:10 (ENGINE SPEED) - GPU engine works; decode 3.4 -> 15.5 tok/s; prefill work in flight
+
+### 0. One-paragraph state
+The GSQ file is DONE (`/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf`, 152 GiB, 40 layers; head gate eval ppl 5.645 vs teacher
+4.915 = +14.9%, top-1 0.674 vs 0.701; agent 2.118 vs 2.121, reason 6.19 vs 5.83, zh 7.64 vs 6.83, code 1.98 vs 1.74, agentic_long
+12.78 vs 9.79). The engine (tools/v41/engine) now runs correctly on the 4090: 2048-token code ppl 2.51 / top-1 0.816 (GPU),
+GPU-experts vs CPU-experts logits cos 0.996 mean, 62/64 top-1 equal. Decode went 3.4 -> **15.5 tok/s steady (128 tokens)** with
+`--route-bias 1.0` (selection-only bonus for VRAM-resident experts; nothing pruned) and 16.7 tok/s (64 tok) with soft prune 65%
+pen 1.0 + route-bias 0.5. Prefill is **~27 tok/s at chunk 512, 54.5 tok/s at chunk 2048** and is the current focus (Mal: target
+300-400 tok/s prefill, then decode 20+). Mal is conducting via /conductor with flash workers; keep at most 2-3 workers alive at
+once (Mal, 13:05). Nothing pushed.
+
+### 1. Commits this session (branch deepseek4, all local)
+- `baa59315` v41_quant 4x faster GSQ pass (CUDA-graph GPTQ `v41_gptq_graph.py` + threaded encode), bit-identical (L17 re-run
+  vs GGUF: 1152 matrices identical, h/L18 identical; `compare_layer_bytes.py`).
+- `02ef47de` v41_calib --gc also deletes shared/L(L-1).pt (3 GB/layer from L21 filled Crucial1TB);
+  `92d9dfdb` chain retries immediately (5 s, not 2 min / 10 min - Mal).
+- `2ff530bb` **ds41_moe chunk path race fix** (the NaN): non-last class passes returned without syncing s_cp, the next pass's
+  reader threads overwrote pinned bounce slots still being DMA'd -> garbage/NaN prompt rows whenever >1 class pass AND
+  file-tier experts. `test_ds41_moe --chunk N` added (run_chunk rows vs reference; FAIL before, PASS after).
+- `8e21392a` deferred VRAM cache (one-shot: arena at load, prompt runs, `Ds41Dense::release_pass` + release_chunk, then the VRAM
+  cache is sized from measured free memory and seeded: 892 -> 1563 experts at margin 1 GiB); `Ds41Dense::set_route_bias`
+  (per-layer F32 rbias added to the top-k SELECTION score only; weights from unbiased scores; zero = model routing);
+  `ds41_generate --prune F --prune-penalty X --route-bias X`; `v41_prune_list.py RANK FRAC OUT`.
+- `c3a8c9fe` ds41_generate prints "prompt split: dense / experts (file wait) / logits".
+- Uncommitted elsewhere: none in the main tree (bench/ probe dirs untracked as before).
+
+### 2. Measurements (all on this box; logs under /home/mal/AI/v41-dev/)
+Load: 49 s with `STRATA_NO_LARGEPAGES=1` (4 KiB pages pin at 1.18 GB/s vs THP madvise 0.16 GB/s; was 211 s). ALWAYS set it.
+Decode (256-tok code prompt, 64 decoded, `--pf-b 1.43`, arena 60, vram-lru, margin 1; sweep logs sweep*-HHMM):
+| config | tok/s | VRAM hits | prompt ppl* |
+|---|---|---|---|
+| base | 3.38 | 48% | 3.49 |
+| threads 16 | 2.16 (worse: SMT) | | |
+| pf-b 1.43 | 3.59 | 60% | |
+| + pcie 0.75 | 3.81 | 61% | |
+| prune 55% pen 0.5 | 8.54 | 74% | 3.48 |
+| prune 55% hard (mask) | 11.43 | | 4.11 (+18%: REJECTED, Mal wants soft only) |
+| prune 65% pen 1.0 | 9.84 | 73% | 3.62 |
+| p65 pen1.0 + route-bias 0.5 | **16.67** | 95% | 3.60 |
+| route-bias 1.0 only (no prune) | 14.72 (64 tok), **15.50 (128 tok, steady)** | 96% | 3.50 |
+| p65 pen1.0 + rb 1.0 | 14.37 | 98% | |
+*IMPORTANT: the "prompt ppl" column is computed on the PROMPT, where route bias is NOT active (it is applied after the deferred
+VRAM seed) - so it measures only the prune penalty. The true decode-mode quality of route-bias needs `--prefill-chunk 1 --ppl`
+(token-by-token, bias active). That check (`/home/mal/AI/v41-dev/quality_rb.sh`) was started and STOPPED after one result
+(base code 1024 tok: ppl 3.4026 top-1 0.748, 2.7 tok/s) to give the GPU to prefill. RE-RUN IT (~25 min) before choosing a default.
+Decode tier profile at rb 1.0 (128 tok): 0.73 ms/layer call (cpu pool 0.52 incl. file waits, layer sync 0.10); ~29 ms/token tier,
+~35 ms dense; file waits ~14 ms/token.
+R1 (one CPU-pool batch per layer, branch `v41-r1-pool-batch` @ `5253ec22`, worktree ~/AI/Strata-DS4-r1): bitwise identical
+(DS41_CHECK_POOL_BATCH=1: 0 mismatches; test_ds41_moe_gpu --chunk 64 PASS), CPU expert ms halved (1925 -> 892) but decode
+15.36 vs 15.50 (neutral: it drops the arena-vs-file-read overlap and file waits dominate at 96% hits). PARKED, not merged;
+re-test after file-tier prefetch hides the SSD waits.
+Prefill (4096-token code prompt, no decode; logs pf-1217): chunk 512 = 27.0 tok/s (8 chunks x 19 s), 1024 = 40.3, 2048 = 54.5,
+2048+chunk-mmq = 43.8 (MMQ slower). Split at 2048 (MIMO_CHUNK_PROF=1): 85 s = dense 25.1 s + experts 59.2 s of which **file-tier
+SSD wait 52.9 s (137.5 GB at 2.58 GB/s)**; GPU grouped expert kernels 0.26 s. 1024 tok chunk 1024: dense 5.5 s WITH --engram,
+**1.4 s without** -> Engram row reads ~4.1 s (~12K reads/s; 49K reads). nsys (nsys-pf/pf1k.nsys-rep, arena 8): expert kernels
+native_gu<143> 1.09 s, native_gu<11> 0.61 s, native_down<143> 0.38 s, <11> 0.23 s, Q2_0 multi 0.36 s => ~2.3 s per 1024 tokens
+(decode-style row kernels on 1024-row groups; caps prefill ~450 tok/s later); cudaMemcpyAsync 5.1 s/16K calls (pageable small
+uploads block), cudaMallocHost 3.4 s per prompt (pinned bounce halves re-allocated every prompt).
+SSD: nvme0 "SSD NVME" does 4.25-4.5 GB/s with 8-16 parallel 2.6 MiB preads, 1.4 GB/s single-thread, 1.67 GB/s sequential 16 MiB.
+
+### 3. Workers (conductor session 636553.13852289; relay inbox `conductor-636553.13852289`; packets/reports in ~/.quetza-data/conductor)
+IN FLIGHT at 13:10 (adopt; re-arm `qc-await <slice>` each as its own background Bash):
+- `lm-prefill` (flash, ~32 min in): layer-major prompt batches (`--prompt-batch B`, default 4096-8192; experts over the whole batch,
+  dense in sub-batches of `--prefill-chunk`); worktree ~/AI/Strata-DS4-lm branch `v41-lm-prefill` (dense/generate modified,
+  build-lm configured). Packet `packets/lm-prefill-task.md`. It relays "GPU?" before GPU runs - answer "go" only when the GPU is free.
+  Told (relay): file reads dominate, size the batch from free VRAM (~8 GB idle during prefill).
+- `engram-io` (flash, ~6 min in): fast batched/deduped/high-QD + async Engram reads, module-only (ds41_engram + a bench tool);
+  worktree ~/AI/Strata-DS4-eng branch `v41-engram-io`. Packet `packets/engram-io-task.md`. CPU+disk only.
+DONE (reports read, verified): `moe-offload-survey`, `ds4-src` (antirez ds4 + Chida82 fork: see reports - top items decayed
+route-hotness eviction, prefill next-layer prefetch, file-tier prefetch from the GPU predictor, fewer readback syncs),
+`glm-vs-ds41` (per-class pool/launch overhead + residency explain GLM 25 vs us; recs R1-R5), `r1-pool-batch` (parked, above).
+`ds4-study` was a broken-packet run (ignore its report).
+QUEUED (packets written, NOT dispatched - dispatch one at a time as slots free; max 2-3 alive):
+- `enc-skip` (packets/enc-skip-task.md): exact encoder-only prefill - decoder layers 20-39 only on the last 2560 prompt tokens
+  (proof in the packet: kv_source 20 / index-key ownership; index sources 24-36 only make queries; decoder layers interact only
+  through the 128 window). Roughly halves dense + SSD reads for long prompts. Must compose with lm-prefill (small standalone
+  dense methods). Best dispatched AFTER lm-prefill lands (same files).
+- `pf-prefetch` (packets/pf-prefetch-task.md): prompt path reads layer l+1's file-tier experts while layer l computes (ds4 recipe)
+  + keep pinned prompt buffers across prompts. ds41_moe run_chunk only - can run beside lm-prefill.
+- `xk-kernels` (packets/xk-kernels-task.md): prompt-batch CUDA kernels for PTQ1_0/Q2_0 (and why Q3_K MMQ was slower).
+Dispatch with: `qc-dispatch <slice> --model flash --prompt "Read the full task packet at ~/.quetza-data/conductor/packets/<slice>-task.md and follow it exactly (...report/done/relay...)."`
+then `qc-await <slice>` in background. **FOOTGUN: `qc-dispatch --prompt` OVERWRITES packets/<slice>.md with the prompt text** -
+keep packet bodies in `packets/<slice>-task.md` (a different name) as done here. Workers from this session show
+"(prev: 636553.13852289)" in qc-status; `qc-status --close-done` skips them -> use `--close-done --all-sessions` (closes only DONE).
+qc-await FROZEN-TOKENS fires during long builds - check `tmux capture-pane -pt qc-<slice>` before acting; re-arm.
+
+### 4. Next steps (in order)
+1. Land lm-prefill: verify diff, run its GPU gate (old chunk path vs --prompt-batch: last-row logits cos >= 0.9999, all-row top-1),
+   then measure 4096/8192-token prompts at batch 4096/8192 with the prompt split. Expected: file reads once per batch -> ~150-400 tok/s.
+2. Land engram-io, then wire its async API into Ds41Dense::begin (start at begin, wait at layers 1/14) - dense 5.5 -> ~1.4 s/1K tok.
+3. Dispatch pf-prefetch (beside lm-prefill), then enc-skip (after lm-prefill), then xk-kernels.
+4. Re-run quality_rb.sh (decode-mode ppl for route bias 1.0 / 2.0 / prune+rb) -> pick the decode default (Mal: soft only, every
+   expert reachable). Then decode work: fewer per-layer syncs (11/layer; GPU-side weighted sum; fuse predict into finish), decayed
+   route-hotness eviction (ds4-src E1), file-tier prefetch from dense.predict (E3), re-test R1.
+5. Serving: `strata-ds41-quetza` wrapper (tools/v41/serve) once prefill/decode settle; the serve path must also get deferred cache /
+   route bias / prompt batches (currently one-shot only: `defer_vram = !serve`).
+
+### 5. Commands
+Bench prompt (4096 code tokens, prompt split): `bash /home/mal/AI/v41-dev/prefill_sweep.sh` (edit configs). Decode sweeps:
+`/home/mal/AI/v41-dev/decode_sweep*.sh` (256-tok prompt + 64 decode, one config per line). Quality (decode-mode, bias active):
+`/home/mal/AI/v41-dev/quality_rb.sh`. Best current decode command:
+`STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_generate -m "/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf" --ids-file F -n 128 --backend cuda --experts gpu --engram "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8:/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8" --prefill-chunk 2048 --arena-gib 60 --vram-lru --vram-margin 1 --rank "/media/mal/SSD NVME/AI/V41-GSQ/rank.bin" --pf-b 1.43 --pcie 0.75 --route-bias 1.0`
+GPU tier test incl. prompt path: `build-ds4-gpu/test_ds41_moe_gpu GGUF --layers 0,20,39 --tokens 2 --gpu --chunk 64`.
+
+### 6. Drives / housekeeping done today
+Both Engram shards on NVME1TB (verified). Crucial1TB + Team CX2 now kernel ntfs3 (fstab, backup /etc/fstab.bak-ntfs3-20261011-104202);
+Crucible stays ntfs-3g (volume dirty; ntfs3 refused rw; options: leave / ntfsfix -d / Windows chkdsk). Temporary sudo rule
+/etc/sudoers.d/zz-claude-ntfs3 + /usr/local/sbin/ntfs3-remount: Mal to remove (`sudo rm` both) if not already.
+v41-calib/h + shared (89 GB) deleted (not needed for any re-quant: stats/route/tokens/alloc maps kept). syv-qwen + vLLM wrappers deleted.
+maptism-hub.service was stopped for the remount and restarted.
+Rules learned: never `pkill -f` a pattern matching your own command line (killed my shell again today - use PIDs);
+unquoted heredocs execute backticks in packet text (use <<'EOF').
+
+
 **Last updated:** 2026-10-11 ~07:20 by `strata-ds4-gpu` (Claude).  **READ §HANDOFF 2026-10-11 FIRST** - everything
 below it is history (still accurate unless this section says otherwise).
 
