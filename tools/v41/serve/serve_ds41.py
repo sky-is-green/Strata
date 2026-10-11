@@ -248,6 +248,65 @@ F.OutputParser.feed = _op_feed_ds41
 F.OutputParser.finish = _op_finish_ds41
 S.OutputParser = F.OutputParser
 
+# ---- full text log (llama.cpp-style): every request's thinking / answer / tool calls as they are generated, so a run
+# can be watched (`tail -f`) and checked afterwards (loops, what it was thinking).  STRATA_TEXT_LOG=<path> (default
+# /tmp/strata-ds41-text.log), STRATA_TEXT_LOG=0 = off.
+import threading as _th
+import time as _time
+
+_TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", "/tmp/strata-ds41-text.log")
+_text_lock = _th.Lock()
+_text_state = {"kind": None}
+_KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
+
+
+def _text_write(s: str):
+    if not _TEXT_LOG or _TEXT_LOG == "0":
+        return
+    try:
+        with _text_lock, open(_TEXT_LOG, "a", encoding="utf-8") as f:
+            f.write(s)
+    except OSError:
+        pass
+
+
+_svc_note, _svc_run = S.Service._note, S.Service.run
+
+
+def _note_ds41(self, n, evs, st=None, rate=None):
+    out = []
+    for ev in evs:
+        if not ev.text:
+            continue
+        label = _KIND_LABEL.get(ev.kind, ev.kind)
+        if label != _text_state["kind"]:
+            _text_state["kind"] = label
+            out.append(f"\n--- {label} ---\n")
+        out.append(ev.text)
+    if out:
+        _text_write("".join(out))
+    return _svc_note(self, n, evs, st, rate)
+
+
+def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel):
+    t0 = _time.time()
+    _text_state["kind"] = None
+    _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
+                f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
+    end = "(stream closed)"
+    try:
+        for item in _svc_run(self, ids, thinking, tools, max_new, sampling, cancel):
+            if item[0] == "done" and isinstance(item[1], dict):
+                d = item[1]
+                end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"
+            yield item
+    finally:
+        _text_write(f"\n===== end: {end}, {_time.time() - t0:.1f} s =====\n")
+
+
+S.Service._note = _note_ds41
+S.Service.run = _run_ds41
+
 if __name__ == "__main__":
     for i, v in enumerate(sys.argv[:-1]):   # paths are the caller's; the server runs from Strata's directory
         if v in ("--config", "--tokenizer", "--mcp-config"):

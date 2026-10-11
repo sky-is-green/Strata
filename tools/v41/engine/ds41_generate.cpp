@@ -653,6 +653,8 @@ int main(int argc, char ** argv) {
         // layer-major batch (~16.8 s + n / 250 tok/s; measured crossover ~765 tokens); 0 = always the batch (every prompt
         // token exact)
         const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 768;
+        // STRATA_SERVE_PASS_BIAS=0: those passes route exactly (the decode biases only while decoding)
+        const bool pass_bias = !(std::getenv("STRATA_SERVE_PASS_BIAS") && std::getenv("STRATA_SERVE_PASS_BIAS")[0] == '0');
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
         std::printf("READY %d stop\n", ctxv);
@@ -713,7 +715,15 @@ int main(int argc, char ** argv) {
             if (by_step && !cache_open) {
                 if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
                 cache_open = true;
-            } else if (!by_step && defer_vram && cache_open && delta >= 2) {
+            }
+            // exact passes (STRATA_SERVE_PASS_BIAS=0): the decode-side prompt tokens route with the model's own
+            // selection (no route bias / file penalty) - only the batch shape differs from the exact batch path
+            const bool exact_pass = by_step && !pass_bias;
+            if (exact_pass && bias_set) {
+                bias_now = a.bias_prompt > 0;
+                apply_bias();
+            }
+            if (!by_step && defer_vram && cache_open && delta >= 2) {
                 tier.release_cache();
                 cache_open = false;
                 bias_now = a.bias_prompt > 0;
@@ -758,9 +768,13 @@ int main(int argc, char ** argv) {
             }
             ++n_req;
             const double prompt_ms = now_ms() - tp0;
+            if (exact_pass && cache_open) {   // decode: the biases back on, from the VRAM set as it is now
+                bias_now = true;
+                apply_bias();
+            }
             const Ds41MoeStats pst = tier.stats();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
-                                 "%lld pcie / %lld file)\n", total, reused, by_step ? "steps" : "batch", prompt_ms / 1000.0,
+                                 "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
                          (long long) pst.pcie, (long long) pst.file_tier);
             if (defer_vram && !cache_open) {   // decode next: the VRAM cache opens into what the prompt freed
