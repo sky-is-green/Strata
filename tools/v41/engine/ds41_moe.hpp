@@ -142,6 +142,18 @@ public:
         if (part == 0) read(layer, expert, dst);
         (void) nparts;
     }
+    /// The chunk-prefetch reader pool's read: the same bytes as `read`, through the fastest path the source has.  A
+    /// source with a raw file layout overrides this to pread through an `O_DIRECT` twin fd via the aligned `scratch`
+    /// bounce (`read_staged_scratch()` bytes per thread, 4096-aligned).  Measured on the V41-GSQ GGUF: the scattered
+    /// 3 MiB expert pattern runs 2.25 GB/s buffered and 4.65 GB/s through O_DIRECT at 16 threads (buffered copies
+    /// through the page cache; `dd` on the same file: 2.7 GB/s one stream, 5.1 GB/s at 16).  Default: `read`.
+    virtual void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const {
+        (void) scratch;
+        (void) scratch_bytes;
+        read(layer, expert, dst);
+    }
+    /// Bytes one `read_staged` scratch bounce must have.  0 = `read_staged` ignores it.
+    virtual size_t read_staged_scratch() const { return 0; }
 };
 
 /// The production source: the three per-role tensors of a `deepseek4` GGUF, mmap'd in place, so assembling one
@@ -205,6 +217,8 @@ public:
     size_t blob_bytes(int64_t l) const override;
     void read(int64_t layer, int64_t expert, uint8_t* dst) const override;
     void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
+    void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const override;
+    size_t read_staged_scratch() const override { return scratch_; }
     const Ds41MoeGeom& geom() const { return g_; }
     /// bytes of expert e of layer l (its class's blob)
     size_t expert_bytes(int64_t l, int64_t e) const;
@@ -212,8 +226,13 @@ public:
 private:
     struct Span { uint64_t off = 0, bytes = 0; };
     void spans(int64_t l, int64_t e, Span s[3]) const;
+    /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
+    /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
+    bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const;
     std::string path_;
     int fd_ = -1;
+    int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
+    size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
     Ds41MoeGeom g_;
     size_t max_ = 0;
     std::vector<uint64_t> base_;          ///< [layer * 3 * n_types...] see .cpp
@@ -265,6 +284,14 @@ struct Ds41MoeConfig {
     /// Prompt chunks: while layer l's experts compute (and the caller runs layer l+1's dense half), DMA layer l+1's
     /// arena experts into the other device half, which is then sized to a whole layer.  Off with arena_adapt.
     bool chunk_prestage = false;
+    /// Prompt chunks: while layer l computes, a background reader pool fills a pinned host slab with layer l+1's
+    /// FILE-TIER experts (neither VRAM-resident nor in the RAM arena), so run_chunk(l+1) DMAs straight out of the slab
+    /// instead of reading on its own critical path.  Two slabs ping-pong; a layer that fits neither falls back to
+    /// run_chunk's on-demand reader.  `chunk_prefetch_gib` caps the PAIR (0 = auto: the largest routed layer's file
+    /// tier, capped by the host RAM MemAvailable can spare above `mem_floor_gib`).  Measured: the 4096-token prompt's
+    /// 52.9 s file wait is what this moves off the critical path.
+    bool chunk_prefetch = true;
+    double chunk_prefetch_gib = 0.0;
     /// REAP saliency (calibration only): every prompt chunk reads its experts' outputs back and accumulates, per
     /// (layer, expert), sum of routing weight x ||expert output||_2 and the token count (saliency_sum / saliency_count).
     bool saliency = false;

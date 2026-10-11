@@ -61,8 +61,9 @@ struct Args {
     uint64_t seed = 1;
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = false, arena_adapt = false, chunk_mmq = false;
-    bool act_quant = true;
+    bool act_quant = true, chunk_prefetch = true;
     float skip_miss = 0.0f, skip_file = 0.0f;
+    double chunk_prefetch_gib = 0.0;
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -95,6 +96,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--prompt-batch") a.prompt_batch = std::atoi(next().c_str());
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
+        else if (k == "--no-chunk-prefetch") a.chunk_prefetch = false;
+        else if (k == "--chunk-prefetch") a.chunk_prefetch_gib = std::atof(next().c_str());
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
         else if (k == "--skip-file") a.skip_file = (float) std::atof(next().c_str());
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
@@ -224,6 +227,8 @@ int main(int argc, char ** argv) {
     mc.vram_lru = a.vram_lru;
     mc.arena_adapt = a.arena_adapt;
     mc.chunk_mmq = a.chunk_mmq;
+    mc.chunk_prefetch = a.chunk_prefetch;
+    mc.chunk_prefetch_gib = a.chunk_prefetch_gib;
     mc.skip_miss = a.skip_miss;
     mc.skip_file = a.skip_file;
     // soft / hard pruning (the GLM recipe, as tools/ds4/ds4_generate): listed experts take no VRAM slot and no arena space;
