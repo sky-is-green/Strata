@@ -161,6 +161,16 @@ struct Gpu {
     int c_pre_layer = -1, c_pre_half = -1;
     int64_t c_pre_sl = 0;
     std::vector<int32_t> c_pre_e;
+    /// Layer prestage (any geometry, per-expert formats too): while the caller runs layer `p_layer`'s dense half, its
+    /// arena experts (not VRAM-resident) are DMA'd on s_cp into one device region `p_buf` (each at its own offset, its
+    /// class's blob size); run_chunk launches them from there and streams only the rest.  STRATA_PRESTAGE_GIB (default
+    /// 3, 0 = off) caps the region; freed by release_chunk (the deferred VRAM seed wants the memory).
+    void* p_buf = nullptr;
+    size_t p_cap = 0;
+    int p_layer = -1;
+    bool p_off = false, p_used_rec = false;
+    std::vector<unsigned long long> p_ptr;
+    cudaEvent_t p_copied = nullptr, p_used = nullptr;
     void *c_w = nullptr, *c_out = nullptr;   ///< run_chunk: the top-k weights and the summed rows on the card
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
@@ -2252,6 +2262,52 @@ void chunk_prestage(Ds41MoeImpl& im, int64_t layer, int h) {
     gp.c_pre_e = std::move(es);
 }
 
+// Layer prestage: start DMAing `layer`'s arena experts into the prestage region (see Gpu::p_buf).  Called right after
+// the previous layer's expert passes are queued, so the copies run on s_cp while the caller computes `layer`'s dense
+// half (a different stream).  The region is reused only after the previous layer's launches from it (p_used).
+void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
+    Gpu& gp = *im.gpu;
+    gp.p_layer = -1;
+    if (gp.p_off || !gp.s_cp || !gp.arena.base || !im.g.routed(layer)) return;
+    if (!gp.p_buf) {
+        const char* env = std::getenv("STRATA_PRESTAGE_GIB");
+        const double gib = env ? std::atof(env) : 3.0;
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        const size_t want = (size_t) (gib * 1073741824.0), keep = (size_t) 1536 << 20;
+        gp.p_cap = fr > want + keep ? want : (fr > keep ? fr - keep : 0);
+        if (gib <= 0 || gp.p_cap < ((size_t) 256 << 20) || cudaMalloc(&gp.p_buf, gp.p_cap) != cudaSuccess) {
+            (void) cudaGetLastError();
+            gp.p_buf = nullptr;
+            gp.p_off = true;
+            return;
+        }
+        ck(cudaEventCreateWithFlags(&gp.p_copied, cudaEventDisableTiming), "ev");
+        ck(cudaEventCreateWithFlags(&gp.p_used, cudaEventDisableTiming), "ev");
+        static bool said = false;
+        if (!said) { said = true; std::fprintf(stderr, "chunk prestage: %.2f GiB device region\n", gp.p_cap / 1073741824.0); }
+    }
+    if (gp.p_used_rec) ck(cudaStreamWaitEvent(gp.s_cp, gp.p_used, 0), "pstage wait used");
+    const int64_t NX = im.g.n_experts;
+    gp.p_ptr.assign((size_t) NX, 0ull);
+    size_t off = 0;
+    int nput = 0;
+    for (int64_t e = 0; e < NX; ++e) {
+        if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+        const uint8_t* src = gp.arena.ptr(layer, e);
+        if (!src) continue;
+        const size_t bl = (size_t) im.bl[(size_t) (im.g.per_expert() ? im.g.cls(layer, (int32_t) e) : layer)];
+        if (off + bl > gp.p_cap) break;
+        ck(cudaMemcpyAsync((uint8_t*) gp.p_buf + off, src, bl, cudaMemcpyHostToDevice, gp.s_cp), "pstage dma");
+        gp.p_ptr[(size_t) e] = (unsigned long long) gp.p_buf + off;
+        off = (off + bl + 255) & ~(size_t) 255;
+        ++nput;
+    }
+    if (!nput) return;
+    ck(cudaEventRecord(gp.p_copied, gp.s_cp), "pstage copied");
+    gp.p_layer = (int) layer;
+}
+
 // cf >= 0 (per-expert geometry): only the entries whose expert is of class cf; `first` uploads and quantizes the
 // activations, `last` takes the weighted sum (each entry's parts row is written by exactly one class pass)
 bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x_host,
@@ -2537,6 +2593,35 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     // a batch waits only for the blobs it DMAs.
     // chunk_prestage: this layer's arena experts may already sit in a device half (issued by the previous call)
     std::vector<int32_t> arena_e(order[1]);
+    if (gp.p_layer == (int) layer && !arena_e.empty()) {   // layer prestage: launch the arena experts already on the card
+        std::vector<int32_t> es, rest;
+        std::vector<unsigned long long> ps;
+        for (int32_t e : arena_e) {
+            const unsigned long long pp = gp.p_ptr[(size_t) e];
+            if (!pp) { rest.push_back(e); continue; }
+            es.push_back(e);
+            ps.push_back(pp);
+            ent_str += cnt[(size_t) e];
+        }
+        if (!es.empty()) {
+            ck(cudaStreamWaitEvent(gp.s, gp.p_copied, 0), "wait pstage");
+            std::vector<int32_t> re;
+            std::vector<unsigned long long> rp;
+            for (size_t q = 0; q < es.size(); ++q) {
+                if (!re.empty() && first[(size_t) re.back()] + cnt[(size_t) re.back()] != first[(size_t) es[q]]) {
+                    launch(re, rp);
+                    re.clear();
+                    rp.clear();
+                }
+                re.push_back(es[q]);
+                rp.push_back(ps[q]);
+            }
+            launch(re, rp);
+            ck(cudaEventRecord(gp.p_used, gp.s), "pstage used");
+            gp.p_used_rec = true;
+        }
+        arena_e = std::move(rest);
+    }
     int h0 = 0;   // the first half the batch loop below uses
     bool used_pre = false;
     if (gp.c_pre_layer == (int) layer && gp.c_pre_sl == SL) {
@@ -2772,12 +2857,26 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 
 #if defined(DS4_MOE_CUDA)
 // a chunk over every format class present (one pass each; the sum after the last)
+// the next routed layer after `layer` (wrapping: the next chunk's layer 0) gets the layer prestage
+void chunk_pstage_next(Ds41MoeImpl& im, int64_t layer) {
+    int64_t nl = layer;
+    for (int64_t k = 0; k < im.g.n_layers; ++k) {
+        nl = (nl + 1) % im.g.n_layers;
+        if (im.g.routed(nl)) break;
+    }
+    chunk_pstage_issue(im, nl);
+}
+
 bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out,
                    void* out_dev) {
     // chunk_prefetch: make this layer's file-tier experts available in a slab (and start the next layer's read), so
     // the passes below DMA out of pinned memory instead of reading NVMe on their critical path (a no-op when off).
     chunk_pf_prepare(im, layer);
-    if (!im.g.per_expert()) return gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev);
+    if (!im.g.per_expert()) {
+        if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev)) return false;
+        chunk_pstage_next(im, layer);
+        return true;
+    }
     const int64_t NE = (int64_t) n * im.g.top_k;
     std::vector<int> cl;
     for (int64_t j = 0; j < NE; ++j) {
@@ -2787,6 +2886,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     std::sort(cl.begin(), cl.end());
     for (size_t i = 0; i < cl.size(); ++i)
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size())) return false;
+    chunk_pstage_next(im, layer);
     return true;
 }
 #endif
@@ -2888,6 +2988,14 @@ void Ds41MoeTier::release_chunk() {
     gp.c_ready = false;
     gp.c_pre_layer = gp.c_pre_half = -1;
     gp.c_pre_e.clear();
+    if (gp.p_buf) cudaFree(gp.p_buf);
+    if (gp.p_copied) cudaEventDestroy(gp.p_copied);
+    if (gp.p_used) cudaEventDestroy(gp.p_used);
+    gp.p_buf = nullptr;
+    gp.p_copied = gp.p_used = nullptr;
+    gp.p_cap = 0;
+    gp.p_layer = -1;
+    gp.p_off = gp.p_used_rec = false;
     gp.free_mmq();
 #endif
 }
