@@ -24,6 +24,7 @@
 
 #include "ds41_geometry.hpp"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -102,6 +103,9 @@ public:
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();
+    /// Called when a graph's buffer cannot be allocated; return true if it freed device memory (the allocation is
+    /// then retried once).  E.g. the expert tier's prestage region.
+    void set_oom_hook(std::function<bool()> hook);
     /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
     /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
     void set_route_bias(int il, const float * bias);

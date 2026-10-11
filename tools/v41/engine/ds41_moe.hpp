@@ -445,6 +445,9 @@ public:
     bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
     /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
     void release_chunk();
+    /// Gives the layer-prestage region back (VRAM for the dense half when its pass buffer would not fit); prestage
+    /// stays off until release_chunk.  False when there was none.
+    bool release_prestage();
     /// Closes the VRAM expert cache and gives its device memory back (--serve: a multi-token prompt needs that VRAM
     /// for its pass / chunk buffers, as the one-shot deferred seed).  Every expert is then an arena / file-tier
     /// expert until the next seed_from_ranked, which reopens the cache (sized by set_slot_gib) and refills it; the

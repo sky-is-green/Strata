@@ -2476,7 +2476,10 @@ void chunk_pstage_issue(Ds41MoeImpl& im, int64_t layer) {
         const double gib = env ? std::atof(env) : 3.0;
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
-        const size_t want = (size_t) (gib * 1073741824.0), keep = (size_t) 1536 << 20;
+        // keep: VRAM left for the dense half's pass buffer, which grows with the context (2.3 GB at 20K); 1.5 GiB was
+        // too little once the desktop held a few hundred MB more (fresh 20K prompt OOM, 2026-10-12)
+        const char* kenv = std::getenv("STRATA_PRESTAGE_KEEP_GIB");
+        const size_t want = (size_t) (gib * 1073741824.0), keep = (size_t) ((kenv ? std::atof(kenv) : 3.0) * 1073741824.0);
         gp.p_cap = fr > want + keep ? want : (fr > keep ? fr - keep : 0);
         if (gib <= 0 || gp.p_cap < ((size_t) 256 << 20) || cudaMalloc(&gp.p_buf, gp.p_cap) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -3162,6 +3165,26 @@ void Ds41MoeTier::release_cache() {
     im_->admitted = 0;
     im_->pf_n = 0;             // staged prefetches are keyed by expert, not slot - but they belong to the old decode
     im_->vlast.clear();        // the LRU order restarts from the next seed (lru_seed_order)
+#endif
+}
+
+bool Ds41MoeTier::release_prestage() {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->p_buf) return false;
+    Gpu& gp = *im_->gpu;
+    cudaDeviceSynchronize();   // no DMA into it and no expert kernel reading from it is still in flight
+    cudaFree(gp.p_buf);
+    if (gp.p_copied) cudaEventDestroy(gp.p_copied);
+    if (gp.p_used) cudaEventDestroy(gp.p_used);
+    gp.p_buf = nullptr;
+    gp.p_copied = gp.p_used = nullptr;
+    gp.p_cap = 0;
+    gp.p_layer = -1;
+    gp.p_used_rec = false;
+    gp.p_off = true;           // no prestage for the rest of this prompt (release_chunk re-arms it)
+    return true;
+#else
+    return false;
 #endif
 }
 

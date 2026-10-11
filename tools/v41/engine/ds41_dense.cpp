@@ -109,6 +109,7 @@ bool is_routed(const std::string & n) {
 // ================================================================== Impl
 
 struct Ds41Dense::Impl {
+    std::function<bool()> oom_hook;       // set_oom_hook: frees device memory when a graph buffer does not fit
     Ds41DenseConfig cfg;
     Ds41Geometry g;
     std::unique_ptr<GgufModel> model;
@@ -326,7 +327,12 @@ struct B {
 
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
     Allo & a = cached ? allo_dec : allo_pass;
-    if (!a.alloc(gf, cached && env_on("DS41_GRAPH_REUSE", true))) { err = "graph allocation failed"; return false; }
+    bool ok_alloc = a.alloc(gf, cached && env_on("DS41_GRAPH_REUSE", true));
+    if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
+        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
+        ok_alloc = a.alloc(gf, false);
+    }
+    if (!ok_alloc) { err = "graph allocation failed"; return false; }
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
     return true;
 }
@@ -901,6 +907,8 @@ void Ds41Dense::set_route_bias(int il, const float * bias) {
     if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;
     ggml_backend_tensor_set(im.ly[(size_t) il].rbias, bias, 0, (size_t) im.NE * 4);
 }
+
+void Ds41Dense::set_oom_hook(std::function<bool()> hook) { p_->oom_hook = std::move(hook); }
 
 void Ds41Dense::release_pass() {
     Impl & im = *p_;
