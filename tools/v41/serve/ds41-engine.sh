@@ -9,5 +9,7 @@ if [ "${MEMGUARD_ALLOW_COMFY:-0}" != 1 ] && ss -ltn 2>/dev/null | grep -q ':8188
 fi
 LOCK="${DS4_LOCK:-$HOME/.quetza-data/conductor/ds4-gpu.lock}"
 export GGML_NO_BACKTRACE=1
+# 4 KiB pages pin the 60 GiB arena at 1.2 GB/s (load ~50 s); THP pins at ~0.16 GB/s (~4 min)
+export STRATA_NO_LARGEPAGES="${STRATA_NO_LARGEPAGES:-1}"
 exec flock "$LOCK" systemd-run --user --scope -q --unit="ds41-serve-$$" -p MemoryMax=84G -p MemorySwapMax=0 \
     "$PWD/build-ds4-gpu/ds41_generate" "$@"

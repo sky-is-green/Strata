@@ -3036,6 +3036,17 @@ bool Ds41MoeTier::build_arena_from_routes(const std::string& routes_bin, int bat
 const std::vector<double>& Ds41MoeTier::saliency_sum() const { return im_->sal_sum; }
 const std::vector<int64_t>& Ds41MoeTier::saliency_count() const { return im_->sal_cnt; }
 
+void Ds41MoeTier::release_cache() {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->cache) return;
+    cudaDeviceSynchronize();   // no copy or kernel may still read a slot
+    im_->gpu->cache.reset();
+    im_->admitted = 0;
+    im_->pf_n = 0;             // staged prefetches are keyed by expert, not slot - but they belong to the old decode
+    im_->vlast.clear();        // the LRU order restarts from the next seed (lru_seed_order)
+#endif
+}
+
 void Ds41MoeTier::release_chunk() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu) return;

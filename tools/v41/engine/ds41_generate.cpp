@@ -15,7 +15,11 @@
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
 //   out: READY <ctx> stop, RESUME <reused>, PP <read> <total> <ms> <tok/s>, T <id>, DONE ..., ERR <text>
 // Conversation reuse: a request that extends what the state has seen continues; one that shares the last prompt
-// restores the snapshot taken at its end (Ds41Dense::snapshot: every other cache is position-indexed).
+// restores the snapshot taken at its end (Ds41Dense::snapshot: every other cache is position-indexed); the same prompt
+// again (regenerate) restores it and samples from the saved last-row logits without a prefill.  VRAM: a multi-token
+// prompt runs with the expert cache closed (its buffers need that VRAM) and the decode after it re-seeds the cache from
+// the measured free memory (~0.6 s), as a one-shot run; the decode biases (--route-bias / --route-bias-file) apply only
+// while decoding.
 //
 // Load the real model only through tools/ds4/memguard.sh (RAM cap + the shared GPU lock).
 #include "ds41_dense.hpp"
@@ -214,9 +218,10 @@ int main(int argc, char ** argv) {
     // through the per-layer 128-token window, so for a long prompt they can stop after the KV-writing part of layer
     // 20 (the layer-major batch path only; the chunk path has no per-layer column split, --ppl/--dump-logits need
     // every row's logits, which the skipped rows do not have).
-    // default ON (byte-identical last-row logits vs the full path, 8192 tokens, 2026-10-11) for one-shot layer-major runs;
-    // --serve keeps it opt-in until the reuse path is exercised
-    bool enc_skip = a.enc_skip == 1 || (a.enc_skip < 0 && !a.serve && PB > 1);
+    // default ON (byte-identical last-row logits vs the full path, 8192 tokens, 2026-10-11) for layer-major runs, --serve
+    // included (a continuation / snapshot restore only reads per-position caches + the last window of every layer,
+    // which the replay window computes in full)
+    bool enc_skip = a.enc_skip == 1 || (a.enc_skip < 0 && PB > 1);
     if (enc_skip && a.enc_replay < 1) { std::fprintf(stderr, "ds41_generate: --enc-replay must be >= 1\n"); return 2; }
     if (enc_skip && (a.ppl || !a.dump_logits.empty())) {
         if (a.enc_skip == 1) std::fprintf(stderr, "note: --enc-skip disabled (--ppl/--dump-logits need every row's logits, the old full path)\n");
@@ -297,9 +302,10 @@ int main(int argc, char ** argv) {
         mc.exclude = pruned;
     }
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
-    // one-shot runs defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the
-    // cache opens into it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots
-    const bool defer_vram = !mc.cpu_only && !a.serve && (a.prefill_chunk > 1 || a.prompt_batch > 1);
+    // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
+    // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
+    // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)
+    const bool defer_vram = !mc.cpu_only && (a.prefill_chunk > 1 || a.prompt_batch > 1);
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (!mc.cpu_only) {
         if (!a.rank.empty()) {
@@ -335,8 +341,11 @@ int main(int argc, char ** argv) {
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
     bool bias_now = a.bias_prompt > 0 || !defer_vram;
+    bool bias_set = false;   // a nonzero bias is in the dense half now (--serve turns it off again for the next prompt)
     auto apply_bias = [&]() {
-        if (n_pruned == 0 && (!bias_now || (a.route_bias == 0.0f && a.route_bias_file == 0.0f))) return;
+        const bool want = n_pruned > 0 || (bias_now && (a.route_bias != 0.0f || a.route_bias_file != 0.0f));
+        if (!want && !bias_set) return;
+        bias_set = want;
         std::vector<float> rb((size_t) TG.n_experts);
         for (int64_t l = 0; l < TG.n_layers; ++l) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
@@ -420,6 +429,24 @@ int main(int argc, char ** argv) {
     const int piece = (int) std::max<int64_t>(1, (int64_t) chunk_budget / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
     std::vector<float> last_logits((size_t) nv);
+    // the deferred VRAM seed after a prompt: the prompt's buffers go back, the cache opens into the free space, and the
+    // decode biases (route bias + file penalty) switch on.  Returns the free GiB measured (for the log).
+    double seed_free = 0, seed_gib = 0, seed_s = 0;
+    auto open_cache = [&]() -> bool {
+        dense.release_pass();
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
+        seed_free = fr / 1073741824.0;
+        seed_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+        tier.set_slot_gib(a.slots > 0 ? 0.0 : seed_gib);
+        const double ts = now_ms();
+        if (!tier.seed_from_ranked(ranked, err)) return false;
+        seed_s = (now_ms() - ts) / 1000.0;
+        proxy_res.clear();   // the real VRAM set from here on
+        bias_now = true;     // decode: route bias + file penalty on
+        apply_bias();
+        return true;
+    };
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
     bool enc_reported = false;
     // ---- env-gated per-layer dumps (determinism bisect): STRATA_LAYER_DUMP=<dir> writes, for every layer of the
@@ -585,6 +612,11 @@ int main(int argc, char ** argv) {
         const int ctxv = (int) ctx;
         std::vector<int> hist;
         int snap_len = -1;
+        std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
+        int n_req = 0;
+        bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
+        // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs as decode steps (0 = always layer-major)
+        const int step_max = std::getenv("STRATA_SERVE_STEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_STEP_MAX")) : 384;
         std::printf("INFO ctx=%d experts_vram=%lld arena_experts=%lld\n", ctxv, (long long) tier.resident(),
                     (long long) tier.arena_experts());
         std::printf("READY %d stop\n", ctxv);
@@ -621,7 +653,11 @@ int main(int argc, char ** argv) {
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
             int reused = 0;
             if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
-            else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
+            else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
+                hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
+                reused = snap_len;
+                last_logits = snap_logits;
+            } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
             } else {
@@ -631,14 +667,39 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "serve: reuse lcp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp, hist.size(), snap_len,
                          ids.size(), reused);
             if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
+            const int total = (int) ids.size();
+            // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
+            // the prompt's routing (no decode bias).  A short one (<= step_max new tokens: a chat / agent turn's tool
+            // result) runs as decode steps instead, with the cache and the decode biases: the layer-major path streams
+            // nearly every expert of every layer whatever the batch size (~18 s for 40 tokens), a step ~45 ms
+            const int delta = total - reused;
+            const bool by_step = defer_vram && delta >= 1 && delta <= step_max;
+            if (by_step && !cache_open) {
+                if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
+                cache_open = true;
+            } else if (!by_step && defer_vram && cache_open && delta >= 2) {
+                tier.release_cache();
+                cache_open = false;
+                bias_now = a.bias_prompt > 0;
+                apply_bias();
+            }
             tier.reset_stats();
             const double tp0 = now_ms();
-            const int total = (int) ids.size();
-            const bool ok = feed(ids.data() + reused, total - reused, reused, [&](int done) {
+            auto pp = [&](int done) {
                 const double ms = now_ms() - tp0;
                 std::printf("PP %d %d %.0f %.1f\n", reused + done, total, ms, 1000.0 * done / std::max(ms, 1e-9));
                 std::fflush(stdout);
-            }, nullptr);
+            };
+            auto feed_steps = [&]() -> bool {   // the short-turn path: one decode step per prompt token
+                for (int i = 0; i < delta; ++i) {
+                    if (!step(ids[(size_t) (reused + i)], reused + i)) return false;
+                    if ((i + 1) % 64 == 0 && i + 1 < delta) pp(i + 1);
+                }
+                if (!dense.logits(0, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                pp(delta);
+                return true;
+            };
+            const bool ok = total == reused || (by_step ? feed_steps() : feed(ids.data() + reused, delta, reused, pp, nullptr));
             if (!ok) {
                 std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
@@ -647,10 +708,30 @@ int main(int argc, char ** argv) {
                 continue;
             }
             hist = ids;
-            if (dense.snapshot(total)) snap_len = total;
+            if (total > reused && dense.snapshot(total)) { snap_len = total; snap_logits = last_logits; }
+            if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {   // exactness checks: request N's last-row logits
+                char nb[32];
+                std::snprintf(nb, sizeof(nb), "/req%03d.f32", n_req);
+                std::ofstream f(std::string(dd) + nb, std::ios::binary);
+                f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
+            }
+            ++n_req;
             const double prompt_ms = now_ms() - tp0;
-            std::fprintf(stderr, "serve: prompt %d tokens (%d reused) in %.2f s = %.1f tok/s\n", total, reused,
-                         prompt_ms / 1000.0, 1000.0 * (total - reused) / std::max(prompt_ms, 1e-9));
+            const Ds41MoeStats pst = tier.stats();
+            std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
+                                 "%lld pcie / %lld file)\n", total, reused, by_step ? "steps" : "batch", prompt_ms / 1000.0,
+                         1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
+                         (long long) pst.pcie, (long long) pst.file_tier);
+            if (defer_vram && !cache_open) {   // decode next: the VRAM cache opens into what the prompt freed
+                if (!open_cache()) {
+                    std::printf("ERR VRAM seed failed: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    continue;
+                }
+                cache_open = true;
+                std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
+                             (long long) tier.resident(), seed_s);
+            }
             tier.reset_stats();
             const double td0 = now_ms();
             int gen = 0, pos = total;
@@ -684,7 +765,11 @@ int main(int argc, char ** argv) {
             std::fflush(stdout);
         }
         tier.close();
-        return 0;
+        // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
+        // on it until the client closes the pipe - leave without the static destructors
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(0);
     }
 
     // ---- one-shot: prompt (+ perplexity), then generate
@@ -698,18 +783,9 @@ int main(int argc, char ** argv) {
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     const double prompt_ms = now_ms() - tp0;
     if (defer_vram) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
-        dense.release_pass();
-        size_t fr = 0, tot = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
-        const double g = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
-        tier.set_slot_gib(a.slots > 0 ? 0.0 : g);
-        const double ts = now_ms();
-        if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
-        proxy_res.clear();   // the real VRAM set from here on
-        bias_now = true;     // decode: route bias + file penalty on
-        apply_bias();
+        if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
-                     fr / 1073741824.0, g, (long long) tier.resident(), (now_ms() - ts) / 1000.0);
+                     seed_free, seed_gib, (long long) tier.resident(), seed_s);
     }
     const Ds41MoeStats pst = tier.stats();
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",

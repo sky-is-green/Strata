@@ -434,6 +434,11 @@ public:
     bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
     /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
     void release_chunk();
+    /// Closes the VRAM expert cache and gives its device memory back (--serve: a multi-token prompt needs that VRAM
+    /// for its pass / chunk buffers, as the one-shot deferred seed).  Every expert is then an arena / file-tier
+    /// expert until the next seed_from_ranked, which reopens the cache (sized by set_slot_gib) and refills it; the
+    /// arena is kept (an LRU-demoted expert stays in the arena slot it took).  No-op without a cache.
+    void release_cache();
     /// REAP accumulators (Ds41MoeConfig::saliency), [layer * n_experts + expert]; empty when off.
     const std::vector<double>& saliency_sum() const;
     const std::vector<int64_t>& saliency_count() const;

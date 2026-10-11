@@ -3,7 +3,9 @@
 # STRATA-DS41-QUETZA - DeepSeek-V4.1-Flash (uncensored, GSQ mixed tiers) on the Strata-DS4 engine, QuetzaCodetl in front
 #
 # Engine:  build-ds4-gpu/ds41_generate --serve (Strata's engine line protocol) via tools/v41/serve/ds41-engine.sh
-#          (shared GPU lock with strata-glm, 84 GiB RAM cap, refuses while ComfyUI runs)
+#          (shared GPU lock with strata-glm, 84 GiB RAM cap, refuses while ComfyUI runs).  Tuned defaults: long
+#          prompts layer-major (~250 tok/s at 8K, exact), turns of <= 384 new tokens as decode steps (~25 tok/s),
+#          decode ~22-26 tok/s (route bias 1.0 + file penalty 0.6), same prompt again = no prefill
 # Server:  Strata's serve.server through tools/v41/serve/serve_ds41.py (DeepSeek encoder, DSML tool calls,
 #          reasoning effort 1-100) - OpenAI (/v1) + Anthropic (/v1/messages) + /health + llama.cpp-style /metrics
 # Context: 524288 (V4.1's caches are shared across layers: ~1.5 GB at 512K)
@@ -68,7 +70,7 @@ else
         > "$SERVER_LOG" 2>&1 < /dev/null &
     echo $! > "$SERVER_PID_FILE"
     server_pid=$(cat "$SERVER_PID_FILE")
-    log_info "  pid $server_pid - log $SERVER_LOG (engine log: /tmp/strata-ds41.log; load ~2-5 min: RAM arena fill)"
+    log_info "  pid $server_pid - log $SERVER_LOG (engine log: /tmp/strata-ds41.log; load ~1 min: 60 GiB RAM arena fill)"
     for i in $(seq 1 450); do
         if curl -s --max-time 2 "$LOCAL_URL/health" >/dev/null 2>&1; then
             log_ok "ready: $LOCAL_URL/v1 (OpenAI) - $LOCAL_URL/v1/messages (Anthropic)"
