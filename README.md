@@ -25,6 +25,9 @@ three tiers:
 | Pinned RAM arena | ~6,700 experts (60 GiB, `cudaHostRegister`) | DMA straight to the GPU |
 | NVMe file tier | the other ~8,700 experts | O_DIRECT reads at ~4.5 GB/s, prefetched a layer ahead |
 
+A bigger arena does not help on this box: 62 / 65 GiB cut NVMe reads 10% but decode stayed within run-to-run noise
+(24.4-25.2 tok/s at 60, 24.5 at 62, 24.7 at 65), because the file penalty already keeps decode routing off the NVMe tier.
+
 ### The model file: GSQ mixed tiers (152 GiB)
 
 `tools/v41` holds a GPTQ-style quantisation pipeline (`v41_calib.py`, `v41_alloc.py`, `v41_quant.py`,

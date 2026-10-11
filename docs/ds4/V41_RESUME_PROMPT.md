@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-12 ~06:30 by Claude (session paused: Claude weekly token limit close).
+**Last updated:** 2026-10-12 ~08:30 by Claude (arena verdict in; continuing the queue: fq patch, then MTP).
 **READ §UPDATE 2026-10-12 ~08:00 FIRST**, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
 
 ## UPDATE 2026-10-12 ~08:00 (supersedes MORNING where they differ) - READ FIRST
