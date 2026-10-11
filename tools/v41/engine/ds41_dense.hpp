@@ -78,6 +78,15 @@ public:
     /// attention, hc, router, shared expert + the Engram add.  ids / wts / fn land in the batch buffers (batch_ids /
     /// batch_wts / batch_fn) at column col0.  Uses (and advances) layer il's own KV state in sub-batch order.
     bool attn_router_span(int il, int col0, int n);
+    /// Encoder-only skip (enc-skip): build and run ONLY the persistent-KV half of layer il for the batch's sub-batch
+    /// at column col0 - hc_pre / attn_norm, the raw window K/V ring write and, on a kv source layer, the compressed-KV
+    /// row + indexer-key row + ratio-2 compressor state (all the state a LATER query can read across positions).  No
+    /// attention output, no router, no shared expert, no hc_post / finish, no indexer selection / candidates: nothing
+    /// that only ever flows into this layer's own output columns.  For prompt tokens whose layers past the replay
+    /// window are never read (the model's cross-position reach is the 128-token window per layer, so the last
+    /// `enc_replay` tokens are all that matters).  Writes no host ids/wts/fn, so batch_ids()/batch_wts()/batch_fn()
+    /// are left untouched at these columns.
+    bool attn_router_span_kv(int il, int col0, int n);
     /// The batch's host buffers filled by attn_router_span: ids / wts are n_used * B (token-major), fn is n_embd * B.
     const int32_t * batch_ids() const;
     const float * batch_wts() const;

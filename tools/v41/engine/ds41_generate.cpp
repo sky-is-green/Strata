@@ -7,6 +7,9 @@
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--serve] [--quiet]
+//                 [--enc-skip] [--enc-replay N] [--dump-last F]
+// --enc-skip (layer-major batches only): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
+// after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
 //   in:  GEN <max_new> [temperature=.. top_p=.. top_k=.. min_p=.. seed=..] <ids csv> | STOP | QUIT
@@ -46,7 +49,7 @@ using namespace strata::v41;
 namespace {
 
 struct Args {
-    std::string model, ids_csv, ids_file, rank, dump_logits;
+    std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
     float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed
@@ -62,6 +65,8 @@ struct Args {
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = false, arena_adapt = false, chunk_mmq = false;
     bool act_quant = true, chunk_prefetch = true;
+    bool enc_skip = false;        // --enc-skip: only run the tokens before the replay window through layers 21-39
+    int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
 };
@@ -113,6 +118,9 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
+        else if (k == "--dump-last") a.dump_last = next();
+        else if (k == "--enc-skip") a.enc_skip = true;
+        else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty());
@@ -192,6 +200,18 @@ int main(int argc, char ** argv) {
     const int S = a.prefill_chunk > 0 ? a.prefill_chunk : (a.prompt_batch > 0 ? 512 : 1);
     dc.max_pass = S;
     dc.prompt_batch = PB;
+    // encoder-only prompt prefill (enc-skip): tokens before the last `enc_replay` need their layers past layer 20 only
+    // through the per-layer 128-token window, so for a long prompt they can stop after the KV-writing part of layer
+    // 20 (the layer-major batch path only; the chunk path has no per-layer column split, --ppl/--dump-logits need
+    // every row's logits, which the skipped rows do not have).
+    bool enc_skip = a.enc_skip;
+    if (enc_skip && a.enc_replay < 1) { std::fprintf(stderr, "ds41_generate: --enc-replay must be >= 1\n"); return 2; }
+    if (enc_skip && (a.ppl || !a.dump_logits.empty())) {
+        std::fprintf(stderr, "note: --enc-skip disabled (--ppl/--dump-logits need every row's logits, the old full path)\n");
+        enc_skip = false;
+    }
+    if (enc_skip && PB <= 1) { std::fprintf(stderr, "ds41_generate: --enc-skip needs the layer-major prompt path (--prompt-batch >= 2)\n"); return 2; }
+    int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
     dc.act_quant = a.act_quant;
     Ds41Dense dense;
@@ -200,6 +220,19 @@ int main(int argc, char ** argv) {
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
+    // enc-skip's layer 20: the LAST kv source (every compressed-KV / index-key write is owned by a kv source, and the
+    // layers above it only read that owner's state, so the cut belongs there).  Also the window reach R = swa *
+    // (n_layer - cut_layer) is what --enc-replay defaults to.
+    int CL = 0;
+    for (int64_t s : G.kv_sources) CL = std::max<int>(CL, (int) s);
+    // exactness needs every later layer's window reach to stay inside the replay: reach = swa * (n_layer - CL)
+    const int64_t reach = (int64_t) G.n_swa * (int64_t) (n_layer - CL);
+    if (enc_skip && ER < reach) {
+        std::fprintf(stderr, "note: --enc-replay %lld < the window reach %lld (swa %lld x %d layers past %d); raised\n",
+                     (long long) ER, (long long) reach, (long long) G.n_swa, n_layer - CL, CL);
+        ER = reach;
+    }
+    if (enc_skip) std::fprintf(stderr, "enc-skip: cut at layer %d (last kv source), replay window %lld (reach %lld)\n", CL, (long long) ER, (long long) reach);
     if (a.engram.empty()) std::fprintf(stderr, "WARNING: no --engram dirs: the Engram add is skipped (not the real model)\n");
 
     // ---- routed experts
@@ -322,22 +355,44 @@ int main(int argc, char ** argv) {
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
     std::vector<float> last_logits((size_t) nv);
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
+    bool enc_reported = false;
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
                 const int B = std::min(PB, n - c0);
+                // enc-skip: columns whose global position is before `pos0 + n - ER` are phase A (layers past layer 20
+                // are never read for them), rounded DOWN to a sub-batch boundary so a straddling sub-batch still runs
+                // the full path (more work, never wrong); the last sub-batches holding the final token are always full.
+                int cut = 0;
+                if (enc_skip) {
+                    const int64_t gpos = (int64_t) pos0 + c0;
+                    const int64_t ta = (int64_t) pos0 + n - ER - gpos;
+                    cut = ta <= 0 ? 0 : ta >= B ? B : (int) ta;
+                    cut = (cut / SB) * SB;
+                    if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
+                }
                 double t0 = now_ms();
                 if (!dense.begin_batch(ids + c0, B, pos0 + c0)) { ferr = dense.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
-                    for (int s = 0; s < B; s += SB) {   // sub-batches in order: the layer's KV state advances as today
+                    // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
+                    // nothing at all for phase A (their output columns are never read, and no later layer reads state
+                    // a phase-A position would leave past layer 20)
+                    const int d0 = (cut > 0 && l >= CL) ? cut : 0;
+                    if (cut > 0 && l == CL) {
+                        for (int s = 0; s < cut; s += SB) {
+                            const int sn = std::min(SB, cut - s);
+                            if (!dense.attn_router_span_kv(l, s, sn)) { ferr = dense.last_error(); return false; }
+                        }
+                    }
+                    for (int s = d0; s < B; s += SB) {   // sub-batches in order: the layer's KV state advances as today
                         const int sn = std::min(SB, B - s);
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
                     }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
-                    for (int s = 0; s < B; s += piece) {   // the experts for all B rows (in pieces if the buffers cap)
+                    for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
                         if (!tier.run_chunk(l, pn, dense.batch_ids() + (size_t) s * top_k,
                                             dense.batch_wts() + (size_t) s * top_k,
@@ -347,7 +402,7 @@ int main(int argc, char ** argv) {
                     t0 = now_ms();
                     fd_tier += t0 - t1;
                     if (!dense.upload_routed(brouted.data(), B)) { ferr = dense.last_error(); return false; }
-                    for (int s = 0; s < B; s += SB) {
+                    for (int s = d0; s < B; s += SB) {
                         const int sn = std::min(SB, B - s);
                         if (!dense.finish_span(l, s, sn)) { ferr = dense.last_error(); return false; }
                     }
@@ -577,6 +632,10 @@ int main(int argc, char ** argv) {
     if (!a.dump_logits.empty()) {
         std::ofstream f(a.dump_logits, std::ios::binary);
         f.write((const char *) all.data(), (std::streamsize) (all.size() * 4));
+    }
+    if (!a.dump_last.empty()) {   // the last row's logits - the one row enc-skip still computes exactly
+        std::ofstream f(a.dump_last, std::ios::binary);
+        f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
     }
     tier.reset_stats();
     const double td0 = now_ms();

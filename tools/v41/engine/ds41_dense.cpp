@@ -543,6 +543,93 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     return gf;
 }
 
+// enc-skip: the persistent-KV half of build_attn for one span.  Runs hc_pre / attn_norm, writes the raw window K/V
+// ring, and on a kv source layer writes the compressed-KV row + indexer-key row (+ the ratio-2 compressor state).
+// Everything else build_attn does (q, the attention + output LoRA, hc_post, the router, the shared expert, the indexer
+// selection / candidate blocks, and the pre_state / hap / shexp / o_* writes) only ever flows into THIS layer's own
+// output columns, so a prompt token whose later layers are never read does not need them.  The state it does write is
+// exactly what build_attn writes for those positions, so a later query's window / compressed reads see the same
+// values as the full path (verified by the enc-skip gate).
+static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
+    using L_t = Ds41Dense::Impl::Layer;
+    L_t & L = im.ly[(size_t) il];
+    const Ds41Geometry & G = im.g;
+    B b { &im, gc, &G };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 8192, false);
+    const int64_t D = im.D, HC = im.HC, DH = im.DH;
+    const int64_t r = L.ratio;
+    std::vector<ggml_tensor *> outs, late;   // late: the ring / state write-backs, after every read
+    ggml_tensor * pos = b.v1(im.i_pos, n, (size_t) col0 * 4);
+
+    ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
+    if (L.eslot >= 0 && im.engram.enabled()) {   // the Engram add still feeds the K/V + compressor projections
+        ggml_tensor * rows = b.cols2(im.i_eng[L.eslot], im.EC * im.ED, n, col0);
+        ggml_tensor * kv = ggml_mul_mat(gc, im.BL(il, "engram_kv.weight"), rows);
+        ggml_tensor * key = ggml_view_3d(gc, kv, D, HC, n, (size_t) D * 4, kv->nb[1], 0);
+        ggml_tensor * val = ggml_view_3d(gc, kv, D, 1, n, (size_t) D * 4, kv->nb[1], (size_t) HC * D * 4);
+        ggml_tensor * wqk = ggml_mul(gc, im.BL(il, "engram_q_norm.weight"), im.BL(il, "engram_k_norm.weight"));
+        ggml_tensor * hn = ggml_rms_norm(gc, x, (float) G.rms_eps);
+        ggml_tensor * kn = ggml_rms_norm(gc, ggml_cont(gc, key), (float) G.rms_eps);
+        ggml_tensor * dot = ggml_scale(gc, ggml_sum_rows(gc, ggml_mul(gc, ggml_mul(gc, hn, wqk), kn)), 1.0f / std::sqrt((float) D));
+        ggml_tensor * mag = ggml_sqrt(gc, ggml_clamp(gc, ggml_abs(gc, dot), 1e-6f, INFINITY));
+        ggml_tensor * gate = ggml_sigmoid(gc, ggml_mul(gc, ggml_sgn(gc, dot), mag));
+        x = ggml_add(gc, x, ggml_mul(gc, ggml_repeat(gc, ggml_cont(gc, val), x), gate));
+        outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
+    }
+    ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));
+    ggml_tensor * xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
+
+    // ---- window K (= V): the same post-RoPE raw row build_attn writes into the ring
+    ggml_tensor * kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
+    kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
+    ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
+    if (im.cfg.act_quant) kv2 = ds41_fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);
+    {
+        const int64_t k = std::min<int64_t>(n, im.RAW);
+        ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
+        late.push_back(ggml_set_rows(gc, L.raw, last, b.v1(im.i_wslot, k, 0)));
+    }
+
+    // ---- compressed KV + indexer keys (kv source layers; the only other persistent state a later query reads)
+    if (r && L.kv_src) {
+        ggml_tensor * latent = nullptr;
+        if (r == 1) {
+            latent = ggml_mul_mat(gc, im.BL(il, "attn_compressor_kv.weight"), xn);
+        } else {
+            ggml_tensor * skv = ggml_mul_mat(gc, im.BL(il, "attn_compressor_kv.weight"), xn);
+            ggml_tensor * ssc = ggml_mul_mat(gc, im.BL(il, "attn_compressor_gate.weight"), xn);
+            ggml_mul_mat_set_prec(skv, GGML_PREC_F32);
+            ggml_mul_mat_set_prec(ssc, GGML_PREC_F32);
+            ggml_tensor * src_kv = ggml_concat(gc, L.st_kv, skv, 1);
+            ggml_tensor * src_sc = ggml_concat(gc, L.st_sc, ssc, 1);
+            ggml_tensor * gi = b.v1(im.i_sidx, 2 * n, (size_t) col0 * 2 * 4);
+            ggml_tensor * vk = ggml_reshape_3d(gc, ggml_get_rows(gc, src_kv, gi), DH, 2, n);
+            ggml_tensor * vs = ggml_reshape_3d(gc, ggml_get_rows(gc, src_sc, gi), DH, 2, n);
+            vk = ggml_cont(gc, ggml_permute(gc, vk, 1, 0, 2, 3));
+            vs = ggml_cont(gc, ggml_permute(gc, vs, 1, 0, 2, 3));
+            latent = ggml_reshape_2d(gc, ggml_sum_rows(gc, ggml_mul(gc, vk, ggml_soft_max(gc, vs))), DH, n);
+            const int64_t k = std::min<int64_t>(n, 2);
+            late.push_back(ggml_set_rows(gc, L.st_kv, ggml_view_2d(gc, skv, DH, k, skv->nb[1], (size_t) (n - k) * skv->nb[1]),
+                                         b.v1(im.i_sslot, k, 0)));
+            late.push_back(ggml_set_rows(gc, L.st_sc, ggml_view_2d(gc, ssc, DH, k, ssc->nb[1], (size_t) (n - k) * ssc->nb[1]),
+                                         b.v1(im.i_sslot, k, 0)));
+        }
+        latent = b.rms_w(latent, im.BL(il, "attn_compressor_norm.weight"));
+        ggml_tensor * cpos = b.v1(im.i_cpos[r], n, (size_t) col0 * 4);
+        ggml_tensor * cslot = b.v1(im.i_cslot[r], n, (size_t) col0 * 4);
+        ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
+        ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
+        if (im.cfg.act_quant) ik = ds41_fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
+        outs.push_back(ggml_set_rows(gc, L.idxk, ik, cslot));
+        ggml_tensor * lr = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, latent, DH, 1, n), cpos, r), DH, n);
+        if (im.cfg.act_quant) lr = ds41_fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
+        outs.push_back(ggml_set_rows(gc, L.comp, lr, cslot));
+    }
+    for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
+    for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
+    return gf;
+}
+
 // predict: router(rms_norm(hc_pre(state, pre)) * ffn_norm) + bias, top 16 of token 0
 static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor ** out) {
     B b { &im, gc, &im.g };
@@ -907,19 +994,18 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     return true;
 }
 
-bool Ds41Dense::attn_router_span(int il, int col0, int n) {
-    Impl & im = *p_;
+// The per-span inputs of one layer-major sub-batch: the sub-batch's own pass_cap (the graphs read it) and the
+// PASS-LOCAL row maps (the pass's own rows / states sit at the end of the [ring | pass rows] they index, so they are
+// recomputed from the sub-batch's own position - upload_inputs laid them out for the whole batch, correct only at
+// col0 = 0).  Shared by attn_router_span and attn_router_span_kv.
+static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
     const size_t si = (size_t) (col0 / im.S);
     if (si >= im.span_cap.size()) { im.err = "bad span"; return false; }
-    // the sub-batch's own pass_cap (the graphs read it) and the per-pass (not per-token) ring slots
     im.pass_cap[0] = im.span_cap[si][0];
     im.pass_cap[1] = im.span_cap[si][1];
     im.pass_cap[2] = im.span_cap[si][2];
     const int64_t pbase = (int64_t) im.batch_pos0 + col0;
-    // the window and ratio-2 state row maps are PASS-LOCAL: the pass's own rows (and states) sit at the end of the
-    // [ring | pass rows] (resp. [ring | pass states]) they index, so they are recomputed from the sub-batch's own
-    // position (upload_inputs laid them out for the whole batch, which is only correct at col0 = 0)
     {
         std::vector<int32_t> widx((size_t) (im.SWA * n));
         for (int t = 0; t < n; ++t) {
@@ -953,6 +1039,24 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
         for (int64_t j = 0; j < k; ++j) ss[(size_t) j] = (int32_t) ((pbase + n - k + j) % 2);
         ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
     }
+    return true;
+}
+
+bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
+    Impl & im = *p_;
+    if (!upload_span(im, col0, n)) return false;
+    im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
+    ggml_init_params pk = { im.pf_meta.size(), im.pf_meta.data(), true };
+    ggml_context * gck = ggml_init(pk);
+    ggml_cgraph * gk = build_attn_kv_only(im, gck, il, n, col0);
+    const bool okk = im.compute(gk, false);
+    ggml_free(gck);
+    return okk;
+}
+
+bool Ds41Dense::attn_router_span(int il, int col0, int n) {
+    Impl & im = *p_;
+    if (!upload_span(im, col0, n)) return false;
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gc = ggml_init(p);
