@@ -1,7 +1,99 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-12 ~00:10 by Claude (inline, overnight session).
-**READ §HANDOFF 2026-10-12 NIGHT-2 FIRST** (then 2026-10-11 NIGHT, EVENING, 13:10) - newer sections supersede older ones.
+**Last updated:** 2026-10-12 ~06:30 by Claude (session paused: Claude weekly token limit close).
+**READ §HANDOFF 2026-10-12 MORNING FIRST**, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## HANDOFF 2026-10-12 MORNING (~06:30) - wrapper tested by Mal, queue: exact quick path, MTP + vision export, fq patch
+
+### State in one paragraph
+Repo ~/AI/Strata-DS4, branch deepseek4, GitHub Indras-Mirror/Strata-DSV4.1 (remote `ds4`, `git push ds4 deepseek4:main`,
+pushing OK'd by Mal).  HEAD = 9356d8e6 + this doc.  The serve wrapper `~/.local/bin/strata-ds41-quetza` works:
+Mal ran a real Quetza session 2026-10-12 05:38-06:20 (no errors).  build-ds4-gpu/ds41_generate = HEAD (built 06:2x).
+The box rebooted overnight (~05:17): **"SSD NVME" (/dev/nvme0n1p3) does NOT auto-mount** - it holds V41-GSQ.gguf,
+rank.bin, tokenizer and engram-L1.  Fix: `udisksctl mount -b /dev/nvme0n1p3` (gives ntfs3, which the raw Engram
+reads need; check `mount | grep "SSD NVME"` says ntfs3).  /tmp was wiped by the reboot (old scratch logs gone).
+
+### Mal's live session numbers (512K ctx, quick path ON because that engine started before dd6a185d)
+fresh 20,000-token prompt: 77.6 s = 258 tok/s (batch, exact) · 11,260-token tool result on 20K reused: 49 s = 230 tok/s
+· quick-path turns: 27 tok in 0.8 s, 500 tok 10.9 s (46 tok/s), 668 tok 15.7 s · decode 22.7-28.2 tok/s, 96-98% VRAM hits
+· a "write a poem" request thought for 6,590 tokens (cancelled by Mal; Ctrl-C/STOP worked).  Unknown whether it LOOPED
+(no text was logged then - text log added since, see below).  Reasoning effort default = 75 (high) in the shim.
+Note: each turn re-reads the previous assistant reply (DeepSeek's template drops earlier thinking -> lcp falls back to
+the snapshot at the end of the last prompt) - expected, costs ~reply length.
+
+### Mal's decisions today
+1. **No quick path by default** (dd6a185d: ds41-engine.sh exports STRATA_SERVE_STEP_MAX=0) because agent sessions do
+   many tool calls and the quick path routes those prompt tokens with the decode biases.  BUT every turn now pays the
+   batch floor (~16.8 s + n/250).  He wants the **EXACT quick path** (passes with exact routing) if it is fast enough.
+   `STRATA_SERVE_STEP_MAX=768 strata-ds41-quetza` = old quick path (env passes through to the engine).
+2. **Apply the +5% fused fake-quant patch** ("if it's good") - tools/v41/ggml/dsv41-fake-quant.patch.
+3. **Export the MTP head (3 layers, mtp.0-2) - keep it ~Q8_0 - and the vision tower; we want both.**
+4. Full text in the server logs (done: 9356d8e6).
+
+### Files / sources for the exports (VERIFIED 06:25)
+- Full FP8 checkpoint (46 of 48 shards) on **/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/** incl.
+  shard 1 (vision.* 259 tensors) and shards 44-46 (mtp.* 2401 tensors, ~7.9 GB, `.ok` markers).  index json there too.
+- I mistakenly re-downloaded shards 44-46 into /media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/ (duplicates,
+  7.9 GB; ask Mal before deleting).  Engram shards 47/48 also live on NVME1TB.
+- mtp.N.* names: attn, attn_norm, ffn (experts!), ffn_norm, hc_attn_*, hc_ffn_*, main_norm, main_proj, ... (DSpark /
+  V4.1 MTP = 3 layers).  The GSQ GGUF writer = tools/v41/ (v41_gguf.py / quant pipeline, see §Export pipeline below);
+  mtp.* and vision.* were simply never in the export plan ("mtp.* not exported yet").
+- Engine side for MTP: run_multi (tier, up to 4 tokens; per-expert geometry falls back to token-by-token) and the serve
+  passes (pass_m) are the verify building blocks; the V4-0731 engine (tools/ds4) has a full MTP draft/verify
+  implementation to port from (`--mtp`, `--verify`, FINDINGS s19: depth 1 wins at ~60% acceptance).
+- Vision: no engine code at all yet.  Needs: export vision tower, ViT forward (ggml), image-token injection, shim image
+  input (the server already has a Vision class for Qwen - serve/server.py `class Vision`).
+
+### Work queue (Mal's order)
+1. **Exact quick path** - code in HEAD (STRATA_SERVE_PASS_BIAS=0, built, UNMEASURED).  Measure with
+   tools: serve driver (rewrite of the lost scratch serve_drive.py: drive ds41-engine.sh over stdin with
+   `GEN n temperature=0 ids`; DRIVE_ENV passes env).  Compare per turn size (41 / 300 / 641 tokens on a 20K context):
+   exact passes vs biased passes vs batch (STEP_MAX=0).  Exactness: STRATA_SERVE_DUMP last-row logits vs the batch
+   path (expect cos ~0.999 = batch-shape noise).  If exact passes beat the batch floor for small turns, set the wrapper
+   to STEP_MAX=<crossover> + PASS_BIAS=0 and tell Mal.
+2. **MTP head export at Q8_0** (+ engine draft/verify) and **vision tower export** (then engine + shim support).
+3. **Fused fake-quant patch**: `patch -p1 -d third_party/llama.cpp < tools/v41/ggml/dsv41-fake-quant.patch`
+   (use /usr/bin/patch - anaconda's patch is broken), `cmake -S . -B build-ds4-gpu -DSTRATA_DSV41_FQ_OP=ON`, rebuild
+   (~5 min, all cores - never while Mal is using the wrapper), run `build-ds4-gpu/test_ds41_fq --cuda` (must say bit for
+   bit) and the 8K exactness check (md5 4d229102872a), then decode p256 x 256 (expect ~27.7 tok/s).  Record in docs
+   that the local third_party tree is now patched.
+4. **Stashed** (`git stash list`: "span-upload precompute"): uploads all layer-major sub-batch index maps once in
+   begin_batch instead of 4 tiny synchronous tensor_sets per span (measured upload_span = 2.97 s of a 37 s 8K prompt,
+   probably queued behind prestage DMAs) + STRATA_SPAN_PROF profiler.  NOT VALIDATED (my "md5 OK" this morning ran
+   on the committed code - the stash had already happened).  `git stash pop`, build, check md5 4d229102872a + prefill
+   tok/s warm (2 runs each A/B).
+5. Check the text log on the next live run: `tail -f /tmp/strata-ds41-text.log`; if the poem case loops, investigate
+   (route bias / quick path?) - otherwise maybe lower the default reasoning effort (shim EFFORT default 75).
+
+### Server observability (9356d8e6)
+- `/tmp/strata-ds41-text.log`: every request's header (prompt tokens, max, thinking, tools), the thinking / answer /
+  tool-call text as generated, end line (finish, tokens, seconds).  STRATA_TEXT_LOG=<path>|0.
+- `/api-monitor` (config "api_monitor": true): last 100 prompts + answers.  `/metrics` (JSON or Prometheus),
+  `/slots` (live reasoning_tail / output_tail), engine log /tmp/strata-ds41.log (`serve:` lines per request),
+  server log /tmp/strata-ds41-quetza-8150.log (progress lines).
+
+### Rules (keep)
+- third_party/llama.cpp is gitignored/untracked: ops go in patch files under tools/v41/ggml/ (opt-in), never committed
+  there.  Mal OK'd applying the fq patch locally (2026-10-12).
+- Don't rebuild build-ds4-gpu while a script or the wrapper uses it.  GPU runs:
+  `STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- env VARS build-ds4-gpu/ds41_generate ...`.
+  After killing an engine wait for MemAvailable >= 70 GiB.  Kill by PID; never `pgrep -f` a pattern in your own cmdline.
+- Exactness references: 8192-token code prompt (eval/seq20_code.i32[:8192]) --dump-last md5 4d229102872a;
+  p256 = /home/mal/AI/v41-dev/r1ab-1237/p256.i32.  Standard flags: --backend cuda --experts gpu --engram
+  "/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram" --rank "/media/mal/SSD NVME/AI/V41-GSQ/rank.bin".
+
+### Paste-able resume prompt
+    Continue the DeepSeek-V4.1-Flash Strata engine work for Mal in ~/AI/Strata-DS4 (branch deepseek4, GitHub remote
+    `ds4` = Indras-Mirror/Strata-DSV4.1, pushing OK'd). Read docs/ds4/V41_RESUME_PROMPT.md §HANDOFF 2026-10-12 MORNING
+    fully first (then NIGHT-2). First: make sure "SSD NVME" is mounted (udisksctl mount -b /dev/nvme0n1p3, ntfs3).
+    Queue in Mal's order: (1) measure the exact quick path (STRATA_SERVE_PASS_BIAS=0, already in HEAD) vs biased passes
+    vs batch on 41/300/641-token turns over a 20K context + exactness via STRATA_SERVE_DUMP, and set the wrapper default
+    from the result; (2) export the MTP head (mtp.0-2, ~Q8_0) and the vision tower from
+    /media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8 (shards 44-46 and 1), then engine MTP draft/verify
+    (port from tools/ds4) and vision; (3) apply tools/v41/ggml/dsv41-fake-quant.patch, -DSTRATA_DSV41_FQ_OP=ON, verify
+    test_ds41_fq + md5 4d229102872a; (4) validate the stashed span-upload change. Rules: memguard for every GPU run,
+    never rebuild while the wrapper/scripts use build-ds4-gpu, measure before claiming, report ppl/KL of anything lossy,
+    soft routing only. Commit with "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>".
 
 ## HANDOFF 2026-10-12 NIGHT-2 (~00:10) - serve wrapper live, decode 25.5-26.3 tok/s (27.7 opt-in), short turns ~40 tok/s
 
