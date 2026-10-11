@@ -332,14 +332,17 @@ int main(int argc, char ** argv) {
     auto resident_now = [&](int64_t l, int64_t e) {
         return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
     };
+    // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
+    // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
+    bool bias_now = a.bias_prompt > 0 || !defer_vram;
     auto apply_bias = [&]() {
-        if (n_pruned == 0 && a.route_bias == 0.0f && a.route_bias_file == 0.0f) return;
+        if (n_pruned == 0 && (!bias_now || (a.route_bias == 0.0f && a.route_bias_file == 0.0f))) return;
         std::vector<float> rb((size_t) TG.n_experts);
         for (int64_t l = 0; l < TG.n_layers; ++l) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
-                               : (a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
+                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
         }
     };
@@ -703,6 +706,7 @@ int main(int argc, char ** argv) {
         const double ts = now_ms();
         if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         proxy_res.clear();   // the real VRAM set from here on
+        bias_now = true;     // decode: route bias + file penalty on
         apply_bias();
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      fr / 1073741824.0, g, (long long) tier.resident(), (now_ms() - ts) / 1000.0);
