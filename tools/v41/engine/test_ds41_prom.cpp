@@ -125,7 +125,8 @@ int main(int argc, char ** argv) {
     std::printf("geom: n_embd %lld n_ff %lld layers %lld experts %lld classes %zu\n", (long long) g.n_embd,
                 (long long) g.n_ff, (long long) g.n_layers, (long long) g.n_experts, g.cls_gu.size());
 
-    void * d_blob = nullptr, * d_xq = nullptr, * d_scratch = nullptr, * d_out = nullptr;
+    kernels::native_expert_prom_set_force(true);   // validate the kernels at every format/row count, not the tuned gate
+    void * d_blob = nullptr, * d_xq = nullptr, * d_scratch = nullptr, * d_out = nullptr, * d_xf = nullptr;
     std::vector<uint8_t> blob(src.blob_bytes());
     std::vector<float> x, native_out, prom_out, want;
     std::mt19937_64 rng(11);
@@ -135,7 +136,7 @@ int main(int argc, char ** argv) {
 
     for (size_t c = 0; c < g.cls_gu.size(); ++c) {
         const int gt = g.cls_gu[c], dt = g.cls_d[c];
-        if (gt != 143 && gt != 42) continue;   // this slice's tiers
+        if (gt != 143 && gt != 42 && dt != 143 && dt != 42) continue;   // this slice's tiers
         // one real (layer, expert) of this class
         int64_t l = -1, e = -1;
         for (int64_t ll = 0; ll < g.n_layers && l < 0; ++ll)
@@ -164,8 +165,30 @@ int main(int argc, char ** argv) {
             ck(cudaMalloc(&d_xq, xq_bytes), "malloc xq");
             ck(cudaMalloc(&d_scratch, kernels::native_expert_scratch_bytes(T, FF)), "malloc scratch");
             ck(cudaMalloc(&d_out, (size_t) (T * D) * sizeof(float)), "malloc out");
-            kernels::quantize_q8_1_rows(x.data(), T, D, d_xq, nullptr);
+            ck(cudaMalloc(&d_xf, (size_t) (T * D) * sizeof(float)), "malloc xf");
+            ck(cudaMemcpy(d_xf, x.data(), (size_t) (T * D) * sizeof(float), cudaMemcpyHostToDevice), "cp xf");
+            kernels::quantize_q8_1_rows((const float*) d_xf, T, D, d_xq, nullptr);   // device pointers
             ck(cudaDeviceSynchronize(), "q8 sync");
+            cudaEvent_t ev0, ev1;
+            ck(cudaEventCreate(&ev0), "ev"); ck(cudaEventCreate(&ev1), "ev");
+            float ms_nat = 1e9f, ms_prom = 1e9f;
+            for (int rep = 0; rep < 5; ++rep) {
+                kernels::native_expert_prom_set_enabled(false);
+                ck(cudaEventRecord(ev0, nullptr), "rec");
+                launch_group(L, (const uint8_t*) d_blob, d_xq, d_scratch, (float*) d_out, T, 1, nullptr);
+                ck(cudaEventRecord(ev1, nullptr), "rec");
+                ck(cudaEventSynchronize(ev1), "ev sync");
+                float ms = 0; ck(cudaEventElapsedTime(&ms, ev0, ev1), "elapsed");
+                ms_nat = std::min(ms_nat, ms);
+                kernels::native_expert_prom_set_enabled(true);
+                ck(cudaEventRecord(ev0, nullptr), "rec");
+                launch_group(L, (const uint8_t*) d_blob, d_xq, d_scratch, (float*) d_out, T, 1, nullptr);
+                ck(cudaEventRecord(ev1, nullptr), "rec");
+                ck(cudaEventSynchronize(ev1), "ev sync");
+                ck(cudaEventElapsedTime(&ms, ev0, ev1), "elapsed");
+                ms_prom = std::min(ms_prom, ms);
+            }
+            ck(cudaEventDestroy(ev0), "ev"); ck(cudaEventDestroy(ev1), "ev");
             kernels::native_expert_prom_set_enabled(false);
             launch_group(L, (const uint8_t*) d_blob, d_xq, d_scratch, (float*) d_out, T, 1, nullptr);
             native_out.assign((size_t) (T * D), 0.0f);
@@ -189,10 +212,14 @@ int main(int argc, char ** argv) {
             const double r_prom = rel(pv, want), r_natf = rel(nv, want);
             worst_f32 = std::max(worst_f32, r_prom);
             worst_nat = std::max(worst_nat, r_nat);
-            const bool ok = (r_nat < 1e-4) && (r_prom < 1.8e-2);
+            // pass: prom within the tier's tolerance of the reference, no worse than the native arm, and the two
+            // kernels agree to within float summation order (~1e-3; exact integer chain, different scale order)
+            const bool ok = (r_prom < 1.8e-2) && (r_natf < 1.8e-2) && (r_prom <= r_natf * 1.05 + 1e-5) && (r_nat < 1e-2);
             fails += !ok;
-            std::printf("  %s T %5lld  prom-vs-native %.3e | prom-vs-F32 %.3e (native-vs-F32 %.3e, %lld rows)\n",
-                        ok ? "ok  " : "FAIL", (long long) T, r_nat, r_prom, r_natf, (long long) R);
+            std::printf("  %s T %5lld  prom-vs-native %.3e | prom-vs-F32 %.3e (native-vs-F32 %.3e, %lld rows) | kernel %.3f ms vs %.3f ms = %.2fx\n",
+                        ok ? "ok  " : "FAIL", (long long) T, r_nat, r_prom, r_natf, (long long) R, ms_prom, ms_nat,
+                        ms_nat / ms_prom);
+            ck(cudaFree(d_xf), "free xf");
             ck(cudaFree(d_xq), "free xq");
             ck(cudaFree(d_scratch), "free scratch");
             ck(cudaFree(d_out), "free out");

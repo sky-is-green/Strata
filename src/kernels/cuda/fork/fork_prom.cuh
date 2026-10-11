@@ -19,6 +19,9 @@
 
 // One switch for the whole path: env STRATA_PROM=1 at first use, or native_expert_prom_set_enabled.
 bool g_prom_enabled = [] { const char* v = std::getenv("STRATA_PROM"); return v != nullptr && v[0] == '1'; }();
+// Test only (native_expert_prom_set_force): ignore the measured type/size gate below so the unit test can run the
+// kernels on both tiers at every row count.  The engine never sets it.
+bool g_prom_force = false;
 
 // Rows per block in the PROM kernels: one per warp (8 warps).  Shared per row = K int8 codes + K/32 float scales.
 constexpr int PROM_ROWS = 8;
@@ -129,11 +132,19 @@ inline void prom_check(const char* what) {
 }
 
 // Gate/up half: true when the PROM kernel was launched for this layer's format (caller runs its own SwiGLU + q8_1
-// pass either way), false to fall through to the default launch_gu.  `gy` is the caller's group-row count.
-inline bool prom_gu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr,
-                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
-                    const block_q8_1* X, float* gate, float* up) {
+// pass either way), false to fall through to the default launch_gu.  `gy` is the caller's group-row count and
+// `large_groups` says the call averages >= 64 entries per group.
+//
+// THE GATE is the measured envelope (test_ds41_prom on the real GSQ blobs, 5 launches each, min): PTQ1_0 gate/up is
+// 1.21x / 1.37x / 1.45x the native kernel at 64 / 512 / 1024 entries per group but 0.33x / 0.64x at 1 / 7 (the
+// shared-memory weight tile costs more than the per-row decode it saves when the tile is used a few times), and Q2_0
+// is 0.57-0.80x at every size (its native multi kernel already reuses the decode 4x with every lane busy, so the
+// tile's LDS traffic is a straight loss).  So: PTQ1_0 only, large groups only.
+inline bool prom_gu(const NativeExpertLayout& L, int64_t gy, bool large_groups, cudaStream_t s,
+                    const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                    const int32_t* ent_tok, const block_q8_1* X, float* gate, float* up) {
     if (!g_prom_enabled || L.up_type >= 0) return false;                                  // mixed gate/up: not covered
+    if (!g_prom_force && (L.gu_type != 143 || !large_groups)) return false;
     if ((L.gu_type != 143 && L.gu_type != 42) || (L.n_embd & 127) != 0 || !prom_fits(L.n_embd)) return false;
     const dim3 grid((unsigned) ((2 * L.n_ff + PROM_ROWS - 1) / PROM_ROWS), (unsigned) gy);
     if (L.gu_type == 143) native_prom_kernel<143, true><<<grid, 256, prom_shared(L.n_embd), s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, nullptr);
@@ -143,10 +154,12 @@ inline bool prom_gu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, con
 }
 
 // Down half: same contract, `hq` is the SwiGLU output quantized to q8_1 (per entry index).
-inline bool prom_down(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr,
-                      const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
-                      const block_q8_1* hq, float* out) {
+// Down half: as prom_gu.  PTQ1_0 down measures 1.02-1.05x the native kernel alone (Q2_0 0.9x), so the same gate.
+inline bool prom_down(const NativeExpertLayout& L, int64_t gy, bool large_groups, cudaStream_t s,
+                      const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                      const int32_t* ent_dst, const block_q8_1* hq, float* out) {
     if (!g_prom_enabled) return false;
+    if (!g_prom_force && (L.d_type != 143 || !large_groups)) return false;
     if ((L.d_type != 143 && L.d_type != 42) || (L.n_ff & 127) != 0 || !prom_fits(L.n_ff)) return false;
     const dim3 grid((unsigned) ((L.n_embd + PROM_ROWS - 1) / PROM_ROWS), (unsigned) gy);
     if (L.d_type == 143) native_prom_kernel<143, false><<<grid, 256, prom_shared(L.n_ff), s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, nullptr, nullptr, out);

@@ -99,5 +99,8 @@ bool iq_old_kernels();
 /// (STRATA_PROM=1 at first use selects it; default off).  Used by `native_expert_grouped` for those formats only.
 void native_expert_prom_set_enabled(bool enabled);
 bool native_expert_prom_enabled();
+/// Test only: ignore the measured type/size gate (PTQ1_0 and >= 64 entries per group), so a unit test can run the
+/// kernels on both tiers at every row count.  Never set by the engine.
+void native_expert_prom_set_force(bool force);
 
 }  // namespace strata::kernels

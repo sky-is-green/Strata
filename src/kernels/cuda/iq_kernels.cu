@@ -2713,6 +2713,7 @@ bool iq_old_kernels() { return g_old_kernels; }
 
 void native_expert_prom_set_enabled(bool enabled) { g_prom_enabled = enabled; }
 bool native_expert_prom_enabled() { return g_prom_enabled; }
+void native_expert_prom_set_force(bool force) { g_prom_force = force; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
@@ -3507,6 +3508,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped (v2k)");
         return;
     }
+    // PROM (fork): the window's entries per group - the measured break-even is ~64 (test_ds41_prom)
+    const bool prom_large = cap_groups > 0 && cap_entries / cap_groups >= 64;
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type)) ? 16 : GU_ROWS;
@@ -3576,7 +3579,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         else if (L.gu_type == 11 && L.up_type == 10)
             native_gu_mixed_kernel<11, 10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
         else { std::fprintf(stderr, "native_expert_grouped: gate %d / up %d\n", L.gu_type, L.up_type); std::exit(1); }
-    } else if (prom_gu(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
+    } else if (prom_gu(L, gy, prom_large, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
         // PROM prompt-batch kernel (fork slice xk-kernels); the SwiGLU + q8_1 pass below is the caller's
     } else
     switch (L.gu_type) {
@@ -3635,7 +3638,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_D_AMD
 #endif
-    if (prom_down(L, gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) {
+    if (prom_down(L, gy, prom_large, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) {
         // PROM prompt-batch kernel (fork slice xk-kernels)
     } else
     switch (L.d_type) {
