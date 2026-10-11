@@ -1,7 +1,62 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-11 ~20:15 by Claude (inline conductor, session 636553.13852289).
-**READ §HANDOFF 2026-10-11 NIGHT FIRST** (then EVENING, 13:10) - it supersedes the 07:20 handoff below where they differ.
+**Last updated:** 2026-10-12 ~00:10 by Claude (inline, overnight session).
+**READ §HANDOFF 2026-10-12 NIGHT-2 FIRST** (then 2026-10-11 NIGHT, EVENING, 13:10) - newer sections supersede older ones.
+
+## HANDOFF 2026-10-12 NIGHT-2 (~00:10) - serve wrapper live, decode 25.5-26.3 tok/s (27.7 opt-in), short turns ~40 tok/s
+
+Mal (2026-10-11 ~20:10): "set the wrapper up for our current thing, update github ..., keep working on the decode
+stuff, dont make mistakes".  All below is committed and pushed to ds4/main (HEAD after this doc).
+
+### Wrapper / --serve (DONE, installed)
+- `~/.local/bin/strata-ds41-quetza` (= tools/v41/serve/strata-ds41-quetza.wrapper; port 8150, 512K ctx, QuetzaCodetl)
+  -> serve_ds41.py (Strata's server: OpenAI + Anthropic + DSML tools; 40 shim tests pass) -> ds41-engine.sh
+  (GPU lock, 84G cap, now exports STRATA_NO_LARGEPAGES=1) -> `ds41_generate --serve`; strata-ds41.json = tuned defaults
+  + the new Engram dirs.  Checked end to end over HTTP: OpenAI chat, Anthropic tool_use + tool_result follow-up
+  (reused 302 cached tokens through the snapshot).
+- ea04b97f: per request the VRAM expert cache is closed for a long prompt (Ds41MoeTier::release_cache) and re-seeded
+  for the decode (~0.55 s); enc-skip on in serve; regenerate (same prompt) = snapshot + saved logits, no prefill;
+  serve exits with _Exit after QUIT (the detached stdin reader held cin's lock -> exit hung until the pipe closed);
+  STRATA_SERVE_DUMP=<dir> writes each request's last-row logits.
+- Exactness (512K ctx): 8192-token request md5 4d229102872a = the one-shot exact path; 256-token request byte-identical
+  to one-shot; 512 reused + 7680 new = 4d229102872a.  Misaligned reuse (256 + 7936) = cos 0.9985 (= the sub-batch
+  boundary shift; S=256 vs 512 one-shot gives 0.9991).
+- 1cf5d37d / e66471f3: turns of <= 768 new tokens (STRATA_SERVE_STEP_MAX) run on the decode side in dense passes of
+  16 (STRATA_SERVE_PASS_M; dense weights read once per pass, experts per token from the VRAM cache): 41-token turn
+  18.0 -> 1.5 s, 300 tokens 11.4 -> 7.5 s (passes of 8), 641 tokens 15.5 s vs 19.4 warm / 25.0 cold on the batch.
+  QUALITY NOTE: those prompt tokens route with the decode biases (as decode).  Last-row logits of a 256-token prompt
+  vs exact: KL 0.27 (passes) / 0.30 (steps), top-1 shifted.  STRATA_SERVE_STEP_MAX=0 = every prompt token exact.
+  Mal may want a lower threshold - his call (it trades turn latency for prompt exactness).
+
+### Decode (one-shot p256 x 256 tokens, default flags; run-to-run +-3%)
+23.82 (start) -> a966904c O_DIRECT decode miss reads (STRATA_DECODE_DIRECT=0 off) + one pinned metadata copy per
+grouped launch + one sync for attn_router's 3 readbacks: 24.46 -> 59920d80 routed sum on the card into the dense
+routed tensor (run_to_dev, decode_rows_sum in double = host loop bit for bit; STRATA_DEC_HOSTSUM=1 off): 24.73 ->
+5ed8126a NVMe-read experts DMA'd + run on the card instead of the CPU pool (STRATA_FILE_GPU=0 off): 25.5-26.3.
+All bit-identical tokens except 5ed8126a (GPU vs CPU arithmetic for those experts; DS4_CHECK_GPU covers them).
+- 3ac307db OPT-IN fused activation rounding: tools/v41/ggml/dsv41-fake-quant.patch adds GGML_OP_DSV41_FAKE_QUANT to a
+  llama.cpp tree, -DSTRATA_DSV41_FQ_OP=ON uses it (refuses an unpatched tree).  test_ds41_fq: bit-identical to the
+  composite on CUDA + CPU (6.3M values incl. edge cases); with it 8K md5 4d229102872a, tokens identical, 27.66 tok/s.
+  NOT applied to third_party/llama.cpp (untracked - see the rule below).  Mal: apply it or not?
+- Re-sweep --pcie {0.75,1.0} x --pf-b {1.43,2.0}: all within noise (24.3-25.3) -> defaults kept.
+- Tried + reverted (no gain): persistent IO pool for the file reads (spawn cost moved, total +0.016 ms/layer).
+- Profile now (~38 ms/token): dense half ~19 ms (Q8_0 mat-vecs ~8.6 ms at ~880 GB/s = bandwidth; ~14 ms GPU total),
+  tier ~16 ms (layer sync ~6 ms = expert kernels + DMAs, NVMe reads ~5 ms), finish ~2 ms, begin ~0.8 ms.
+- Prefill unchanged: 8192 tokens 221 tok/s x2 runs (md5 4d229102872a); serve at 512K: 250 tok/s.
+
+### Open questions for Mal
+1. Apply tools/v41/ggml/dsv41-fake-quant.patch to third_party/llama.cpp (+5% decode, exact)?
+2. Short-turn threshold (768) vs prompt exactness (see QUALITY NOTE).
+3. MTP drafting needs mtp.* (checkpoint shards 44-46) exported - those shards are no longer on NVME1TB (only 47/48).
+4. Bigger decode lever: dense Q8_0 -> Q6_K would cut ~1.9 GB/token (~2 ms) at some quality cost - not done (lossy).
+
+### Rules (add to the paste-able prompt)
+- third_party/llama.cpp is gitignored / untracked: never add ops there (patch files under tools/v41/ggml/, opt-in).
+- Don't rebuild build-ds4-gpu while a script is launching it (I broke a sweep that way tonight; reran it).
+- After killing an engine, wait for MemAvailable to recover before the next memguard launch (70 GiB floor).
+- GPU runs: `STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- env ... build-ds4-gpu/ds41_generate ...`;
+  serve tests: drive ds41-engine.sh over stdin (memguard backgrounds its command); kill by PID, never pkill -f.
+
 
 ## HANDOFF 2026-10-11 NIGHT (~20:15) - prefill 219-227 tok/s (8K) / 288 (16K), decode 21.1 tok/s - READ THIS FIRST
 

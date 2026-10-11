@@ -79,8 +79,21 @@ Engram: decode reads ~48 random rows per token. On the exFAT volume that held th
 ms/token (~13K random reads/s); `tools/v41/extract_engram.py` copies just the two tables (202.8 GB) to fast storage,
 and a heavily fragmented copy is read straight from the block device via FIEMAP (1 ms/token).
 
-Next for decode: the dense half (~21 ms/token, ~5,000 small kernels and ~380 host syncs per token), the expert tier's
-remaining CPU / file work, MTP drafting.
+**Decode work, 2026-10-11 night** (256-token prompt, 256 generated tokens, greedy, default flags; run-to-run ±3%)
+
+| Step | tok/s |
+| --- | ---: |
+| start of the night (the defaults above) | 23.8 |
+| experts read from NVMe with O_DIRECT; one metadata copy per expert launch (was 5); one sync for the dense half's 3 readbacks | 24.5 |
+| routed sum computed on the card straight into the dense half's tensor (no parts readback / sum upload per layer; same bits) | 24.7 |
+| experts read from NVMe computed on the card (DMA from the read buffer) instead of by the CPU pool | **25.5-26.3** |
+| opt-in: activation rounding as one ggml op (`-DSTRATA_DSV41_FQ_OP=ON` + `tools/v41/ggml/dsv41-fake-quant.patch`) | 27.7 |
+
+Every step except the GPU compute of NVMe-read experts keeps the decode tokens bit-identical; that one swaps the CPU
+pool's arithmetic for the GPU kernels the VRAM hits use (per-expert rel. error vs the CPU 2.2e-3, hits 1.3e-3).
+Where a token goes now (~38 ms): dense half ~19 ms (of which the Q8_0 mat-vecs read ~7.6 GB at ~880 GB/s - the
+card's bandwidth), expert tier ~16 ms (GPU expert kernels + PCIe DMA waits ~6 ms, NVMe reads ~5 ms), the rest
+launches and syncs. Next: MTP drafting (needs the checkpoint's `mtp.*` tensors exported), fewer graph nodes.
 
 ### What changed on 2026-10-11
 
@@ -116,7 +129,9 @@ STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_ge
      --ids-file prompt.i32 -n 128 --backend cuda --experts gpu --engram "/fast/a:/fast/b" --rank rank.bin
 ```
 
-`STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. `--ppl` /
+`STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. Optional +5% decode:
+`patch -p1 -d third_party/llama.cpp < tools/v41/ggml/dsv41-fake-quant.patch`, configure with `-DSTRATA_DSV41_FQ_OP=ON`,
+and check `build-ds4-gpu/test_ds41_fq --cuda` says bit for bit (it adds one op to ggml; the stock build does not need it). `--ppl` /
 `--dump-logits F` / `--dump-last F` for quality checks; `test_ds41_moe_gpu GGUF --layers 0,20,39 --tokens 2 --gpu
 --chunk 64` checks the expert tier against a dequantised F32 reference. Full engineering log, every measurement and
 the next steps: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
@@ -135,13 +150,16 @@ tools/v41/serve/strata-ds41-quetza.wrapper
 | Request | Path | Time |
 | --- | --- | --- |
 | 8192-token prompt | layer-major, VRAM cache closed, exact (md5 = the one-shot path) | 32.7 s (250 tok/s) |
-| new turn of 41 / 86 tokens on a cached conversation | decode steps, VRAM cache open | 1.5 / 3.4 s |
-| new turn of 513 tokens | layer-major (a short batch still streams almost every expert: ~18 s floor) | 18.6 s |
+| new turn of 41 / 86 tokens on a cached conversation | decode side, VRAM cache open | 1.5 / 3.4 s |
+| new turn of 300 / 641 tokens | decode side: dense passes (of 8 / 16 tokens), experts from the VRAM cache | 7.5 / 15.5 s (40 / 41 tok/s) |
+| the same 641 tokens as an exact prompt batch (a short batch still streams almost every expert) | layer-major | 19.4 s warm, 25 s cold |
 | the same prompt again (regenerate) | snapshot + saved logits | no prefill |
 | decode | route bias 1.0 + file penalty 0.6 | 22-26 tok/s |
 
-Turns of up to 384 new tokens (`STRATA_SERVE_STEP_MAX`) run as decode steps, with the decode biases; longer ones
-run as an exact prompt batch, after which the VRAM cache is re-seeded (~0.55 s). A conversation that extends the last
+Turns of up to 768 new tokens (`STRATA_SERVE_STEP_MAX`, measured crossover ~765) run on the decode side: passes of 16
+tokens (`STRATA_SERVE_PASS_M`) that read the ~8 GB of dense weights once per pass, with the decode biases - so those
+prompt tokens carry the same routing trade as decode (`STRATA_SERVE_STEP_MAX=0` keeps every prompt token exact).
+Longer turns run as an exact prompt batch, after which the VRAM cache is re-seeded (~0.55 s). A conversation that extends the last
 request continues from it; one whose re-rendered history differs (DeepSeek's encoder drops earlier turns' thinking)
 restores the snapshot taken at the end of the last prompt. A 512-token prefix reused + 7680 new tokens gives the same
 bytes as the fresh 8192-token prompt.
