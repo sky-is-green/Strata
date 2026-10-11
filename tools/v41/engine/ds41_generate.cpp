@@ -52,6 +52,7 @@ struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
+    float route_bias_file = 0.0f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena)
     float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed
     std::vector<std::string> engram;
     int n_predict = 64;
@@ -116,6 +117,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
+        else if (k == "--route-bias-file") a.route_bias_file = (float) std::atof(next().c_str());
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
         else if (k == "--dump-last") a.dump_last = next();
@@ -311,12 +313,13 @@ int main(int argc, char ** argv) {
     }
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     auto apply_bias = [&]() {
-        if (n_pruned == 0 && a.route_bias == 0.0f) return;
+        if (n_pruned == 0 && a.route_bias == 0.0f && a.route_bias_file == 0.0f) return;
         std::vector<float> rb((size_t) TG.n_experts);
         for (int64_t l = 0; l < TG.n_layers; ++l) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
-                               : (a.route_bias != 0.0f && !mc.cpu_only && tier.resident(l, e)) ? a.route_bias : 0.0f;
+                               : (a.route_bias != 0.0f && !mc.cpu_only && tier.resident(l, e)) ? a.route_bias
+                               : (a.route_bias_file != 0.0f && !tier.resident(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
         }
     };
