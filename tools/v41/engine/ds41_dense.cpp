@@ -333,6 +333,19 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
 
 // ================================================================== the attention graph (+ router + shared expert)
 
+// the model's activation rounding: ds41_ops.hpp's stock-op composite (~45 ops per call), or - built with
+// -DSTRATA_DSV41_FQ_OP=ON on a llama.cpp tree patched with tools/v41/ggml/dsv41-fake-quant.patch - the fused
+// GGML_OP_DSV41_FAKE_QUANT, one kernel per call (bit-identical on CUDA and CPU: test_ds41_fq; ~3,000 fewer tiny
+// kernels per decode token).  STRATA_FQ_COMPOSITE=1 in such a build: the composite.
+static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mode) {
+#if defined(STRATA_DSV41_FQ_OP)
+    static const bool composite = std::getenv("STRATA_FQ_COMPOSITE") != nullptr;
+    return composite ? ds41_fake_quant(gc, x, mode) : ggml_dsv41_fake_quant(gc, x, (int) mode);
+#else
+    return ds41_fake_quant(gc, x, mode);
+#endif
+}
+
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
@@ -381,7 +394,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
     kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
-    if (im.cfg.act_quant) kv2 = ds41_fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
+    if (im.cfg.act_quant) kv2 = fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
     ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
     ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
     ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n, col0);
@@ -424,11 +437,11 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
             // indexer keys from the UNROTATED latent (model.py Indexer.forward, owns_k)
             ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
             ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
-            if (im.cfg.act_quant) ik = ds41_fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
+            if (im.cfg.act_quant) ik = fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
             idxk_w = ggml_set_rows(gc, L.idxk, ik, cslot);
             outs.push_back(idxk_w);
             ggml_tensor * lr = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, latent, DH, 1, n), cpos, r), DH, n);
-            if (im.cfg.act_quant) lr = ds41_fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
+            if (im.cfg.act_quant) lr = fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
             comp_w = ggml_set_rows(gc, L.comp, lr, cslot);
             outs.push_back(comp_w);
         }
@@ -442,7 +455,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 // ---- indexer (model.py Indexer.forward): scores over the visible rows of the shared index keys
                 ggml_tensor * iq = ggml_mul_mat(gc, im.BL(il, "indexer.attn_q_b.weight"), qr);
                 iq = b.rope(ggml_reshape_3d(gc, iq, im.ID, im.IH, n), pos, r);
-                if (im.cfg.act_quant) iq = ds41_fake_quant(gc, ggml_cont(gc, iq), Ds41Quant::FP4_POW2_32);
+                if (im.cfg.act_quant) iq = fake_quant(gc, ggml_cont(gc, iq), Ds41Quant::FP4_POW2_32);
                 ggml_tensor * iw = ggml_mul_mat(gc, im.BL(il, "indexer.proj.weight"), xn);
                 iw = ggml_scale(gc, iw, 1.0f / std::sqrt((float) (im.ID * im.IH)));         // softmax_scale * heads^-0.5
                 ggml_tensor * ksrc = ggml_view_3d(gc, idxk, im.ID, 1, cap, idxk->nb[1], idxk->nb[1], 0);
@@ -601,7 +614,7 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
     ggml_tensor * kv = b.rms_w(ggml_mul_mat(gc, im.BL(il, "attn_kv.weight"), xn), im.BL(il, "attn_kv_a_norm.weight"));
     kv = b.rope(ggml_reshape_3d(gc, kv, DH, 1, n), pos, r);
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
-    if (im.cfg.act_quant) kv2 = ds41_fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);
+    if (im.cfg.act_quant) kv2 = fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);
     {
         const int64_t k = std::min<int64_t>(n, im.RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
@@ -637,10 +650,10 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
         ggml_tensor * cslot = b.v1(im.i_cslot[r], n, (size_t) col0 * 4);
         ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
         ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
-        if (im.cfg.act_quant) ik = ds41_fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
+        if (im.cfg.act_quant) ik = fake_quant(gc, ggml_cont(gc, ik), Ds41Quant::FP4_POW2_32);
         outs.push_back(ggml_set_rows(gc, L.idxk, ik, cslot));
         ggml_tensor * lr = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, latent, DH, 1, n), cpos, r), DH, n);
-        if (im.cfg.act_quant) lr = ds41_fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
+        if (im.cfg.act_quant) lr = fake_quant(gc, ggml_cont(gc, lr), Ds41Quant::FP4_E4M3_16);
         outs.push_back(ggml_set_rows(gc, L.comp, lr, cslot));
     }
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
