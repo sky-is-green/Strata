@@ -94,4 +94,10 @@ void native_expert_set_mode(int mode, int phase);
 void iq_set_old_kernels(bool old);
 bool iq_old_kernels();
 
+/// Strata-DS4 fork: the prompt-batch ("PROM") grouped kernels for the PTQ1_0 (143) / Q2_0 (42) expert tiers - one
+/// weight-tile decode per (row, group) in shared memory, applied to every entry of the group with int8 dp4a
+/// (STRATA_PROM=1 at first use selects it; default off).  Used by `native_expert_grouped` for those formats only.
+void native_expert_prom_set_enabled(bool enabled);
+bool native_expert_prom_enabled();
+
 }  // namespace strata::kernels

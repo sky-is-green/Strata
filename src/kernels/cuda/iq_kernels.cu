@@ -2357,6 +2357,7 @@ void s26_launch_l(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t 
     const dim3 gd((unsigned) (L.n_embd / (8 * RD)), (unsigned) cap_groups);
     s26_down_l_kernel<LX, RD, SL, TS, BD><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
+#include "fork/fork_prom.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 // ---------------------------------------------------------------- stream B: UD-Q4_K_XL grouped decode experts
 // STRATA_EXPERT_V2K=1: s26_gu_l_kernel / s26_down_l_kernel's structure (4 interleaved rows per warp, the chunk's q8_1
 // activation rows in LDS, SwiGLU + q8_1 fused, optionally STRATA_TSUM's transposed butterfly) for Q4_K / Q5_K gate/up
@@ -2709,6 +2710,9 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+
+void native_expert_prom_set_enabled(bool enabled) { g_prom_enabled = enabled; }
+bool native_expert_prom_enabled() { return g_prom_enabled; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
@@ -3572,6 +3576,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         else if (L.gu_type == 11 && L.up_type == 10)
             native_gu_mixed_kernel<11, 10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
         else { std::fprintf(stderr, "native_expert_grouped: gate %d / up %d\n", L.gu_type, L.up_type); std::exit(1); }
+    } else if (prom_gu(L, gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
+        // PROM prompt-batch kernel (fork slice xk-kernels); the SwiGLU + q8_1 pass below is the caller's
     } else
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -3629,6 +3635,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_D_AMD
 #endif
+    if (prom_down(L, gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) {
+        // PROM prompt-batch kernel (fork slice xk-kernels)
+    } else
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_D_FMTS(STRATA_DOWN)
