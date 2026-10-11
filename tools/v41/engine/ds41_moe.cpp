@@ -1420,6 +1420,16 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
 #endif
 }
 
+void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
+    if (!im_->inited || !im_->blobs || !ids || n <= 0 || layer < 0 || layer >= im_->g.n_layers || !im_->g.routed(layer)) return;
+    for (int i = 0; i < n; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= im_->g.n_experts || resident(layer, e) || in_arena(layer, e)) continue;
+        im_->blobs->advise(layer, e);
+        ++im_->st.advised;
+    }
+}
+
 void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
@@ -3232,6 +3242,7 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
     prefetched_useful += o.prefetched_useful;
     prefetch_issued += o.prefetch_issued;
     prefetch_dummy += o.prefetch_dummy;
+    advised += o.advised;
     cpu += o.cpu;
     pcie += o.pcie;
     file_tier += o.file_tier;
@@ -3364,6 +3375,14 @@ void Ds41FileBlobs::read_staged(int64_t layer, int64_t expert, uint8_t* dst, uin
         }
         at += x.bytes;
     }
+}
+
+void Ds41FileBlobs::advise(int64_t layer, int64_t expert) const {
+    if (fd_ < 0) return;
+    Span s[3];
+    spans(layer, expert, s);
+    for (const Span& x : s)
+        if (x.bytes) ::posix_fadvise(fd_, (off_t) x.off, (off_t) x.bytes, POSIX_FADV_WILLNEED);
 }
 
 size_t Ds41FileBlobs::expert_bytes(int64_t l, int64_t e) const {

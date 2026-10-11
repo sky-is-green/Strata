@@ -152,6 +152,8 @@ public:
         (void) scratch_bytes;
         read(layer, expert, dst);
     }
+    /// Hint that `expert` of `layer` will be read soon (asynchronous kernel readahead into the page cache).  Default: no-op.
+    virtual void advise(int64_t layer, int64_t expert) const { (void) layer; (void) expert; }
     /// Bytes one `read_staged` scratch bounce must have.  0 = `read_staged` ignores it.
     virtual size_t read_staged_scratch() const { return 0; }
 };
@@ -219,6 +221,7 @@ public:
     void read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const override;
     void read_staged(int64_t layer, int64_t expert, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const override;
     size_t read_staged_scratch() const override { return scratch_; }
+    void advise(int64_t layer, int64_t expert) const override;
     const Ds41MoeGeom& geom() const { return g_; }
     /// bytes of expert e of layer l (its class's blob)
     size_t expert_bytes(int64_t l, int64_t e) const;
@@ -322,6 +325,7 @@ struct Ds41MoeStats {
     int64_t prefetched_useful = 0;  ///< routed misses whose blob the prefetch had already staged
     int64_t prefetch_issued = 0;    ///< DMAs the prefetch started (useful or not)
     int64_t prefetch_dummy = 0;     ///< guesses outside the arena (the DMA happens; the bytes are zeros)
+    int64_t advised = 0;            ///< file-tier experts hinted for readahead (advise_file)
     int64_t cpu = 0;                ///< computed by the CPU pool
     int64_t pcie = 0;               ///< misses DMA'd to the GPU and computed there
     int64_t file_tier = 0;          ///< reads served by the blob source instead of the arena
@@ -385,6 +389,10 @@ public:
     /// work; `run(layer, ...)` consumes what it staged and clears the staging.  No-op in `cpu_only` and when
     /// `pf_b <= 0`.  `n` may be smaller than the caller's list; never larger than kPredW.
     void prefetch(int64_t layer, const int32_t* top16, int n = Ds41MoeConfig::kPredW);
+    /// Decode file-tier readahead: for the predicted experts of `layer` that are neither VRAM-resident nor in the RAM
+    /// arena, ask the kernel to read their bytes into the page cache now (posix_fadvise WILLNEED), so the tier's
+    /// buffered read later is a page-cache copy.  The SSD is otherwise idle in decode, so a wrong guess costs ~nothing.
+    void advise_file(int64_t layer, const int32_t* ids, int n);
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
     bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);

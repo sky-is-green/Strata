@@ -53,6 +53,8 @@ struct Args {
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
     float route_bias_file = 0.0f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena)
+    int   bias_prompt = 0;          // --bias-prompt N: quality proxy - apply route bias during the prompt, treating the first N
+                                    // ranked experts as VRAM-resident (what the deferred seed will cache)
     float route_bias = 0.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed
     std::vector<std::string> engram;
     int n_predict = 64;
@@ -117,6 +119,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
         else if (k == "--route-bias") a.route_bias = (float) std::atof(next().c_str());
+        else if (k == "--bias-prompt") a.bias_prompt = std::atoi(next().c_str());
         else if (k == "--route-bias-file") a.route_bias_file = (float) std::atof(next().c_str());
         else if (k == "--quiet") a.quiet = true;
         else if (k == "--dump-logits") a.dump_logits = next();
@@ -312,14 +315,27 @@ int main(int argc, char ** argv) {
                      (now_ms() - t0) / 1000.0);
     }
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
+    std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
+    if (a.bias_prompt > 0) {
+        proxy_res.assign((size_t) (TG.n_layers * TG.n_experts), 0);
+        int got = 0;
+        for (const auto & le : ranked) {
+            if (got >= a.bias_prompt) break;
+            char & r = proxy_res[(size_t) ((int64_t) le.first * TG.n_experts + le.second)];
+            if (!r) { r = 1; ++got; }
+        }
+    }
+    auto resident_now = [&](int64_t l, int64_t e) {
+        return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+    };
     auto apply_bias = [&]() {
         if (n_pruned == 0 && a.route_bias == 0.0f && a.route_bias_file == 0.0f) return;
         std::vector<float> rb((size_t) TG.n_experts);
         for (int64_t l = 0; l < TG.n_layers; ++l) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
-                               : (a.route_bias != 0.0f && !mc.cpu_only && tier.resident(l, e)) ? a.route_bias
-                               : (a.route_bias_file != 0.0f && !tier.resident(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
+                               : (a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
         }
     };
@@ -331,10 +347,24 @@ int main(int argc, char ** argv) {
     std::vector<int> ids1((size_t) top_k);
     std::vector<float> w1((size_t) top_k), routed1((size_t) n_embd), logits1((size_t) nv);
     std::string ferr;
+    // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
+    static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
+    // STRATA_ADVISE_AHEAD=k (0 = off): at layer l, predict layer l+k's routing from the current state and hint its
+    // top STRATA_ADVISE_TOP (8) file-tier experts to the kernel (page-cache readahead; the SSD is idle in decode)
+    const int advise_ahead = std::getenv("STRATA_ADVISE_AHEAD") ? std::atoi(std::getenv("STRATA_ADVISE_AHEAD")) : 0;
+    const int advise_top = std::getenv("STRATA_ADVISE_TOP") ? std::atoi(std::getenv("STRATA_ADVISE_TOP")) : 8;
+    double dp[5] = {0, 0, 0, 0, 0};
+    long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
+        double ta = dprof ? now_ms() : 0;
         if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
+        if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
         for (int l = 0; l < n_layer; ++l) {
+            if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
+                int ta[16];
+                if (dense.predict(l + advise_ahead, ta, 16)) tier.advise_file(l + advise_ahead, ta, advise_top);
+            }
             if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
                 int t16[16];
                 if (dense.predict(l, t16, 16)) {
@@ -342,11 +372,18 @@ int main(int argc, char ** argv) {
                     tier.prefetch(l, top16, 16);
                 }
             }
+            if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
             const float * fn = nullptr;
             if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
+            if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (!tier.run(l, ids1.data(), w1.data(), fn, routed1.data())) { ferr = "tier.run failed"; return false; }
+            if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
             if (!dense.finish(l, routed1.data())) { ferr = dense.last_error(); return false; }
+            if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
         }
+        if (dprof && ++dp_n % 64 == 0)
+            std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f (%ld steps)\n",
+                         dp[0] / dp_n, dp[1] / dp_n, dp[2] / dp_n, dp[3] / dp_n, dp[4] / dp_n, dp_n);
         return true;
     };
     const int NP = std::max(1, a.prefill_chunk);
@@ -650,6 +687,7 @@ int main(int argc, char ** argv) {
         tier.set_slot_gib(a.slots > 0 ? 0.0 : g);
         const double ts = now_ms();
         if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+        proxy_res.clear();   // the real VRAM set from here on
         apply_bias();
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      fr / 1073741824.0, g, (long long) tier.resident(), (now_ms() - ts) / 1000.0);
