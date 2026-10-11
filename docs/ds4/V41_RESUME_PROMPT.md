@@ -1,7 +1,41 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-12 ~06:30 by Claude (session paused: Claude weekly token limit close).
-**READ §HANDOFF 2026-10-12 MORNING FIRST**, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**READ §UPDATE 2026-10-12 ~08:00 FIRST**, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## UPDATE 2026-10-12 ~08:00 (supersedes MORNING where they differ) - READ FIRST
+
+Done since MORNING (all pushed, HEAD = 76d69d95 + this doc):
+- 9356d8e6 server text log (/tmp/strata-ds41-text.log, STRATA_TEXT_LOG) + api_monitor (/api-monitor) - NOT yet seen on
+  a live wrapper run.  tools/v41/serve/drive_engine.py = serve-protocol driver (survives /tmp wipes now).
+- 3e8a7479 **fresh 20K prompt VRAM OOM FIXED** (was hitting all modes: prestage region left only 1.5 GiB for the dense
+  pass buffer = 2.3 GB at 20K).  Prestage reserve 3 GiB (STRATA_PRESTAGE_KEEP_GIB) + Ds41Dense::set_oom_hook ->
+  Ds41MoeTier::release_prestage + retry.  Fresh 20K: 266-269 tok/s.
+- **Exact quick path verdict** (~/AI/v41-dev/xq, 20K ctx; turns 41 / 300 / 641 tokens): exact passes 6.9 / 48.1 / 86.2 s
+  (KL vs batch 0.013 / 0.012 / 0.0002), biased passes 1.1 / 6.4 / 11.3 s (KL 0.15 / 0.10 / 0.009), batch 18.0 / 18.5 /
+  18.7 s.  Exact passes ~6-7 tok/s (exact routing misses the VRAM cache) -> win only < ~110 tokens.
+  **Wrapper default now (ds41-engine.sh): STRATA_SERVE_STEP_MAX=96 + STRATA_SERVE_PASS_BIAS=0** = every prompt token
+  exact; biased quick path opt-in `STRATA_SERVE_STEP_MAX=768 STRATA_SERVE_PASS_BIAS=1`.  Mal still wants a FAST quick
+  path that does not skew results - open problem (ideas: exact routing but smarter miss handling for passes - the
+  misses are what cost; run misses via run_chunk-style grouped streaming per pass; or larger passes).
+- 76d69d95 README rewritten: "Results" first-run vs now + serving table; step-by-step history moved to
+  docs/ds4/V41_PROGRESS.md (Mal: README = what we achieved, docs = progression).
+- Duplicate MTP shards on NVME1TB deleted (cmp-identical to Crucial's; Mal OK'd).  Crucial1TB/models/...-FP8 has 46/48
+  shards incl. 1 (vision) and 44-46 (MTP).  Engram runtime tables: L1 on SSD NVME/AI/V41-Engram, L14 on
+  Crucial1TB/V41-Engram (extracted, fast); shards 47/48 on NVME1TB are only the source.
+
+RUNNING at hand-off (background): **arena size test** ~/AI/v41-dev/arena/run.sh -> results.txt (one line per run:
+tier line, decode tok/s + file reads, peak system RAM GB) for --arena-gib 60, 62, 65, 60 (p256 x 256 one-shot).  Mal:
+total RAM ~77 or ~80 GB is OK only if measurably better (wants ~10 GB left for the desktop/Firefox; pinned memory
+cannot be reclaimed).  If 62/65 help clearly: set "--arena-gib" in tools/v41/serve/strata-ds41.json (engine default 60)
+and the memguard cap (ds41-engine.sh MemoryMax=84G may need 86-88G).  Mal is considering 128 GB RAM (replace the 16 GB
+stick + add 64 GB); my estimate: decode ~28-30 tok/s at today's biases (NVMe misses -> RAM) or same speed with a lower
+file penalty; prefill ~unchanged.  Caution: known bad byte lane @56.6 GB (memory note ram-fault-2026-09-18), 4x mixed
+DIMMs may downclock.
+
+Queue now: (a) read arena results, decide arena; (b) MTP head export Q8_0 + engine draft/verify; (c) vision export +
+engine/shim; (d) fq patch apply (Mal OK'd) + verify; (e) stashed span-upload change validate; (f) a fast exact quick
+path idea; (g) watch the text log on Mal's next session (poem request thought 6,590 tokens - loop or long thinking?).
 
 ## HANDOFF 2026-10-12 MORNING (~06:30) - wrapper tested by Mal, queue: exact quick path, MTP + vision export, fq patch
 
@@ -34,7 +68,9 @@ the snapshot at the end of the last prompt) - expected, costs ~reply length.
 - Full FP8 checkpoint (46 of 48 shards) on **/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/** incl.
   shard 1 (vision.* 259 tensors) and shards 44-46 (mtp.* 2401 tensors, ~7.9 GB, `.ok` markers).  index json there too.
 - I mistakenly re-downloaded shards 44-46 into /media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8/ (duplicates,
-  7.9 GB; ask Mal before deleting).  Engram shards 47/48 also live on NVME1TB.
+  deleted 2026-10-12 with Mal's OK).  Engram: the engine reads the EXTRACTED tables - layer 1 on
+  /media/mal/SSD NVME/AI/V41-Engram, layer 14 on /media/Crucial1TB/V41-Engram (fast ntfs3 drives, raw block reads);
+  the original checkpoint shards 47/48 on NVME1TB (exFAT, slow) are only the source, unused at runtime.
 - mtp.N.* names: attn, attn_norm, ffn (experts!), ffn_norm, hc_attn_*, hc_ffn_*, main_norm, main_proj, ... (DSpark /
   V4.1 MTP = 3 layers).  The GSQ GGUF writer = tools/v41/ (v41_gguf.py / quant pipeline, see §Export pipeline below);
   mtp.* and vision.* were simply never in the export plan ("mtp.* not exported yet").
