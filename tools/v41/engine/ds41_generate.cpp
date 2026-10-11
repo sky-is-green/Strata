@@ -52,7 +52,8 @@ struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
-    float route_bias_file = 0.0f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena)
+    float route_bias_file = 0.6f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
+                                     // DEFAULT 0.6 (Mal: max decode w/o too much loss): 21.1 vs 15.1 tok/s, code ppl 2.67->2.87, agentic 6.88->6.39
     int   bias_prompt = 0;          // --bias-prompt N: quality proxy - apply route bias during the prompt, treating the first N
                                     // ranked experts as VRAM-resident (what the deferred seed will cache)
     float route_bias = 1.0f;      // --route-bias X: selection bonus +X on the experts resident in VRAM at the seed (DEFAULT 1.0, Mal 2026-10-11:
@@ -352,6 +353,8 @@ int main(int argc, char ** argv) {
     std::string ferr;
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
     static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
+    // decode: finish(l) and predict(l+1) as one graph (identical results; STRATA_NO_FUSE_PREDICT=1 = separate graphs)
+    static const bool fuse_predict = std::getenv("STRATA_NO_FUSE_PREDICT") == nullptr;
     // STRATA_ADVISE_AHEAD=k (0 = off): at layer l, predict layer l+k's routing from the current state and hint its
     // top STRATA_ADVISE_TOP (8) file-tier experts to the kernel (page-cache readahead; the SSD is idle in decode)
     const int advise_ahead = std::getenv("STRATA_ADVISE_AHEAD") ? std::atoi(std::getenv("STRATA_ADVISE_AHEAD")) : 0;
@@ -363,6 +366,7 @@ int main(int argc, char ** argv) {
         if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
         if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
+        bool have_pred = false;
         for (int l = 0; l < n_layer; ++l) {
             if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
                 int ta[16];
@@ -370,10 +374,13 @@ int main(int argc, char ** argv) {
             }
             if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
                 int t16[16];
-                if (dense.predict(l, t16, 16)) {
+                if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
+                    tier.prefetch(l, top16, 16);
+                } else if (dense.predict(l, t16, 16)) {
                     for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                     tier.prefetch(l, top16, 16);
                 }
+                have_pred = false;
             }
             if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
             const float * fn = nullptr;
@@ -381,7 +388,12 @@ int main(int argc, char ** argv) {
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (!tier.run(l, ids1.data(), w1.data(), fn, routed1.data())) { ferr = "tier.run failed"; return false; }
             if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
-            if (!dense.finish(l, routed1.data())) { ferr = dense.last_error(); return false; }
+            if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer) {
+                int t16[16];
+                if (!dense.finish_predict(l, routed1.data(), l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
+                for (int i = 0; i < 16; ++i) top16[i] = t16[i];
+                have_pred = true;
+            } else if (!dense.finish(l, routed1.data())) { ferr = dense.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
         }
         if (dprof && ++dp_n % 64 == 0)

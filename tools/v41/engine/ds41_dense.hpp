@@ -115,6 +115,10 @@ public:
     bool predict(int il, int * top_ids, int n_top);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
     bool finish(int il, const float * routed_sum);
+    /// Decode (n == 1) fusion: finish(il) and predict(next_il) in ONE cached graph - the router prediction for the next
+    /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
+    /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
+    bool finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top);
     /// Logits of rows row0..row0+nrows-1 of the pass after the last layer's finish: nrows * n_vocab floats.
     bool logits(int row0, int nrows, float * out);
     /// Conversation reuse: every cache is position-indexed except the window ring and the ratio-2 compressor state

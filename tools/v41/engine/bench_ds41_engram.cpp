@@ -116,7 +116,9 @@ static void run_module(const std::string & gguf, const std::string & dir, const 
     std::string e = ds41_read_geometry(m, G);
     if (!e.empty()) { std::fprintf(stderr, "bench: geometry: %s\n", e.c_str()); std::exit(1); }
     Ds41Engram eng;
-    if (!eng.open(G, { dir }, threads, e)) { std::fprintf(stderr, "bench: engram open: %s\n", e.c_str()); std::exit(1); }
+    std::vector<std::string> dirs;   // ':'-separated, as ds41_generate --engram
+    for (size_t a = 0, b; a <= dir.size(); a = b + 1) { b = dir.find(':', a); if (b == std::string::npos) b = dir.size(); if (b > a) dirs.push_back(dir.substr(a, b - a)); }
+    if (!eng.open(G, dirs, threads, e)) { std::fprintf(stderr, "bench: engram open: %s\n", e.c_str()); std::exit(1); }
     std::printf("engram: layers=%zu heads=%" PRId64 " dim=%" PRId64 " ngram=%" PRId64 " cols=%" PRId64 " rows=[",
                 G.engram_layers.size(), G.engram_heads, G.engram_dim, G.engram_ngram, eng.n_cols());
     for (size_t i = 0; i < G.engram_rows.size(); ++i) std::printf("%s%" PRId64, i ? "," : "", G.engram_rows[i]);

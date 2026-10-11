@@ -28,6 +28,7 @@ namespace strata::v41 {
 
 class Ds41Engram {
 public:
+    struct RawMap;   ///< a fragmented table file read straight from its block device (see ds41_engram.cpp)
     ~Ds41Engram();
     /// dirs: where the shards are (the index json is looked up in each, the shard files too).
     bool open(const Ds41Geometry & g, const std::vector<std::string> & dirs, int threads, std::string & err);
@@ -60,7 +61,8 @@ public:
     uint64_t cache_misses() const { return cache_miss_; }
 
 private:
-    struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0; };
+    struct Table { int fd_w = -1, fd_s = -1; uint64_t off_w = 0, off_s = 0; int64_t rows = 0;
+                   std::shared_ptr<RawMap> rm_w, rm_s; };
     struct ReadGroup;               // one coalesced pread (defined in the .cpp)
     const Ds41Geometry * g_ = nullptr;
     std::vector<Table> tables_;

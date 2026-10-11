@@ -199,6 +199,7 @@ struct Ds41Dense::Impl {
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
+    std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
 
     ~Impl() {
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -672,6 +673,27 @@ static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64
     ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
                                         b.cols3(im.comb_f, HC, HC, n, col0));
     ggml_build_forward_expand(gf, ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
+    return gf;
+}
+
+// finish (n = 1) + the next layer's routing prediction on the state it writes (build_predict's ops on the cpy result)
+static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * gc, int next_il, ggml_tensor ** pout) {
+    B b { &im, gc, &im.g };
+    ggml_cgraph * gf = ggml_new_graph_custom(gc, 128, false);
+    const int64_t D = im.D, HC = im.HC;
+    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, 1, 0), b.cols2(im.routed, D, 1, 0));
+    ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, 1, 0), b.cols2(im.post_f, HC, 1, 0),
+                                        b.cols3(im.comb_f, HC, HC, 1, 0));
+    ggml_tensor * st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, 1, 0));
+    ggml_build_forward_expand(gf, st);
+    ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, 1));
+    ggml_tensor * rl = ggml_mul_mat(gc, im.BL(next_il, "ffn_gate_inp.weight"), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
+    ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
+    ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
+                                ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1));
+    *pout = ggml_argsort_top_k(gc, sc, 16);
+    ggml_set_output(*pout);
+    ggml_build_forward_expand(gf, *pout);
     return gf;
 }
 
@@ -1224,6 +1246,26 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     const bool ok = im.compute(gf, cached);
     if (gc) ggml_free(gc);
     return ok;
+}
+
+bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
+    Impl & im = *p_;
+    (void) il;
+    if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
+    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
+    const Impl::GKey key { next_il, 5, 0, 1 };
+    auto it = im.graphs.find(key);
+    if (it == im.graphs.end()) {
+        ggml_tensor * o = nullptr;
+        ggml_cgraph * gf = build_finish_predict(im, im.gctx, next_il, &o);
+        it = im.graphs.emplace(key, gf).first;
+        im.fpredict_out[next_il] = o;
+    }
+    if (!im.compute(it->second, true)) return false;
+    int32_t buf[16];
+    ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
+    for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
+    return true;
 }
 
 bool Ds41Dense::logits(int row0, int nrows, float * out) {

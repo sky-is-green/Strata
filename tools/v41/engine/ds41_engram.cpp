@@ -1,7 +1,14 @@
 // tools/v41/engine/ds41_engram.cpp - see ds41_engram.hpp.
 #include "ds41_engram.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <random>
+#include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -75,6 +82,95 @@ float fp8_e4m3(uint8_t b) {
 
 }  // namespace
 
+// ---- raw block-device reads for a fragmented table file ----------------------------------------------------------
+// ntfs3 serves random reads into a heavily fragmented file badly (measured: a 101 GB table in 62,112 extents, written
+// onto a 99%-full NVMe, 9K random 4 KiB reads/s vs 304K/s for a 1,226-extent file on the same partition).  When a
+// table file has many extents (STRATA_ENGRAM_RAWDEV: auto = >= 1024 extents, 1 = always, 0 = never) its extent map is
+// taken once with FIEMAP and rows are pread straight from the partition's block device (read-only; needs read access
+// to the device, e.g. the `disk` group).  256 random spans are compared against the filesystem read at open - any
+// mismatch turns it off.
+struct Ds41Engram::RawMap {
+    int dev = -1;
+    std::vector<uint64_t> log, phys, len;
+    ~RawMap() { if (dev >= 0) ::close(dev); }
+    ssize_t read(void * buf, size_t n, uint64_t off) const {
+        size_t done = 0;
+        while (done < n) {
+            const uint64_t o = off + done;
+            auto it = std::upper_bound(log.begin(), log.end(), o);
+            if (it == log.begin()) return -1;
+            const size_t i = (size_t) (it - log.begin()) - 1;
+            if (o >= log[i] + len[i]) return -1;
+            const size_t k = (size_t) std::min<uint64_t>(n - done, log[i] + len[i] - o);
+            const ssize_t r = ::pread(dev, (uint8_t *) buf + done, k, (off_t) (phys[i] + (o - log[i])));
+            if (r <= 0) return -1;
+            done += (size_t) r;
+        }
+        return (ssize_t) done;
+    }
+};
+
+static std::shared_ptr<Ds41Engram::RawMap> raw_map(const std::string & path, int fd) {
+    const char * env = std::getenv("STRATA_ENGRAM_RAWDEV");
+    if (env && env[0] == '0') return nullptr;
+    auto m = std::make_shared<Ds41Engram::RawMap>();
+    const size_t NX = 512;
+    std::vector<uint8_t> mem(sizeof(fiemap) + NX * sizeof(fiemap_extent));
+    uint64_t cur = 0;
+    for (;;) {
+        std::fill(mem.begin(), mem.end(), 0);
+        fiemap * fm = (fiemap *) mem.data();
+        fm->fm_start = cur;
+        fm->fm_length = ~0ull - cur;
+        fm->fm_extent_count = NX;
+        if (::ioctl(fd, FS_IOC_FIEMAP, fm) != 0 || fm->fm_mapped_extents == 0) break;
+        bool last = false;
+        for (uint32_t i = 0; i < fm->fm_mapped_extents; ++i) {
+            const fiemap_extent & e = fm->fm_extents[i];
+            if (e.fe_flags & (FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_ENCODED | FIEMAP_EXTENT_DATA_INLINE |
+                              FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_DATA_ENCRYPTED |
+                              FIEMAP_EXTENT_UNWRITTEN))
+                return nullptr;
+            m->log.push_back(e.fe_logical); m->phys.push_back(e.fe_physical); m->len.push_back(e.fe_length);
+            cur = e.fe_logical + e.fe_length;
+            if (e.fe_flags & FIEMAP_EXTENT_LAST) last = true;
+        }
+        if (last) break;
+    }
+    const bool force = env && env[0] == '1';
+    if (m->log.empty() || (!force && m->log.size() < 1024)) return nullptr;
+    struct stat st;
+    if (::fstat(fd, &st) != 0) return nullptr;
+    char sys[96];
+    std::snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u/uevent", major(st.st_dev), minor(st.st_dev));
+    std::ifstream ue(sys);
+    std::string line, devname;
+    while (std::getline(ue, line)) if (line.rfind("DEVNAME=", 0) == 0) devname = line.substr(8);
+    if (devname.empty()) return nullptr;
+    m->dev = ::open(("/dev/" + devname).c_str(), O_RDONLY | O_CLOEXEC);
+    if (m->dev < 0) { std::fprintf(stderr, "engram: %s: %zu extents, /dev/%s not readable - filesystem reads\n",
+                                   path.c_str(), m->log.size(), devname.c_str()); return nullptr; }
+    std::mt19937_64 rng(7);
+    uint8_t a[4096], b[4096];
+    const uint64_t size = (uint64_t) st.st_size;
+    for (int k = 0; k < 256; ++k) {
+        const uint64_t o = (rng() % (size > 4096 ? size - 4096 : 1)) & ~(uint64_t) 255;
+        if (::pread(fd, a, sizeof a, (off_t) o) != (ssize_t) sizeof a || m->read(b, sizeof b, o) != (ssize_t) sizeof b ||
+            std::memcmp(a, b, sizeof a) != 0) {
+            std::fprintf(stderr, "engram: %s: raw device check FAILED at %llu - filesystem reads\n", path.c_str(),
+                         (unsigned long long) o);
+            return nullptr;
+        }
+    }
+    std::fprintf(stderr, "engram: %s: %zu extents -> raw reads via /dev/%s (256 spans verified)\n", path.c_str(),
+                 m->log.size(), devname.c_str());
+    return m;
+}
+
+static inline ssize_t tread(int fd, const std::shared_ptr<Ds41Engram::RawMap> & m, void * buf, size_t n, uint64_t off) {
+    return m ? m->read(buf, n, off) : ::pread(fd, buf, n, (off_t) off);
+}
+
 Ds41Engram::~Ds41Engram() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -131,6 +227,7 @@ bool Ds41Engram::open(const Ds41Geometry & g, const std::vector<std::string> & d
             ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
             (k ? t.fd_s : t.fd_w) = fd;
             (k ? t.off_s : t.off_w) = off;
+            (k ? t.rm_s : t.rm_w) = raw_map(path, fd);
             t.rows = rows;
         }
         tables_.push_back(t);
@@ -328,8 +425,8 @@ std::shared_ptr<Ds41Engram::Batch> Ds41Engram::start(int64_t pos0, int n, std::v
                 const ReadGroup & G = bp->groups[(size_t) g];
                 const Table & T = tables_[(size_t) G.e];
                 if (G.len_w > sizeof bw || G.len_s > sizeof bs ||
-                    ::pread(T.fd_w, bw, G.len_w, (off_t) G.off_w) != (ssize_t) G.len_w ||
-                    ::pread(T.fd_s, bs, G.len_s, (off_t) G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
+                    tread(T.fd_w, T.rm_w, bw, G.len_w, G.off_w) != (ssize_t) G.len_w ||
+                    tread(T.fd_s, T.rm_s, bs, G.len_s, G.off_s) != (ssize_t) G.len_s) { bp->bad.fetch_add(1); continue; }
                 bp->bytes.fetch_add((uint64_t) G.len_w + G.len_s);
                 const auto & uq = bp->uniq[(size_t) G.e];
                 const auto & pk = bp->packed[(size_t) G.e];
