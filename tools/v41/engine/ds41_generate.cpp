@@ -303,24 +303,33 @@ int main(int argc, char ** argv) {
     std::vector<float> cw((size_t) NP * top_k), crouted((size_t) NP * n_embd), clog;
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
     std::vector<float> last_logits((size_t) nv);
+    double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0, m = 0; c0 < n; c0 += m) {
             m = std::min(NP, n - c0);
+            double t0 = now_ms();
             if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
             for (int l = 0; l < n_layer; ++l) {
                 const float * fn = nullptr;
                 if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
+                const double t1 = now_ms();
+                fd_dense += t1 - t0;
                 const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
                                        : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
                 if (!ok) { ferr = "tier run refused"; return false; }
+                t0 = now_ms();
+                fd_tier += t0 - t1;
                 if (!dense.finish(l, crouted.data())) { ferr = dense.last_error(); return false; }
             }
+            fd_dense += now_ms() - t0;
+            const double tl = now_ms();
             if (all_logits) {
                 all_logits->resize((size_t) (c0 + m) * (size_t) nv);
                 if (!dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
                 if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
             } else if (c0 + m == n && !dense.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+            fd_logits += now_ms() - tl;
             progress(c0 + m);
         }
         tier.release_chunk();
@@ -490,6 +499,8 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "\nprompt: %zu tokens in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / %lld pcie / %lld file)\n",
                  prompt.size(), prompt_ms / 1000.0, 1000.0 * prompt.size() / prompt_ms, (long long) pst.hits,
                  (long long) pst.cpu, (long long) pst.pcie, (long long) pst.file_tier);
+    std::fprintf(stderr, "prompt split: dense %.1f s, experts %.1f s (file wait %.1f s), logits %.1f s\n", fd_dense / 1000.0,
+                 fd_tier / 1000.0, pst.file_ms / 1000.0, fd_logits / 1000.0);
     if (a.ppl) {
         double nll = 0;
         int n = 0, top1 = 0;
