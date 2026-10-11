@@ -5,7 +5,7 @@
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
-//                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--chunk-mmq] [--ctx N]
+//                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--serve] [--quiet]
 //
 // --serve speaks Strata's engine line protocol (~/AI/Strata/serve/server.py StrataEngine, as glm_generate):
@@ -55,7 +55,7 @@ struct Args {
     std::string backend = "cuda", experts = "gpu";
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
     double vram_margin_gib = 1.0, pcie = 0.25, arena_gib = 60.0, pf_b = 0.0;
-    int threads = 0, prefill_chunk = 0;
+    int threads = 0, prefill_chunk = 0, prompt_batch = 8192;   // prompt_batch: layer-major batch B (0 = the chunk path)
     int64_t ctx = 0;
     float temp = 0.0f;
     uint64_t seed = 1;
@@ -93,6 +93,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
+        else if (k == "--prompt-batch") a.prompt_batch = std::atoi(next().c_str());
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());
         else if (k == "--skip-file") a.skip_file = (float) std::atof(next().c_str());
@@ -181,7 +182,13 @@ int main(int argc, char ** argv) {
     dc.backend = be;
     dc.n_threads = a.threads > 0 ? a.threads : 8;
     dc.ctx_max = ctx;
-    dc.max_pass = std::max(1, a.prefill_chunk);
+    // the layer-major batch B: --prompt-batch, capped to the prompt length for a one-shot run (the state tensors hold
+    // B columns, so a short prompt must not pay for the flag's full size; --serve sizes for the largest request)
+    const int PB = a.prompt_batch > 0 ? (a.serve ? a.prompt_batch : (int) std::min<int64_t>(a.prompt_batch, (int64_t) prompt.size())) : 0;
+    // the dense sub-batch size S: --prefill-chunk, or 512 with a layer-major prompt batch and no chunk size given
+    const int S = a.prefill_chunk > 0 ? a.prefill_chunk : (a.prompt_batch > 0 ? 512 : 1);
+    dc.max_pass = S;
+    dc.prompt_batch = PB;
     dc.engram_dirs = a.engram;
     dc.act_quant = a.act_quant;
     Ds41Dense dense;
@@ -242,7 +249,7 @@ int main(int argc, char ** argv) {
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
     // one-shot runs defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the
     // cache opens into it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots
-    const bool defer_vram = !mc.cpu_only && !a.serve && a.prefill_chunk > 1;
+    const bool defer_vram = !mc.cpu_only && !a.serve && (a.prefill_chunk > 1 || a.prompt_batch > 1);
     std::vector<std::pair<int32_t, int32_t>> ranked;
     if (!mc.cpu_only) {
         if (!a.rank.empty()) {
@@ -299,38 +306,87 @@ int main(int argc, char ** argv) {
         return true;
     };
     const int NP = std::max(1, a.prefill_chunk);
+    const int SB = std::max(1, S);                 // the dense sub-batch size
     std::vector<int> cids((size_t) NP * top_k);
     std::vector<float> cw((size_t) NP * top_k), crouted((size_t) NP * n_embd), clog;
+    std::vector<float> brouted;                    // the layer-major path's routed sums (n_embd * B)
+    if (PB > 0) brouted.resize((size_t) n_embd * (size_t) PB);
+    // a single run_chunk call streams layer l's experts once for its n tokens; the card's chunk buffers (dominated by
+    // c_parts = n * top_k * n_embd * 4) must fit ~1 GiB, so a larger batch is run in pieces (each streams once again)
+    const int piece = (int) std::max<int64_t>(1, (int64_t) 1.0e9 / std::max<int64_t>(1, (int64_t) n_embd * 4 * (top_k + 3)));
     // the prompt ids[0, n) at positions pos0..: last_logits = the last row; all_logits (if given) every row
     std::vector<float> last_logits((size_t) nv);
     double fd_dense = 0, fd_tier = 0, fd_logits = 0;   // prompt wall split (printed with the prompt line)
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
-        for (int c0 = 0, m = 0; c0 < n; c0 += m) {
-            m = std::min(NP, n - c0);
-            double t0 = now_ms();
-            if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
-            for (int l = 0; l < n_layer; ++l) {
-                const float * fn = nullptr;
-                if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
-                const double t1 = now_ms();
-                fd_dense += t1 - t0;
-                const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
-                                       : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
-                if (!ok) { ferr = "tier run refused"; return false; }
-                t0 = now_ms();
-                fd_tier += t0 - t1;
-                if (!dense.finish(l, crouted.data())) { ferr = dense.last_error(); return false; }
+        for (int c0 = 0; c0 < n; ) {
+            if (PB > 1 && n - c0 >= 2) {
+                // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
+                const int B = std::min(PB, n - c0);
+                double t0 = now_ms();
+                if (!dense.begin_batch(ids + c0, B, pos0 + c0)) { ferr = dense.last_error(); return false; }
+                for (int l = 0; l < n_layer; ++l) {
+                    for (int s = 0; s < B; s += SB) {   // sub-batches in order: the layer's KV state advances as today
+                        const int sn = std::min(SB, B - s);
+                        if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                    }
+                    const double t1 = now_ms();
+                    fd_dense += t1 - t0;
+                    for (int s = 0; s < B; s += piece) {   // the experts for all B rows (in pieces if the buffers cap)
+                        const int pn = std::min(piece, B - s);
+                        if (!tier.run_chunk(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                                            dense.batch_wts() + (size_t) s * top_k,
+                                            dense.batch_fn() + (size_t) s * n_embd,
+                                            brouted.data() + (size_t) s * n_embd)) { ferr = "tier run refused"; return false; }
+                    }
+                    t0 = now_ms();
+                    fd_tier += t0 - t1;
+                    if (!dense.upload_routed(brouted.data(), B)) { ferr = dense.last_error(); return false; }
+                    for (int s = 0; s < B; s += SB) {
+                        const int sn = std::min(SB, B - s);
+                        if (!dense.finish_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                    }
+                }
+                fd_dense += now_ms() - t0;
+                const double tl = now_ms();
+                if (all_logits) {   // every row, one sub-batch at a time (a B-wide head would need a ~2 GiB buffer)
+                    all_logits->resize((size_t) (c0 + B) * (size_t) nv);
+                    for (int s = 0; s < B; s += SB) {
+                        const int sn = std::min(SB, B - s);
+                        if (!dense.logits(s, sn, all_logits->data() + (size_t) (c0 + s) * nv)) { ferr = dense.last_error(); return false; }
+                    }
+                    if (c0 + B == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
+                } else if (c0 + B == n && !dense.logits(B - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                fd_logits += now_ms() - tl;
+                c0 += B;
+            } else {
+                // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
+                const int m = std::min(NP, n - c0);
+                double t0 = now_ms();
+                if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
+                for (int l = 0; l < n_layer; ++l) {
+                    const float * fn = nullptr;
+                    if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
+                    const double t1 = now_ms();
+                    fd_dense += t1 - t0;
+                    const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
+                                           : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
+                    if (!ok) { ferr = "tier run refused"; return false; }
+                    t0 = now_ms();
+                    fd_tier += t0 - t1;
+                    if (!dense.finish(l, crouted.data())) { ferr = dense.last_error(); return false; }
+                }
+                fd_dense += now_ms() - t0;
+                const double tl = now_ms();
+                if (all_logits) {
+                    all_logits->resize((size_t) (c0 + m) * (size_t) nv);
+                    if (!dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
+                    if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
+                } else if (c0 + m == n && !dense.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                fd_logits += now_ms() - tl;
+                c0 += m;
             }
-            fd_dense += now_ms() - t0;
-            const double tl = now_ms();
-            if (all_logits) {
-                all_logits->resize((size_t) (c0 + m) * (size_t) nv);
-                if (!dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
-                if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
-            } else if (c0 + m == n && !dense.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
-            fd_logits += now_ms() - tl;
-            progress(c0 + m);
+            progress(c0);
         }
         tier.release_chunk();
         return true;

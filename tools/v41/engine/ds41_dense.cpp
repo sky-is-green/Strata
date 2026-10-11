@@ -9,6 +9,7 @@
 #include "ggml-impl.h"   // ggml_cgraph::uid (graph reuse)
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -172,6 +173,10 @@ struct Ds41Dense::Impl {
     // ---- the pass
     int pos0 = 0, n = 0;
     int64_t pass_cap[3] = { 0, 0, 0 };
+    // ---- the layer-major prompt batch (begin_batch): S = the dense sub-batch size, batch = B, span_cap per sub-batch
+    int64_t S = 1, batch = 0, col0 = 0;
+    int batch_pos0 = 0;                             // the batch's first position
+    std::vector<std::array<int64_t, 3>> span_cap;   // [sub-batch][ratio] pass_cap
     std::vector<float> host_fn, host_wts, host_logits, host_emb;
     std::vector<int32_t> host_ids;
     const uint8_t * embd = nullptr;       // token_embd F16 rows on the mmap
@@ -198,6 +203,7 @@ struct Ds41Dense::Impl {
     ggml_tensor * W(const std::string & n) const { return w.get(n); }
     ggml_tensor * BL(int64_t il, const std::string & s) const { return w.get("blk." + std::to_string(il) + "." + s); }
     bool compute(ggml_cgraph * gf, bool cached);
+    bool upload_inputs(const int * tids, int n, int pos0);
 };
 
 // ================================================================== weights
@@ -318,7 +324,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
 
 // ================================================================== the attention graph (+ router + shared expert)
 
-static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n) {
+static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
     const Ds41Geometry & G = im.g;
@@ -328,12 +334,12 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     const int64_t r = L.ratio;
     const int64_t cap = r ? im.pass_cap[r] : 0;
     std::vector<ggml_tensor *> outs, late;    // late: ring / state write-backs, after every read
-    ggml_tensor * pos = b.v1(im.i_pos, n, 0);
+    ggml_tensor * pos = b.v1(im.i_pos, n, (size_t) col0 * 4);
 
     // ---- Engram (model.py Engram.forward), before the block, on the hc state
-    ggml_tensor * x = b.cols3(im.x_state, D, HC, n);
+    ggml_tensor * x = b.cols3(im.x_state, D, HC, n, col0);
     if (L.eslot >= 0 && im.engram.enabled()) {
-        ggml_tensor * rows = b.cols2(im.i_eng[L.eslot], im.EC * im.ED, n);
+        ggml_tensor * rows = b.cols2(im.i_eng[L.eslot], im.EC * im.ED, n, col0);
         ggml_tensor * kv = ggml_mul_mat(gc, im.BL(il, "engram_kv.weight"), rows);          // [(HC+1) D, n]
         ggml_tensor * key = ggml_view_3d(gc, kv, D, HC, n, (size_t) D * 4, kv->nb[1], 0);
         ggml_tensor * val = ggml_view_3d(gc, kv, D, 1, n, (size_t) D * 4, kv->nb[1], (size_t) HC * D * 4);
@@ -347,14 +353,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
         ggml_tensor * gate = ggml_sigmoid(gc, ggml_mul(gc, ggml_sgn(gc, dot), mag));
         ggml_tensor * gv = ggml_mul(gc, ggml_repeat(gc, ggml_cont(gc, val), x), gate);
         x = ggml_add(gc, x, gv);
-        outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n)));   // the block input (residual) = state + Engram
+        outs.push_back(ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));   // the block input (residual) = state + Engram
     }
 
     // ---- attention hc: mixes of the block input; its pre-mix is the previous FFN's (pre_state)
     ggml_tensor * a_pre = nullptr, * a_post = nullptr, * a_comb = nullptr;
     b.hc_mixes(x, im.BL(il, "hc_attn_fn.weight"), im.BL(il, "hc_attn_scale.weight"), im.BL(il, "hc_attn_base.weight"),
                &a_pre, &a_post, &a_comb);
-    ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n));             // [D, n]
+    ggml_tensor * xin = ggml_dsv4_hc_pre(gc, x, b.cols2(im.pre_state, HC, n, col0));             // [D, n]
     ggml_tensor * xn = b.rms_w(xin, im.BL(il, "attn_norm.weight"));
 
     // ---- q (no per-head norm in V4.1)
@@ -368,8 +374,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * kv2 = ggml_reshape_2d(gc, kv, DH, n);
     if (im.cfg.act_quant) kv2 = ds41_fake_quant(gc, ggml_cont(gc, kv2), Ds41Quant::FP8_POW2_32);   // model.py _window_kv
     ggml_tensor * wsrc = ggml_concat(gc, L.raw->type == GGML_TYPE_F32 ? L.raw : ggml_cast(gc, L.raw, GGML_TYPE_F32), kv2, 1);     // [DH, RAW + n]
-    ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, 0)), DH, SWA, n);
-    ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n);
+    ggml_tensor * Kw = ggml_reshape_3d(gc, ggml_get_rows(gc, wsrc, b.v1(im.i_widx, SWA * n, (size_t) col0 * SWA * 4)), DH, SWA, n);
+    ggml_tensor * Mw = b.cols2(im.i_wmask, SWA, n, col0);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         ggml_tensor * last = ggml_view_2d(gc, kv2, DH, k, kv2->nb[1], (size_t) (n - k) * kv2->nb[1]);
@@ -391,7 +397,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 ggml_mul_mat_set_prec(ssc, GGML_PREC_F32);
                 ggml_tensor * src_kv = ggml_concat(gc, L.st_kv, skv, 1);                     // [DH, 2 + n]
                 ggml_tensor * src_sc = ggml_concat(gc, L.st_sc, ssc, 1);
-                ggml_tensor * gi = b.v1(im.i_sidx, 2 * n, 0);
+                ggml_tensor * gi = b.v1(im.i_sidx, 2 * n, (size_t) col0 * 2 * 4);
                 ggml_tensor * vk = ggml_reshape_3d(gc, ggml_get_rows(gc, src_kv, gi), DH, 2, n);
                 ggml_tensor * vs = ggml_reshape_3d(gc, ggml_get_rows(gc, src_sc, gi), DH, 2, n);
                 vk = ggml_cont(gc, ggml_permute(gc, vk, 1, 0, 2, 3));                       // [2, DH, n]
@@ -404,8 +410,8 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                                              b.v1(im.i_sslot, k, 0)));
             }
             latent = b.rms_w(latent, im.BL(il, "attn_compressor_norm.weight"));
-            ggml_tensor * cpos = b.v1(im.i_cpos[r], n, 0);
-            ggml_tensor * cslot = b.v1(im.i_cslot[r], n, 0);
+            ggml_tensor * cpos = b.v1(im.i_cpos[r], n, (size_t) col0 * 4);
+            ggml_tensor * cslot = b.v1(im.i_cslot[r], n, (size_t) col0 * 4);
             // indexer keys from the UNROTATED latent (model.py Indexer.forward, owns_k)
             ggml_tensor * ik = b.rms_w(ggml_mul_mat(gc, im.BL(il, "indexer.attn_k.weight"), latent), im.BL(il, "indexer.k_norm.weight"));
             ik = ggml_reshape_2d(gc, b.rope(ggml_reshape_3d(gc, ik, im.ID, 1, n), cpos, r), im.ID, n);
@@ -432,7 +438,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                 iw = ggml_scale(gc, iw, 1.0f / std::sqrt((float) (im.ID * im.IH)));         // softmax_scale * heads^-0.5
                 ggml_tensor * ksrc = ggml_view_3d(gc, idxk, im.ID, 1, cap, idxk->nb[1], idxk->nb[1], 0);
                 // visibility: row i visible to query t iff i < nvis_t  -> 0 / -inf
-                ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], n, 0), 1, n);
+                ggml_tensor * nvs = ggml_reshape_2d(gc, b.v1(im.i_nvis[r], n, (size_t) col0 * 4), 1, n);
                 ggml_tensor * ramp = ggml_view_2d(gc, im.neg_ramp, cap, 1, (size_t) cap * 4, 0);
                 ggml_tensor * vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ggml_repeat(gc, ramp, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n)), nvs)));
                 ggml_tensor * sc = ggml_lightning_indexer(gc, iq, ksrc, iw, ggml_cast(gc, vis, GGML_TYPE_F16));   // [cap, n]
@@ -441,7 +447,7 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     const int64_t nblk = (cap + im.CBS - 1) / im.CBS, ncb = std::min<int64_t>(im.CB, nblk);
                     ggml_tensor * m = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, nblk, n), NEG_INF);
                     ggml_tensor * z = ggml_fill(gc, ggml_new_tensor_3d(gc, GGML_TYPE_F32, im.CBS, ncb, n), 0.0f);
-                    m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], 0)));
+                    m = ggml_set_rows(gc, m, z, ggml_cont(gc, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
                     m = ggml_view_2d(gc, m, cap, n, m->nb[2], 0);
                     sc = ggml_add(gc, sc, m);
                 }
@@ -451,20 +457,20 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     ggml_tensor * bm = ggml_pool_2d(gc, sc, GGML_OP_POOL_MAX, (int) im.CBS, 1, (int) im.CBS, 1, 0, 0);   // [nblk, n]
                     // pin: + 1e30 at block (nvis - 1) / CBS of each query
                     ggml_tensor * br = ggml_view_2d(gc, im.blk_ramp, nblk, 1, (size_t) nblk * 4, 0);
-                    ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, n, 0), 1, n);
+                    ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, n, (size_t) col0 * 4), 1, n);
                     ggml_tensor * eq = ggml_step(gc, ggml_scale_bias(gc, ggml_abs(gc, ggml_sub(gc, ggml_repeat(gc, br, bm), lb)), -1.0f, 0.5f));
                     bm = ggml_add(gc, bm, ggml_scale(gc, eq, 1e30f));
                     ggml_tensor * cb = ggml_cont(gc, ggml_top_k(gc, bm, (int) ncb));                     // I32 [ncb, n]
-                    outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], 0)));
+                    outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
                 }
                 sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, n]
                 selm = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, vis, 1, cap, n), sel), K, n);   // vis at sel
-                outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, n, L.sel->nb[1], 0)));
-                outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, n, L.selm->nb[1], 0)));
+                outs.push_back(ggml_cpy(gc, sel, ggml_view_2d(gc, L.sel, K, n, L.sel->nb[1], (size_t) col0 * L.sel->nb[1])));
+                outs.push_back(ggml_cpy(gc, selm, ggml_view_2d(gc, L.selm, K, n, L.selm->nb[1], (size_t) col0 * L.selm->nb[1])));
             } else {
                 const L_t & IS = im.ly[(size_t) L.idxl];
-                sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], 0);
-                selm = ggml_view_2d(gc, IS.selm, K, n, IS.selm->nb[1], 0);
+                sel = ggml_view_2d(gc, IS.sel, K, n, IS.sel->nb[1], (size_t) col0 * IS.sel->nb[1]);
+                selm = ggml_view_2d(gc, IS.selm, K, n, IS.selm->nb[1], (size_t) col0 * IS.selm->nb[1]);
             }
             Kc = ggml_reshape_3d(gc, ggml_get_rows(gc, comp, ggml_cont(gc, ggml_reshape_1d(gc, ggml_cont(gc, sel), K * n))), DH, K, n);
             Mc = ggml_cont(gc, selm);
@@ -524,14 +530,14 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
     ggml_tensor * se = ggml_mul_mat(gc, im.BL(il, "ffn_down_shexp.weight"), ggml_swiglu_split(gc, gt, up));
 
-    outs.push_back(ggml_cpy(gc, h, b.cols3(im.hap, D, HC, n)));
-    outs.push_back(ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, n)));
-    outs.push_back(ggml_cpy(gc, ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n)));
-    outs.push_back(ggml_cpy(gc, se, b.cols2(im.shexp, D, n)));
-    outs.push_back(ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n)));
-    outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n)));
-    outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n)));
-    outs.push_back(ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, n)));   // reads of pre_state happen above
+    outs.push_back(ggml_cpy(gc, h, b.cols3(im.hap, D, HC, n, col0)));
+    outs.push_back(ggml_cpy(gc, f_post, b.cols2(im.post_f, HC, n, col0)));
+    outs.push_back(ggml_cpy(gc, ggml_reshape_3d(gc, f_comb, HC, HC, n), b.cols3(im.comb_f, HC, HC, n, col0)));
+    outs.push_back(ggml_cpy(gc, se, b.cols2(im.shexp, D, n, col0)));
+    outs.push_back(ggml_cpy(gc, fn, b.cols2(im.o_fn, D, n, col0)));
+    outs.push_back(ggml_cpy(gc, ids, b.cols2(im.o_ids, im.NU, n, col0)));
+    outs.push_back(ggml_cpy(gc, wts, b.cols2(im.o_wts, im.NU, n, col0)));
+    outs.push_back(ggml_cpy(gc, f_pre, b.cols2(im.pre_state, HC, n, col0)));   // reads of pre_state happen above
     for (ggml_tensor * t : outs) ggml_build_forward_expand(gf, t);
     for (ggml_tensor * t : late) ggml_build_forward_expand(gf, t);
     return gf;
@@ -553,14 +559,15 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     return gf;
 }
 
-// finish: x_state = hc_post(shexp + routed, hap, post_f, comb_f)
-static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64_t n) {
+// finish: x_state = hc_post(shexp + routed, hap, post_f, comb_f).  col0: the batch column (0 on the single-pass paths).
+static ggml_cgraph * build_finish(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0 = 0) {
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, n), b.cols2(im.routed, D, n));
-    ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n), b.cols2(im.post_f, HC, n), b.cols3(im.comb_f, HC, HC, n));
-    ggml_build_forward_expand(gf, ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n)));
+    ggml_tensor * out = ggml_add(gc, b.cols2(im.shexp, D, n, col0), b.cols2(im.routed, D, n, col0));
+    ggml_tensor * x = ggml_dsv4_hc_post(gc, out, b.cols3(im.hap, D, HC, n, col0), b.cols2(im.post_f, HC, n, col0),
+                                        b.cols3(im.comb_f, HC, HC, n, col0));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, n, col0)));
     return gf;
 }
 
@@ -578,16 +585,17 @@ static ggml_cgraph * build_head(Ds41Dense::Impl & im, ggml_context * gc, int64_t
     return gf;
 }
 
-// begin: x_state = repeat(embd), pre_state = one-hot (model.py make_identity_pre_mix)
-static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t n) {
+// begin: x_state = repeat(embd), pre_state = one-hot (model.py make_identity_pre_mix).  col0: the batch column the
+// pass's n tokens live at (0 on the single-pass paths).
+static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t n, int64_t col0 = 0) {
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * e = ggml_reshape_3d(gc, b.cols2(im.i_emb, D, n), D, 1, n);
-    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_repeat_4d(gc, e, D, HC, n, 1), b.cols3(im.x_state, D, HC, n)));
+    ggml_tensor * e = ggml_reshape_3d(gc, b.cols2(im.i_emb, D, n, col0), D, 1, n);
+    ggml_build_forward_expand(gf, ggml_cpy(gc, ggml_repeat_4d(gc, e, D, HC, n, 1), b.cols3(im.x_state, D, HC, n, col0)));
     ggml_tensor * one = ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, 1, n), 1.0f);
     ggml_tensor * oh = ggml_pad(gc, one, (int) (HC - 1), 0, 0, 0);                            // [1, 0, 0, 0] per token
-    ggml_build_forward_expand(gf, ggml_cpy(gc, oh, b.cols2(im.pre_state, HC, n)));
+    ggml_build_forward_expand(gf, ggml_cpy(gc, oh, b.cols2(im.pre_state, HC, n, col0)));
     return gf;
 }
 
@@ -624,7 +632,8 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     // on a short prompt
     if (const char * e = std::getenv("DS41_TEST_TOPK")) im.ITOP = std::atoi(e);
     if (const char * e = std::getenv("DS41_TEST_CAND_BLOCKS")) im.CB = std::atoi(e);
-    im.NC = std::max(1, cfg.max_pass);
+    im.S = std::max(1, cfg.max_pass);                       // the dense sub-batch size of the layer-major walk
+    im.NC = std::max<int64_t>(im.S, std::max(1, cfg.prompt_batch));   // state columns: the whole prompt batch, or the pass
     im.RAW = im.SWA + 3;
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
     if (im.ITOP > im.cmax[2] || im.CBS <= 0 || cfg.ctx_max % 256) { err = "ctx_max must be a multiple of 256 and >= 1024"; return false; }
@@ -752,11 +761,19 @@ void Ds41Dense::release_pass() {
     ++im.allo_pass.epoch;
 }
 
-bool Ds41Dense::begin(const int * tids, int n, int pos0) {
-    Impl & im = *p_;
-    if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
-    im.pos0 = pos0;
-    im.n = n;
+// pass_cap (per ratio) of a pass of n tokens ending at pos0+n: the visible compressed rows it ranks over.
+static void span_pass_caps(const Ds41Dense::Impl & im, int pos0, int n, int64_t out[3]) {
+    out[0] = 0;
+    for (int r = 1; r <= 2; ++r) {
+        const int64_t nvis_last = (pos0 + n) / r;
+        out[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, im.CBS)), im.cmax[r]);
+    }
+}
+
+// Per-token inputs of n tokens at positions pos0.. (embeddings, positions, the window / compressed / indexer index
+// maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
+bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
+    Impl & im = *this;
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
@@ -807,8 +824,6 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
         ggml_backend_tensor_set(im.i_nvis[r], nv.data(), 0, (size_t) n * 4);
         ggml_backend_tensor_set(im.i_cslot[r], cs.data(), 0, (size_t) n * 4);
         ggml_backend_tensor_set(im.i_cpos[r], cp.data(), 0, (size_t) n * 4);
-        const int64_t nvis_last = (pos0 + n) / r;
-        im.pass_cap[r] = nvis_last == 0 ? 0 : std::min<int64_t>(next_pow2(std::max<int64_t>(nvis_last, im.CBS)), im.cmax[r]);
         if (r == 1) {
             std::vector<float> lb(n);
             for (int t = 0; t < n; ++t) lb[t] = (float) ((nv[t] - 1) >= 0 ? (int64_t) (nv[t] - 1) / im.CBS : -1);
@@ -835,6 +850,16 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
         for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
             ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
     }
+    return true;
+}
+
+bool Ds41Dense::begin(const int * tids, int n, int pos0) {
+    Impl & im = *p_;
+    if (n < 1 || n > im.NC || pos0 < 0 || pos0 + n > im.cfg.ctx_max) { im.err = "bad pass"; return false; }
+    im.pos0 = pos0;
+    im.n = n;
+    if (!im.upload_inputs(tids, n, pos0)) return false;
+    span_pass_caps(im, pos0, n, im.pass_cap);
     // embeddings -> state
     ggml_context * gc = nullptr;
     ggml_cgraph * gf = nullptr;
@@ -854,6 +879,118 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     if (gc) ggml_free(gc);
     return ok;
 }
+
+// ================================================================== the layer-major prompt batch
+
+bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
+    Impl & im = *p_;
+    if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) { im.err = "bad batch"; return false; }
+    if (!im.upload_inputs(tids, B, pos0)) return false;
+    im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B; im.col0 = 0;
+    // per-sub-batch pass_cap (the compressed rows each sub-batch ranks over) - depends only on (pos0, len)
+    const int64_t nb = (B + im.S - 1) / im.S;
+    im.span_cap.assign((size_t) nb, { 0, 0, 0 });
+    for (int64_t i = 0; i < nb; ++i)
+        span_pass_caps(im, pos0 + (int) (i * im.S), (int) std::min<int64_t>(im.S, (int64_t) B - i * im.S),
+                       im.span_cap[(size_t) i].data());
+    // the batch's initial state, one sub-batch at a time (x_state = embd, pre_state = one-hot)
+    std::vector<uint8_t> meta(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
+    for (int64_t i = 0; i < nb; ++i) {
+        const int64_t c0 = i * im.S, sn = std::min<int64_t>(im.S, (int64_t) B - c0);
+        ggml_init_params p = { meta.size(), meta.data(), true };
+        ggml_context * gc = ggml_init(p);
+        ggml_cgraph * gf = build_init(im, gc, sn, c0);
+        const bool ok = im.compute(gf, false);
+        ggml_free(gc);
+        if (!ok) { im.err = "batch init failed"; return false; }
+    }
+    return true;
+}
+
+bool Ds41Dense::attn_router_span(int il, int col0, int n) {
+    Impl & im = *p_;
+    if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
+    const size_t si = (size_t) (col0 / im.S);
+    if (si >= im.span_cap.size()) { im.err = "bad span"; return false; }
+    // the sub-batch's own pass_cap (the graphs read it) and the per-pass (not per-token) ring slots
+    im.pass_cap[0] = im.span_cap[si][0];
+    im.pass_cap[1] = im.span_cap[si][1];
+    im.pass_cap[2] = im.span_cap[si][2];
+    const int64_t pbase = (int64_t) im.batch_pos0 + col0;
+    // the window and ratio-2 state row maps are PASS-LOCAL: the pass's own rows (and states) sit at the end of the
+    // [ring | pass rows] (resp. [ring | pass states]) they index, so they are recomputed from the sub-batch's own
+    // position (upload_inputs laid them out for the whole batch, which is only correct at col0 = 0)
+    {
+        std::vector<int32_t> widx((size_t) (im.SWA * n));
+        for (int t = 0; t < n; ++t) {
+            const int64_t p = pbase + t;
+            for (int64_t j = 0; j < im.SWA; ++j) {
+                const int64_t q = p - im.SWA + 1 + j;
+                widx[(size_t) (t * im.SWA + j)] = q < 0 ? 0 : (int32_t) (q >= pbase ? im.RAW + (q - pbase) : q % im.RAW);
+            }
+        }
+        ggml_backend_tensor_set(im.i_widx, widx.data(), (size_t) col0 * im.SWA * 4, widx.size() * 4);
+    }
+    {
+        std::vector<int32_t> si((size_t) (2 * n));
+        auto row = [&](int64_t q) { return (int32_t) (q >= pbase ? 2 + (q - pbase) : q % 2); };
+        for (int t = 0; t < n; ++t) {
+            const int64_t p = pbase + t, g0 = (p / 2) * 2;
+            si[(size_t) (2 * t)] = row(g0);
+            si[(size_t) (2 * t + 1)] = row(p >= g0 + 1 ? g0 + 1 : g0);
+        }
+        ggml_backend_tensor_set(im.i_sidx, si.data(), (size_t) col0 * 2 * 4, si.size() * 4);
+    }
+    {
+        const int64_t k = std::min<int64_t>(n, im.RAW);
+        std::vector<int32_t> ws((size_t) k);
+        for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pbase + n - k + j) % im.RAW);
+        ggml_backend_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
+    }
+    {
+        const int64_t k = std::min<int64_t>(n, 2);
+        std::vector<int32_t> ss((size_t) k);
+        for (int64_t j = 0; j < k; ++j) ss[(size_t) j] = (int32_t) ((pbase + n - k + j) % 2);
+        ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
+    }
+    im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
+    ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
+    ggml_context * gc = ggml_init(p);
+    ggml_cgraph * gf = build_attn(im, gc, il, n, col0);
+    const bool ok = im.compute(gf, false);
+    ggml_free(gc);
+    if (!ok) return false;
+    // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
+    ggml_backend_tensor_get(im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
+    ggml_backend_tensor_get(im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ggml_backend_tensor_get(im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    return true;
+}
+
+bool Ds41Dense::upload_routed(const float * routed_host, int B) {
+    Impl & im = *p_;
+    if (!routed_host || B < 1 || B > im.batch) { im.err = "bad routed batch"; return false; }
+    ggml_backend_tensor_set(im.routed, routed_host, 0, (size_t) B * im.D * 4);
+    return true;
+}
+
+bool Ds41Dense::finish_span(int il, int col0, int n) {
+    Impl & im = *p_;
+    (void) il;
+    if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
+    std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
+    ggml_init_params p = { meta.size(), meta.data(), true };
+    ggml_context * gc = ggml_init(p);
+    ggml_cgraph * gf = build_finish(im, gc, n, col0);
+    const bool ok = im.compute(gf, false);
+    ggml_free(gc);
+    return ok;
+}
+
+int Ds41Dense::batch_size() const { return (int) p_->batch; }
+const int32_t * Ds41Dense::batch_ids() const { return p_->host_ids.data(); }
+const float * Ds41Dense::batch_wts() const { return p_->host_wts.data(); }
+const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
 
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;

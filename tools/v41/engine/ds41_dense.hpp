@@ -32,7 +32,11 @@ struct Ds41DenseConfig {
     ggml_backend_t backend = nullptr;   ///< NULL = create and own a CPU backend
     int     n_threads = 8;
     int64_t ctx_max = 65536;            ///< positions the caches hold (compressed rows = ctx_max / ratio)
-    int     max_pass = 1;               ///< tokens a pass may carry (>= 1; prefill chunk size)
+    int     max_pass = 1;               ///< tokens a pass may carry (>= 1; prefill chunk size = the sub-batch size S)
+    /// Layer-major prompt batch (0 = off): the state tensors hold this many token columns and a prompt of up to
+    /// `prompt_batch` tokens is walked layer by layer, one dense sub-batch of `max_pass` tokens at a time, with the
+    /// experts run ONCE per layer over the whole batch (begin_batch / attn_router_span / finish_span).
+    int     prompt_batch = 0;
     bool    skip_routed_experts = true; ///< do not load the routed experts (the tier owns them)
     /// Directories holding the HF shards with the Engram tables (model.safetensors.index.json in the first).
     /// Empty = no Engram (its add is skipped: a debugging mode, the model is then not the model).
@@ -63,6 +67,26 @@ public:
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).
     bool begin(const int * tids, int n, int pos0);
+    /// Layer-major prompt batch (cfg.prompt_batch > 0): the whole batch's inputs are prepared once - embeddings,
+    /// positions, window / compressed / indexer index maps, Engram rows and the initial x/pre state - into the state
+    /// tensors' columns 0..B-1; then attn_router_span / finish_span walk layer il's sub-batches in order.  B <=
+    /// cfg.prompt_batch (the state columns) and B <= ctx_max - pos0.  Every cross-layer dependency of the sequential
+    /// chunk path (the per-layer KV ring / compressed rows / indexer state advances in sub-batch order; layer l's
+    /// residual and pre-mix are the columns the sub-batch used) is preserved, so the outputs match --prefill-chunk.
+    bool begin_batch(const int * tids, int B, int pos0);
+    /// Dense half of layer il for the batch's sub-batch starting at column col0 (n tokens, col0 % max_pass == 0):
+    /// attention, hc, router, shared expert + the Engram add.  ids / wts / fn land in the batch buffers (batch_ids /
+    /// batch_wts / batch_fn) at column col0.  Uses (and advances) layer il's own KV state in sub-batch order.
+    bool attn_router_span(int il, int col0, int n);
+    /// The batch's host buffers filled by attn_router_span: ids / wts are n_used * B (token-major), fn is n_embd * B.
+    const int32_t * batch_ids() const;
+    const float * batch_wts() const;
+    const float * batch_fn() const;
+    int batch_size() const;
+    /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
+    /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
+    bool upload_routed(const float * routed_host, int B);
+    bool finish_span(int il, int col0, int n);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();
