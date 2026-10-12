@@ -10,6 +10,7 @@ tags:
 - moe
 - quantized
 - 2-bit
+- ternary
 - mixed-precision
 - gptq
 - uncensored
@@ -19,7 +20,7 @@ tags:
 
 <div align="center">
 
-# DeepSeek-V4.1-Flash · GSQ mixed-tier (152 GiB)
+# DeepSeek-V4.1-Flash · GSQ mixed-tier: ternary / 2-bit / 3-bit experts (152 GiB)
 
 **A 552B-parameter MoE running on one gaming PC — RTX 4090 (24 GB) + 90 GB RAM + NVMe**
 
@@ -40,19 +41,32 @@ this class of machine, on top of [Strata](https://github.com/Niko1221/Strata).
 ## What this is
 
 [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) has 40 layers with 384 routed experts each
-(top-6 per token), a shared expert, Hyper-Connections, CSA sparse attention, and an **Engram** n-gram memory. Even at FP8
-its routed experts alone are far bigger than any consumer PC's RAM.
+(top-6 per token), a shared expert, Hyper-Connections, CSA sparse attention, and an **Engram** n-gram memory. Its
+15,360 routed experts hold 543.6B weights; even at their native FP4 they're far bigger than any consumer PC's RAM.
 
-This repository holds a **GSQ ("graded sensitivity quantization") mixed-tier** version of
-[dealignai's abliterated FP8 checkpoint](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8):
+This repository holds a **calibrated mixed-tier quantization** of
+[dealignai's abliterated checkpoint](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8), in which
+**every expert's gate/up and down projections get their own format**:
 
-- **Routed experts: ~2.0–2.5 bits per weight on average, chosen per expert.** Each of the 15,360 experts gets its
-  own format from calibration statistics:
-  **PTQ1_0** (ternary, 1.75 bpw), **Q2_0** (2.25 bpw) or **Q3_K**. Experts that matter more (and earlier layers) get
-  richer formats; rarely-used experts get the cheapest ones.
-- **Dense half at Q8_0:** attention, shared expert, output head. The embedding, compressor and indexer stay F16; norms,
-  router and mHC stay F32.
-- Quantization is GPTQ-style (Hessian-weighted error feedback, per expert), computed straight from the FP8/FP4 shards.
+| Format | Grid | Bits per weight | Share of expert weights |
+| --- | --- | ---: | ---: |
+| **PTQ1_0** (ternary) | {−1, 0, +1} × fp16 scale per 128 | 1.75 | **42.8%** |
+| **Q2_0** | {−1, 0, +1, +2} × fp16 scale per 64 | 2.25 | 39.2% |
+| **Q3_K** | 3-bit, 6-bit sub-scales per 16, fp16 per 256 | 3.44 | 18.0% |
+| **All experts** | | **2.250** | |
+
+The dense half (attention, shared expert, output head) is **Q8_0**. The embedding, compressor and indexer stay F16,
+and norms, router and mHC stay F32.
+
+The total is budget-neutral: exactly the bytes of a uniform 2.25-bit (all-Q2_0) quant, but spent where calibration
+says they matter. Nearly half the expert weights are ternary, which pays for 3-bit on the experts that need it. On the
+calibration proxy, the mix has **17% less output error than uniform Q2_0 at the same size**.
+
+"GSQ" names the method family this follows: the format grids and the plan come from
+[GSQ (Gumbel-Softmax Quantization)](https://github.com/IST-DASLab/GSQ) and
+[RCO (budget-exact allocation)](https://arxiv.org/abs/2605.00649) by IST Austria's DAS Lab. This release is the
+**GPTQ-initialized stage** of that pipeline with our own "RCO-lite" allocation. GSQ's Gumbel-softmax refinement
+hasn't been applied yet; see *Not done yet* below.
 
 ## Why
 
@@ -69,9 +83,74 @@ The engine then treats the experts as a three-tier cache:
 | Pinned RAM arena | ~6,700 experts (60 GiB) | DMA straight to the GPU |
 | NVMe file tier | the other ~8,700 experts | O_DIRECT reads, prefetched a layer ahead |
 
+## How it was made
+
+The whole pipeline is open source in
+[Strata-DSV4.1/tools/v41](https://github.com/Indras-Mirror/Strata-DSV4.1/tree/main/tools/v41). It runs on a single
+RTX 4090.
+
+**0. Weight-only metrics can't rank these experts.** V4.1's routed experts were trained in FP4, so all 384 experts of a
+layer share the same per-32 weight distribution. Every expert in layer 0 has the same round-to-nearest error to three
+decimals (ternary 0.443 / Q2 0.378 / Q3 0.183 relative). Which experts deserve more bits can only come from
+**activations**: what the experts actually compute on real text.
+
+**1. Calibration corpus (agentic-first).** Real coding-agent session transcripts (secrets scrubbed value by value, tool
+results clipped) plus antirez/ds4's 4,690 imatrix prompts, all re-rendered with DeepSeek's own V4.1 chat encoder (DSML
+tool-call format). That's 128 sequences × 2,048 tokens, with about a quarter of each domain **held out**: 98 sequences
+fit the quantizer, and 30 only ever measure it.
+
+**2. A layer-streaming teacher forward.** DeepSeek's own reference `model.py` runs **one layer at a time** straight
+from the HF shards, keeping the hidden state on disk between layers. That makes the teacher the real model, not an
+approximation. Each layer's MoE runs expert-major: every FP4 expert is dequantized once and sees all of its routed
+tokens.
+
+**3. Per-expert GPTQ at three exact grids.** For every expert, gate+up are fitted on the Hessian of its input, and down
+on the Hessian of its clamped-SwiGLU × routing-weight input. Scales are chosen **before** GPTQ by a diag(H)-weighted
+search (11 clip ratios × both signs) and rounded to what each format stores, so every result is exactly representable
+in its GGUF type. GPTQ (damp 1.0) then picks the integers. It beat round-to-nearest in every group (error ratios
+0.58 ternary / 0.70 Q2 / 0.74 Q3). Each expert's error is measured on the **held-out** sequences only, as output error
+with the routing weight included.
+
+**4. Budget-exact allocation ("RCO-lite").** The cost of a choice is held-out output error divided by the layer's
+routed output energy, so every layer counts equally; the first two and last three layers count double. Gate+up and
+down are allocated separately. The budget is exactly the all-Q2_0 byte count, solved by Lagrangian relaxation
+(bisection on λ) plus a greedy pass to spend the remainder. Guard rails: at most 50% ternary per layer, and experts
+with fewer than 8 held-out tokens are floored at Q2_0, so an expert can't drift to ternary without evidence.
+
+**5. Sequential quantize pass.** A second layer-by-layer chain quantizes every expert at its chosen format. Each layer
+is fitted on the outputs of the **already-quantized** layers below it, so later layers adapt to the errors earlier
+ones actually make.
+
+**6. Bit-exact export.** Block encoders write the GGUF bytes directly and are checked bit for bit against ggml's
+dequantizers and the PTQ1_0 reference. Ternary packs 5 trits per byte (28 bytes per 128 weights), and Strata runs it
+natively on the CPU and in its grouped-expert CUDA kernels.
+
+### Where the bits went
+
+Measured on the held-out calibration tokens; the relative output error is each layer's quantized routed output against
+the FP4 original, in the final sequential pass.
+
+| Layers | Expert bpw | Held-out relative output error | |
+| --- | ---: | ---: | --- |
+| 0–3 | 2.25–2.34 | 2.4–6.8% | |
+| 4–19 | 2.21–2.71 | 1.9–12.9% | the richest band: the most 3-bit experts (peaks at layers 12–13) |
+| 20–31 | 2.00–2.01 | **0.03–0.44%** | barely sensitive: about half ternary, the rest Q2_0 (the 50% ternary cap binds) |
+| 32 | 2.66 | 14.8% | the most sensitive layer in the model; calibration found it and paid for it |
+| 33–39 | 2.00–2.03 | 0.13–2.1% | |
+| **All 40** | **2.250** | mean 4.3% | |
+
+### Not done yet
+
+- **GSQ refinement:** Gumbel-softmax optimization of the grid assignments at each expert's chosen format. This is
+  the step that closes most of the gap to vector quantization in the GSQ paper. It slots in where GPTQ runs and
+  writes the same format.
+- A Hadamard rotation for the ternary tier.
+- The full RCO manifold search: the allocation above is its Lagrangian "lite" version.
+
 ## Quality
 
-Perplexity on held-out data against the FP8 original ("teacher"):
+Perplexity on the **49,146 held-out calibration tokens** (never used for fitting): the quantized model vs the original
+checkpoint ("teacher"):
 
 | Domain | GSQ ppl | Teacher ppl |
 | --- | ---: | ---: |
@@ -160,6 +239,11 @@ lowers it, at some speed cost), and fast NVMe with room for the model plus the E
 - **[dealignai](https://huggingface.co/dealignai)** for the abliterated FP8 checkpoint this is quantized from (MIT).
   This release inherits that abliteration: the model has **no refusal behaviour**, and you are responsible for how you
   use it.
+- **[GSQ](https://github.com/IST-DASLab/GSQ)** (Dadgarnia, Tabesh, Nikdan, Helcig, Kurtić, Kleinegger, Alistarh) and
+  **[RCO](https://github.com/IST-DASLab/RCO)** (Helcig, Alistarh), IST Austria DAS Lab, for the quantization grids
+  and the budget-exact allocation idea this pipeline follows.
+- **[antirez/ds4](https://github.com/antirez/ds4)** for its 4,690 imatrix calibration prompts (re-rendered for V4.1).
+- **llama-tq** for the PTQ1_0 ternary block format (type 143) and its reference kernels (MIT).
 - **[Strata](https://github.com/Niko1221/Strata)** (Niko1221), the tiered MoE engine this work builds on;
   **ggml / llama.cpp** for the compute backend.
 - Quantization pipeline, engine port and measurements: **Indra's Mirror** ([Strata-DSV4.1](https://github.com/Indras-Mirror/Strata-DSV4.1)).
