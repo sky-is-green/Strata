@@ -55,14 +55,16 @@ Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380,
 
 | | First working GPU run (2026-10-11 morning) | Now |
 | --- | ---: | ---: |
-| Prefill, 8192-token prompt | ~27 tok/s (chunk 512) | **221 tok/s** (one-shot) · 250-269 tok/s (server) |
+| Prefill, 8192-token prompt | ~27 tok/s (chunk 512) | **244-248 tok/s** (one-shot) · 250-269 tok/s (server, before MMQ) |
 | Prefill, 16K / 20K prompt | - | **288 / 266 tok/s** |
 | Decode (256-token prompt, 256 tokens) | 3.4 tok/s | **25.5-26.3 tok/s** (27.7 with the opt-in ggml patch) |
 | Decode in a real agent session (20-32K context, server) | - | 22.7-28.2 tok/s |
 | Model load | 211 s | ~50 s |
 
 - **The prompt is exact.** Every prefill speed-up keeps the last-token logits byte-identical (8192-token check md5
-  `4d229102872a`), also through the server and its conversation reuse.
+  `ee31507a0e88`), also through the server and its conversation reuse. The prompt's routed experts run on int8
+  tensor cores (MMQ; the ternary experts through a lossless PTQ1_0 -> Q2_0 transcode on the card): +12% over the
+  dp4a kernels (`--no-chunk-mmq`, md5 `4d229102872a`) at equal quality (4096-token code ppl 2.3790 vs 2.3799).
 - **Decode routes with two selection-only biases** (`--route-bias 1.0`, `--route-bias-file 0.6`, both defaults):
   a bonus for experts already in VRAM and a penalty for experts that would be read from NVMe. Mixing weights stay
   exact and every expert stays reachable. Cost on 4096-token perplexity: code 2.38 -> 2.87, agentic text 15.11 -> 6.39

@@ -248,6 +248,26 @@ def cmd_prep(a):
         f"max id {int(hashes.max())} (tables {args.engram_num_embeddings})")
 
 
+def cmd_prep_ids(a):
+    """One sequence from int32 token files (concatenated, as given - e.g. an engine prompt + its continuation), for a
+    teacher forward over exactly the engine's tokens (tools/v41/dspark_accept.py --teacher)."""
+    from transformers import AutoTokenizer
+    os.makedirs(WORK, exist_ok=True)
+    tok = AutoTokenizer.from_pretrained(MAIN)
+    ids = np.concatenate([np.fromfile(f, dtype=np.int32) for f in a.ids])
+    tokens = ids.reshape(1, -1).astype(np.int32)
+    np.save(wpath("tokens.npy"), tokens)
+    json.dump({"n": 1, "seq": int(tokens.shape[1]), "domains": [a.domain], "is_eval": [True], "corpus": None},
+              open(wpath("meta.json"), "w"))
+    args = model_args(1, int(tokens.shape[1]))
+    layout = M.EngramLayout.from_args(args)
+    hs = M.NgramHashState(args, layout, tok)
+    with torch.inference_mode():
+        hashes = hs(torch.from_numpy(tokens).long(), 0)
+    np.save(wpath("hashes.npy"), hashes.numpy())
+    log(f"prep-ids: {tokens.shape} tokens from {a.ids}")
+
+
 # ---------------------------------------------------------------------------------------------------------- init
 def h_memmap(L, mode, N, S):
     os.makedirs(wpath("h"), exist_ok=True)
@@ -595,6 +615,7 @@ def main():
     p = sub.add_parser("prep"); p.add_argument("--n", type=int, default=128); p.add_argument("--seq", type=int, default=2048)
     p.add_argument("--corpus", default=None, help="build_corpus.py output dir (agentic-first V4.1 mix)")
     sub.add_parser("init")
+    p = sub.add_parser("prep-ids"); p.add_argument("ids", nargs="+"); p.add_argument("--domain", default="custom")
     p = sub.add_parser("head"); p.add_argument("--layer", type=int, default=40, help="h/L to read (40 = after the last block)")
     p.add_argument("--device", default="cuda")
     p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=0, help="sequences per attention batch (0: ~4K tokens)")
@@ -607,7 +628,7 @@ def main():
     p.add_argument("--screen-only", default=None, metavar="TAG",
                    help="write stats/LNN_TAG.json only; no h/pre/shared/route output, no --gc")
     a = ap.parse_args()
-    {"prep": cmd_prep, "init": cmd_init, "layer": cmd_layer, "head": cmd_head}[a.cmd](a)
+    {"prep": cmd_prep, "prep-ids": cmd_prep_ids, "init": cmd_init, "layer": cmd_layer, "head": cmd_head}[a.cmd](a)
 
 
 if __name__ == "__main__":

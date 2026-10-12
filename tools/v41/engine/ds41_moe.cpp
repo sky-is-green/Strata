@@ -10,6 +10,7 @@
 // initialise the driver - accidental or otherwise.  Compiled with `DS4_MOE_CUDA` it is the full three-tier
 // implementation.  `tools/ds4/cmake/ds4_moe.cmake` builds both.
 #include "ds41_moe.hpp"
+#include "ds41_transcode.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
@@ -289,16 +290,20 @@ struct Gpu {
     void *m_gu = nullptr, *m_h = nullptr, *m_xg = nullptr, *m_xu = nullptr, *m_xd = nullptr, *m_bnd = nullptr,
          *m_iota = nullptr;
     std::vector<int8_t> m_ok;
+    /// run_chunk's MMQ on PTQ1_0: the run's ternary matrices transcoded to Q2_0 here (ds41_transcode, lossless)
+    void* m_tc = nullptr;
+    size_t m_tc_cap = 0;
 #if defined(DS4_MOE_MMQ)
     /// Created once and never destroyed: a binary that also links ggml-cuda (mimo_generate's dense backend) resolves
     /// ~ggml_backend_cuda_context to ggml-cuda's real one, which segfaults on the context strata_mmq built.
     strata::prefill::mmq::Context* m_ctx = nullptr;
 #endif
     void free_mmq() {
-        for (void* p : {m_gu, m_h, m_xg, m_xu, m_xd, m_bnd, m_iota})
+        for (void* p : {m_gu, m_h, m_xg, m_xu, m_xd, m_bnd, m_iota, m_tc})
             if (p) cudaFree(p);
-        m_gu = m_h = m_xg = m_xu = m_xd = m_bnd = m_iota = nullptr;
+        m_gu = m_h = m_xg = m_xu = m_xd = m_bnd = m_iota = m_tc = nullptr;
         m_rows = 0;
+        m_tc_cap = 0;
     }
 
     void close() {
@@ -2549,26 +2554,74 @@ struct ChunkProf { double file_gb = 0, rd_busy = 0; double wall = 0, file = 0, f
 ChunkProf g_cprof;
 bool chunk_prof() { static const bool on = [] { const char* e = std::getenv("MIMO_CHUNK_PROF"); return e && *e == '1'; }(); return on; }
 
+#if defined(DS4_MOE_MMQ)
+// run_chunk MMQ on PTQ1_0 (type 143, not an MMQ type): the run's ternary matrices are transcoded on the card into
+// Q2_0 (ds41_transcode: same d, code = trit + 1 - every weight the same number) and multiplied as Q2_0.
+// STRATA_MMQ_PTQ1=0: classes with a PTQ1_0 matrix stay on MMVQ (the old behaviour).
+constexpr int kPtq1 = 143, kQ20 = 42;
+bool mmq_ptq1() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_PTQ1"); return !(e && e[0] == '0'); }();
+    return on;
+}
+int mmq_eff(int t) { return t == kPtq1 && mmq_ptq1() ? kQ20 : t; }
+/// One class's MMQ plan: covered or not, the staged-blob stride SL (BL rounded to whole blocks of every type MMQ reads
+/// in place), and the transcode layout (offsets of the Q2_0 copies in one expert's slot, SL2 = the slot).
+struct MmqPlan {
+    bool ok = false;
+    int64_t SL = 0;
+    int gt = -1, ut = -1, dt = -1;         // the types MMQ multiplies (PTQ1_0 -> Q2_0)
+    bool tg = false, tu = false, td = false;   // that matrix is a transcoded PTQ1_0 one
+    size_t g_bytes = 0, u_bytes = 0, d_bytes = 0;   // PTQ1_0 bytes of each transcoded matrix in the staged blob
+    size_t g2 = 0, u2 = 0, d2 = 0, SL2 = 0;         // its Q2_0 copy's offset in the slot; the slot size
+};
+MmqPlan mmq_plan(const strata::kernels::NativeExpertLayout& GL, int64_t BL) {
+    namespace mmq = strata::prefill::mmq;
+    MmqPlan P;
+    P.SL = BL;
+    const int ogt = GL.gu_type, out_ = GL.up_type >= 0 ? GL.up_type : GL.gu_type, odt = GL.d_type;
+    P.gt = mmq_eff(ogt);
+    P.ut = mmq_eff(out_);
+    P.dt = mmq_eff(odt);
+    P.tg = P.gt != ogt;
+    P.tu = P.ut != out_;
+    P.td = P.dt != odt;
+    if (!(mmq::fits(P.gt, GL.n_ff) && mmq::fits(P.ut, GL.n_ff) && mmq::fits(P.dt, GL.n_embd) && GL.up_off % 2 == 0 &&
+          GL.down_off % 2 == 0))   // a finite swiglu_limit: mmq::swiglu_clamp
+        return P;
+    if ((P.tg || P.tu) && GL.n_embd % 128 != 0) return P;
+    if (P.td && GL.n_ff % 128 != 0) return P;
+    int64_t lcm = 16;   // whole blocks of every type read IN PLACE (a transcoded matrix is read by the transcode)
+    auto gcd = [](int64_t a, int64_t b) { while (b) { const int64_t t = a % b; a = b; b = t; } return a; };
+    const int in_place[3] = { P.tg ? -1 : P.gt, P.tu ? -1 : P.ut, P.td ? -1 : P.dt };
+    for (int t : in_place) {
+        if (t < 0) continue;
+        const int64_t tsz = (int64_t) mmq::matrix_bytes(t, 1, 256);
+        lcm = lcm / gcd(lcm, tsz) * tsz;
+    }
+    const int64_t SL = (BL + lcm - 1) / lcm * lcm;
+    if (SL - BL > 1048576 - 4096) return P;
+    P.SL = SL;
+    const size_t ptq1_row_gu = (size_t) (GL.n_embd / 128) * 28, ptq1_row_d = (size_t) (GL.n_ff / 128) * 28;
+    size_t at = 0;
+    if (P.tg) { P.g_bytes = (size_t) GL.n_ff * ptq1_row_gu; P.g2 = at; at += ds41_q2_0_bytes_from_ptq1(P.g_bytes); }
+    if (P.tu) { P.u_bytes = (size_t) GL.n_ff * ptq1_row_gu; P.u2 = at; at += ds41_q2_0_bytes_from_ptq1(P.u_bytes); }
+    if (P.td) { P.d_bytes = (size_t) GL.n_embd * ptq1_row_d; P.d2 = at; at += ds41_q2_0_bytes_from_ptq1(P.d_bytes); }
+    P.SL2 = at;   // a multiple of 18 (whole Q2_0 blocks): MMQ's expert stride is counted in blocks
+    P.ok = true;
+    return P;
+}
+#endif
+
 // The stride run_chunk gives a streamed blob in a device half (BL, or BL rounded to whole blocks of every type when
-// the layer runs on MMQ) - the same rule as in gpu_run_chunk, for chunk_prestage
+// the layer runs on MMQ) - the same rule as in gpu_run_chunk (mmq_plan), for chunk_prestage
 int64_t chunk_stride(Ds41MoeImpl& im, int64_t layer) {
     const int64_t BL = im.bl[(size_t) layer];
 #if defined(DS4_MOE_MMQ)
     Gpu& gp = *im.gpu;
     namespace mmq = strata::prefill::mmq;
-    const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) layer];
-    const int gt = GL.gu_type, ut = GL.up_type >= 0 ? GL.up_type : GL.gu_type, dt = GL.d_type;
     if (!im.cfg.chunk_mmq || !mmq::built()) return BL;
-    if (!(mmq::fits(gt, GL.n_ff) && mmq::fits(ut, GL.n_ff) && mmq::fits(dt, GL.n_embd) && GL.up_off % 2 == 0 &&
-          GL.down_off % 2 == 0)) return BL;
-    int64_t lcm = 16;
-    auto gcd = [](int64_t a, int64_t b) { while (b) { const int64_t t = a % b; a = b; b = t; } return a; };
-    for (int t : {gt, ut, dt}) {
-        const int64_t tsz = (int64_t) mmq::matrix_bytes(t, 1, 256);
-        lcm = lcm / gcd(lcm, tsz) * tsz;
-    }
-    const int64_t SL = (BL + lcm - 1) / lcm * lcm;
-    return SL - BL > 1048576 - 4096 ? BL : SL;
+    const MmqPlan P = mmq_plan(gp.gll[(size_t) layer], BL);
+    return P.ok ? P.SL : BL;
 #else
     return BL;
 #endif
@@ -2716,28 +2769,21 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     int64_t SL = BL;
 #if defined(DS4_MOE_MMQ)
     namespace mmq = strata::prefill::mmq;
-    const int gt = GL.gu_type, ut = GL.up_type >= 0 ? GL.up_type : GL.gu_type, dt = GL.d_type;
+    MmqPlan MP;
     if (im.cfg.chunk_mmq && mmq::built()) {
         if (gp.m_ok.size() != gp.gll.size()) gp.m_ok.assign(gp.gll.size(), -1);
         int8_t& ok = gp.m_ok[(size_t) CI];
+        MP = mmq_plan(GL, BL);
         if (ok < 0) {
-            ok = mmq::fits(gt, GL.n_ff) && mmq::fits(ut, GL.n_ff) && mmq::fits(dt, GL.n_embd) &&
-                 GL.up_off % 2 == 0 && GL.down_off % 2 == 0;   // a finite swiglu_limit: mmq::swiglu_clamp
+            ok = MP.ok;
             if (!ok) std::fprintf(stderr, "ds4_moe: run_chunk: layer %lld stays on MMVQ (types %d/%d/%d)\n",
-                                  (long long) layer, gt, ut, dt);
+                                  (long long) layer, GL.gu_type, GL.up_type >= 0 ? GL.up_type : GL.gu_type, GL.d_type);
         }
-        use_mmq = ok > 0;
+        use_mmq = ok > 0 && MP.ok;
     }
+    const int gt = MP.gt, ut = MP.ut, dt = MP.dt;   // the types MMQ multiplies (PTQ1_0 -> its Q2_0 copy)
     if (use_mmq) {
-        // 256 values = one block of the K-quants, 8 of MXFP4 (a multiple of its 17-byte block either way)
-        int64_t lcm = 16;
-        auto gcd = [](int64_t a, int64_t b) { while (b) { const int64_t t = a % b; a = b; b = t; } return a; };
-        for (int t : {gt, ut, dt}) {
-            const int64_t tsz = (int64_t) mmq::matrix_bytes(t, 1, 256);
-            lcm = lcm / gcd(lcm, tsz) * tsz;
-        }
-        SL = (BL + lcm - 1) / lcm * lcm;
-        if (SL - BL > 1048576 - 4096) use_mmq = false, SL = BL;
+        SL = MP.SL;
         const int64_t cap = std::max<int64_t>(16384, n);
         if (use_mmq && gp.m_rows < cap) {
             gp.free_mmq();
@@ -2834,23 +2880,32 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         mmq::quantize((const float*) gp.c_x, tokr, gp.m_xg, gt, H, H, R, gp.s);
         if (ut != gt) mmq::quantize((const float*) gp.c_x, tokr, gp.m_xu, ut, H, H, R, gp.s);
         const uint8_t* base = (const uint8_t*) ptrs[q0];
+        // PTQ1_0 matrices of the run -> their Q2_0 copies in m_tc (one launch per transcoded role; the staged blobs
+        // are SL apart, the copies SL2 apart; same stream, so the copies are done before the products read them)
+        const int nq = (int) (q1 - q0);
+        uint8_t* tc = (uint8_t*) gp.m_tc;
+        if (MP.tg) ds41_ptq1_to_q2_0_strided(base, (size_t) SL, tc + MP.g2, MP.SL2, MP.g_bytes, nq, gp.s);
+        if (MP.tu) ds41_ptq1_to_q2_0_strided(base + GL.up_off, (size_t) SL, tc + MP.u2, MP.SL2, MP.u_bytes, nq, gp.s);
+        if (MP.td) ds41_ptq1_to_q2_0_strided(base + GL.down_off, (size_t) SL, tc + MP.d2, MP.SL2, MP.d_bytes, nq, gp.s);
         mmq::Product p;
-        p.n = (int) (q1 - q0);
-        p.expert_bytes = (size_t) SL;
+        p.n = nq;
         p.bounds = (const int32_t*) gp.m_bnd;
         p.total_rows = R;
         p.max_rows = maxr;
-        p.w = base; p.type = gt; p.w_rows = FF; p.w_cols = H; p.xq = gp.m_xg;
+        p.w = MP.tg ? tc + MP.g2 : base; p.expert_bytes = MP.tg ? MP.SL2 : (size_t) SL;
+        p.type = gt; p.w_rows = FF; p.w_cols = H; p.xq = gp.m_xg;
         p.ids = (const int32_t*) gp.m_iota; p.dst = (float*) gp.m_gu; p.ld_dst = 2 * FF;
         gp.m_ctx->run(p, gp.s);
-        p.w = base + GL.up_off; p.type = ut; p.xq = ut != gt ? gp.m_xu : gp.m_xg; p.dst = (float*) gp.m_gu + FF;
+        p.w = MP.tu ? tc + MP.u2 : base + GL.up_off; p.expert_bytes = MP.tu ? MP.SL2 : (size_t) SL;
+        p.type = ut; p.xq = ut != gt ? gp.m_xu : gp.m_xg; p.dst = (float*) gp.m_gu + FF;
         gp.m_ctx->run(p, gp.s);
         if (std::isfinite(GL.swiglu_limit))   // DeepSeek-V4 (every layer clamps at 10)
             mmq::swiglu_clamp((const float*) gp.m_gu, (float*) gp.m_h, R, FF, false, GL.swiglu_limit, gp.s);
         else
             mmq::swiglu((const float*) gp.m_gu, (float*) gp.m_h, R, FF, false, gp.s);
         mmq::quantize((const float*) gp.m_h, nullptr, gp.m_xd, dt, FF, FF, R, gp.s);
-        p.w = base + GL.down_off; p.type = dt; p.w_rows = H; p.w_cols = FF; p.xq = gp.m_xd;
+        p.w = MP.td ? tc + MP.d2 : base + GL.down_off; p.expert_bytes = MP.td ? MP.SL2 : (size_t) SL;
+        p.type = dt; p.w_rows = H; p.w_cols = FF; p.xq = gp.m_xd;
         p.ids = (const int32_t*) gp.c_dst + r0; p.dst = (float*) gp.c_parts; p.ld_dst = H;
         gp.m_ctx->run(p, gp.s);
     };
@@ -2860,7 +2915,27 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 #if defined(DS4_MOE_MMQ)
         bool strided = use_mmq;
         for (size_t q = 1; strided && q < ptrs.size(); ++q) strided = ptrs[q] == ptrs[0] + q * (unsigned long long) SL;
-        if (strided) {   // sub-runs of at most m_rows entries (one expert has <= n <= m_rows)
+        // the run's PTQ1_0 copies need m_tc: sized for one device half's experts, capped by free VRAM (a sub-run
+        // then holds at most tc_max experts); none -> this run stays on MMVQ
+        size_t tc_max = SIZE_MAX;
+        if (strided && MP.SL2 > 0) {
+            const size_t want = (size_t) std::max<int64_t>(1, gp.c_half / SL) * MP.SL2;
+            if (gp.m_tc_cap < want) {
+                if (gp.m_tc) cudaFree(gp.m_tc);
+                gp.m_tc = nullptr;
+                gp.m_tc_cap = 0;
+                size_t fr = 0, tot = 0;
+                cudaMemGetInfo(&fr, &tot);
+                const size_t keep = (size_t) 2 << 30;   // room for the dense pass buffer (grows with the prompt)
+                size_t got = fr > keep ? std::min(want, fr - keep) : 0;
+                got = got / MP.SL2 * MP.SL2;
+                if (got >= MP.SL2 && cudaMalloc(&gp.m_tc, got) == cudaSuccess) gp.m_tc_cap = got;
+                else { (void) cudaGetLastError(); gp.m_tc = nullptr; }
+            }
+            tc_max = gp.m_tc_cap / MP.SL2;
+            if (tc_max == 0) strided = false;
+        }
+        if (strided) {   // sub-runs of at most m_rows entries (one expert has <= n <= m_rows) and tc_max experts
             cudaEvent_t e0 = nullptr, e1 = nullptr;
             if (prof) {
                 cudaEventCreate(&e0);
@@ -2870,7 +2945,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
             size_t q0 = 0;
             int64_t rows = 0;
             for (size_t q = 0; q < es.size(); ++q) {
-                if (rows + cnt[(size_t) es[q]] > gp.m_rows) {
+                if (rows + cnt[(size_t) es[q]] > gp.m_rows || q - q0 >= tc_max) {
                     mmq_launch(es, ptrs, q0, q);
                     q0 = q;
                     rows = 0;
@@ -3355,6 +3430,7 @@ void Ds41MoeTier::release_chunk() {
     for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_ptr, gp.c_start, gp.c_ng, gp.c_dst, gp.c_tokv,
                     gp.c_stage[0], gp.c_stage[1], gp.c_w, gp.c_out})
         if (p) cudaFree(p);
+    gp.free_mmq();   // MMQ scratch + the PTQ1_0 transcode copies (GBs): the deferred VRAM seed wants them back
     for (int i = 0; i < 2; ++i) {
         if (gp.c_copied[i]) cudaEventDestroy(gp.c_copied[i]);
         if (gp.c_used[i]) cudaEventDestroy(gp.c_used[i]);

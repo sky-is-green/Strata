@@ -73,7 +73,7 @@ struct Args {
     float temp = 0.0f;
     uint64_t seed = 1;
     std::vector<int> stop;
-    bool ppl = false, serve = false, quiet = false, vram_lru = true, arena_adapt = false, chunk_mmq = false;
+    bool ppl = false, serve = false, quiet = false, vram_lru = true, arena_adapt = false, chunk_mmq = true;
     bool act_quant = true, chunk_prefetch = true;
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
@@ -111,7 +111,11 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--prompt-batch") a.prompt_batch = std::atoi(next().c_str());
+        // prompt experts on MMQ (int8 tensor cores; PTQ1_0 through its lossless Q2_0 transcode) - DEFAULT since
+        // 2026-10-12: 8K prompt 219-220 -> 244-248 tok/s, 4096 code ppl 2.3799 -> 2.3790, KL 7.6e-3, deterministic
+        // (8K --dump-last md5 ee31507a0e88; the MMVQ path's was 4d229102872a).  --no-chunk-mmq = the MMVQ kernels.
         else if (k == "--chunk-mmq") a.chunk_mmq = true;
+        else if (k == "--no-chunk-mmq") a.chunk_mmq = false;
         else if (k == "--no-chunk-prefetch") a.chunk_prefetch = false;
         else if (k == "--chunk-prefetch") a.chunk_prefetch_gib = std::atof(next().c_str());
         else if (k == "--skip-miss") a.skip_miss = (float) std::atof(next().c_str());

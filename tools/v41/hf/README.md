@@ -171,7 +171,7 @@ stays reachable, and `--route-bias 0 --route-bias-file 0` gives fully exact rout
 
 | | |
 | --- | ---: |
-| Prefill, 8K-token prompt | 221 tok/s one-shot · 250–269 tok/s in the server |
+| Prefill, 8K-token prompt | 244–248 tok/s one-shot (tensor-core experts) |
 | Prefill, 16K / 20K prompt | 288 / 266 tok/s |
 | Decode (256-token prompt) | 25.5–26.3 tok/s · 26.6–28.9 with the opt-in fused ggml op |
 | Decode in a real agent session (20–32K context) | 22.7–28.2 tok/s |

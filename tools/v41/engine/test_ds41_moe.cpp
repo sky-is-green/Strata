@@ -69,12 +69,12 @@ double rel(const std::vector<float> & a, const std::vector<float> & b) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq]\n"); return 2; }
     std::string path = argv[1];
     int nchunk = 0;   // --chunk N: also N tokens at once through run_chunk (the prompt path), each row vs the reference
     std::vector<int> layers = { 0 };
     int ntok = 8;
-    bool gpu = false;
+    bool gpu = false, chunk_mmq = false;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--layers" && i + 1 < argc) {
@@ -85,6 +85,7 @@ int main(int argc, char ** argv) {
         } else if (a == "--tokens" && i + 1 < argc) ntok = std::atoi(argv[++i]);
         else if (a == "--gpu") gpu = true;
         else if (a == "--chunk" && i + 1 < argc) nchunk = std::atoi(argv[++i]);
+        else if (a == "--chunk-mmq") chunk_mmq = true;   // the prompt path's MMQ (PTQ1_0 via its Q2_0 transcode)
     }
     Ds41FileBlobs src(path);
     std::string err;
@@ -96,6 +97,7 @@ int main(int argc, char ** argv) {
     Ds41MoeTier tier;
     Ds41MoeConfig cfg;
     cfg.cpu_only = !gpu;
+    cfg.chunk_mmq = chunk_mmq;
     cfg.threads = 8;
     cfg.slots = 64;              // a small cache: most picks miss -> CPU / PCIe paths run too
     cfg.arena_gib = 4.0;

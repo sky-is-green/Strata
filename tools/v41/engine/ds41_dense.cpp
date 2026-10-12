@@ -22,6 +22,8 @@
 #include <set>
 #include <thread>
 
+#include <strings.h>
+
 using namespace strata;
 using namespace strata::v41;
 
@@ -224,10 +226,10 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
     const GgufModel & model = *im.model;
     ggml_init_params ip = { 256ull * 1024 * 1024, nullptr, true };
     w.ctx = ggml_init(ip);
-    auto make = [&](const TensorInfo & ti) {
+    auto make = [&](const TensorInfo & ti, int type = -1) {   // type: the in-memory type (default the file's)
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
-        ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) ti.type, (int) ti.shape.size(), ne);
+        ggml_tensor * t = ggml_new_tensor(w.ctx, (ggml_type) (type >= 0 ? type : (int) ti.type), (int) ti.shape.size(), ne);
         ggml_set_name(t, ti.name.c_str());
         return t;
     };
@@ -252,15 +254,57 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             }
         }
     } else {
+        // STRATA_DENSE_REQUANT=<ggml type name> (q6_K, q5_K, q4_K, ...; quality experiment, OFF by default): every
+        // Q8_0 dense matrix (attention, shared expert; output.weight unless STRATA_DENSE_REQUANT_HEAD=0) is
+        // re-quantized in memory at load - rows dequantized, quantized to that type.  The file is not touched.
+        ggml_type rq = GGML_TYPE_COUNT;
+        if (const char * e = std::getenv("STRATA_DENSE_REQUANT"); e && *e)
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+                if (ggml_get_type_traits((ggml_type) t)->type_name && strcasecmp(ggml_type_name((ggml_type) t), e) == 0) rq = (ggml_type) t;
+        const bool rq_head = !(std::getenv("STRATA_DENSE_REQUANT_HEAD") && std::getenv("STRATA_DENSE_REQUANT_HEAD")[0] == '0');
+        auto requant = [&](const TensorInfo & ti) {
+            return rq != GGML_TYPE_COUNT && (ggml_type) ti.type == GGML_TYPE_Q8_0 && ti.shape.size() == 2 &&
+                   (int64_t) ti.shape[0] % ggml_blck_size(rq) == 0 && (rq_head || ti.name != "output.weight");
+        };
+        size_t rq_n = 0, rq_from = 0, rq_to = 0;
         for (size_t s = 0; s < model.size(); ++s)
-            for (const auto & ti : model.shard(s).tensors())
-                if (!skip(ti.name)) w.t[ti.name] = make(ti);
+            for (const auto & ti : model.shard(s).tensors()) {
+                if (skip(ti.name)) continue;
+                w.t[ti.name] = make(ti, requant(ti) ? (int) rq : -1);
+            }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!buf) { err = "cannot allocate the dense weights on the backend"; return false; }
         w.bufs.push_back(buf);
         for (size_t s = 0; s < model.size(); ++s)
-            for (const auto & ti : model.shard(s).tensors())
-                if (!skip(ti.name)) ggml_backend_tensor_set(w.t[ti.name], model.shard(s).tensor_data(ti), 0, ggml_nbytes(w.t[ti.name]));
+            for (const auto & ti : model.shard(s).tensors()) {
+                if (skip(ti.name)) continue;
+                ggml_tensor * t = w.t[ti.name];
+                if ((int) t->type == (int) ti.type) {
+                    ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
+                    continue;
+                }
+                const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
+                const size_t src_row = ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
+                const uint8_t * src = model.shard(s).tensor_data(ti);
+                std::vector<uint8_t> dst((size_t) nr * dst_row);
+                const int nth = (int) std::max(1u, std::thread::hardware_concurrency());
+                std::vector<std::thread> th;
+                for (int k = 0; k < nth; ++k)
+                    th.emplace_back([&, k] {
+                        std::vector<float> f((size_t) n0);
+                        for (int64_t r = k; r < nr; r += nth) {
+                            ggml_get_type_traits((ggml_type) ti.type)->to_float(src + (size_t) r * src_row, f.data(), n0);
+                            ggml_quantize_chunk(t->type, f.data(), dst.data() + (size_t) r * dst_row, 0, 1, n0, nullptr);
+                        }
+                    });
+                for (auto & x : th) x.join();
+                ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+                ++rq_n;
+                rq_from += (size_t) nr * src_row;
+                rq_to += dst.size();
+            }
+        if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB\n", rq_n, ggml_type_name(rq),
+                               rq_from / 1e9, rq_to / 1e9);
     }
     size_t si = 0;
     const TensorInfo * te = model.find("token_embd.weight", &si);
