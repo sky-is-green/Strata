@@ -1,7 +1,34 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-12 ~08:30 by Claude (arena verdict in; continuing the queue: fq patch, then MTP).
-**READ §UPDATE 2026-10-12 ~18:00 FIRST**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**READ §UPDATE 2026-10-12 ~19:10 FIRST**, then ~18:00, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## UPDATE 2026-10-12 ~19:10 - READ FIRST (then ~18:00)
+
+- **Prefill MMQ DEFAULT (5f1a768c):** prompt experts on int8 tensor cores, PTQ1_0 via the lossless device transcode.
+  8K: 219-220 -> 244-248 tok/s, 4096 code ppl 2.3799 -> 2.3790, KL 7.6e-3, top-1 agree 97.9%, deterministic; 8K
+  --dump-last md5 is now **ee31507a0e88** (--no-chunk-mmq: 4d229102872a).  Uncommitted: m_tc capped at
+  STRATA_MMQ_TC_GIB (1) - taking all free VRAM shrank the prestage region 3.00 -> 1.37 GiB (dense half +1.2 s).
+- **DSpark verdict so far: NOT worth building on this trunk.**  Acceptance 0.73/pass with decode biases, 0.41 with
+  EXACT routing (worse!), confidence head uninformative.  Both generations are coherent code (exact one better).
+  Pending decisive test: teacher (FP8) hidden states for the SAME tokens via `v41_calib.py prep-ids` (added) on
+  p256.i32 + ~/AI/v41-dev/dspark/gen_exact.i32 (383 ids) -> init -> layer 0..39 --no-gptq -> h/L37-39 -> run
+  dspark_accept on those (needs a small loader for h/LNN.bin [1,S,4,5120] bf16-as-int16) + `head` for teacher top-1.
+  If teacher states also give ~0.4-0.7, DSpark is just weak here; if ~3, our 2-bit trunk drift kills it.
+- **Decode profile (nsys, decode-only window):** dense Q8_0 mat-vec 8.84 ms/token (bandwidth floor), expert kernels
+  ~7 ms: native_gu<143> 2.72 ms (76 us/launch, ~136 GB/s), down<143> 1.31, gu_multi<42> 0.93, down_multi<42> 0.75,
+  Q3_K ~1.1; argsort 0.72, F32 router+predict 0.77, F16 indexer/compressor 0.7, flash-attn 0.69.
+- **Ternary decode kernel work (UNBUILT, src/kernels/cuda):** fork_vecdot.cuh vec_dot_ptq1_0_q8_1_quarter + Fmt<143>
+  ipb 4 (fork_fmt.cuh; -DSTRATA_PTQ1_WHOLE = old); iq_kernels.cu STRATA_EXP_MODE_T<type>=<1|2|4> per-type layout
+  override + PTQ1_0/Q3_K in the AMD (multi-row) layouts.  A/B script ~/AI/v41-dev/k143/ab.sh TAG [ENV=..]
+  (--slots 1500, p256 x 256, DEC_PROF).  Gate first: build-ds4-gpu/test_ds41_moe_gpu GGUF --layers 0,20,32,39 --gpu
+  --tokens 8 (decode path vs F32).  Prism fork (PrismML-Eng/llama.cpp, vecdotq.cuh) ideas: exact int sums in q8_1
+  ds.y (drops the sumu dp4a - safe here: Q2_0/Q3_K dots do not read ds.y), qh trits paired into dp4a, _multi
+  (decode once, many columns: for verify windows), MMQ tile loader expanding PTQ1_0 to int8.
+- Dense requant test RUNNING: ~/AI/v41-dev/dq/run.sh -> results.txt (q8 baselines: code 2.3790 / agent 14.4735 /
+  reason 6.5974, decode 28.31 tok/s).
+- HF upload: running (part 1), xet concurrency capped at 3 (upload-start.sh) after ~1/3 of bandwidth was lost to
+  timeouts; resumes on rerun.
 
 ## UPDATE 2026-10-12 ~18:00 (evening session) - READ FIRST
 
