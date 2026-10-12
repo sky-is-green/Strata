@@ -1,3 +1,5 @@
+> **This is the OLD DeepSeek-V4-Flash (0731) handoff. For the current V4.1 work read [V41_START_HERE.md](V41_START_HERE.md) only.**
+
 ## RESUME HERE (2026-10-09 ~18:40) - the active work is DeepSeek-V4.1: read docs/ds4/V41_RESUME_PROMPT.md
 (handoff + paste-able prompt).  DS4 V4 open items are listed at its end.
 

@@ -1,5 +1,9 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
+> **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
+> This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
+
+
 **Last updated:** 2026-10-13 ~03:20 by Claude (session 4, conductor). Decode bottleneck MEASURED (dense Q8_0 weight bandwidth); the earlier GPU-idle attribution was a TOOLING BUG; slice C / C' / spec-reads refuted; HF upload complete.
 **READ §UPDATE 2026-10-13 ~05:10 FIRST, then §UPDATE ~03:20, then §UPDATE 2026-10-12 ~20:45, then §UPDATE ~19:50, then §HANDOFF ~19:30**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
 
