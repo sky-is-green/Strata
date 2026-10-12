@@ -7,7 +7,9 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
 
 > **Status: experimental, single-developer research code, measured on one PC.** The V4.1 engine generates correct
 > text, its GPU prompt path is deterministic (byte-identical logits run to run), and it serves an OpenAI / Anthropic
-> API with tool calls (one sequence at a time).  The GSQ model file it runs is not published.
+> API with tool calls (one sequence at a time).  The GSQ model file is on Hugging Face:
+> **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
+> (uploading since 2026-10-12; the parts arrive over about a day).
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
 
@@ -29,6 +31,10 @@ A bigger arena does not help on this box: 62 / 65 GiB cut NVMe reads 10% but dec
 (24.4-25.2 tok/s at 60, 24.5 at 62, 24.7 at 65), because the file penalty already keeps decode routing off the NVMe tier.
 
 ### The model file: GSQ mixed tiers (152 GiB)
+
+Download: **[huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
+(16 byte-split parts + `reassemble.sh`, which verifies and joins them; also the DSpark draft stack + vision tower sidecar).
+The upload scripts are in `tools/v41/hf/`.
 
 `tools/v41` holds a GPTQ-style quantisation pipeline (`v41_calib.py`, `v41_alloc.py`, `v41_quant.py`,
 `v41_gptq_graph.py`) that gives every expert its own format from calibration statistics: **PTQ1_0** (ternary,

@@ -28,6 +28,34 @@ sys.path[:0] = [os.path.join(HERE, "torch_kernels"), REF, HERE]
 import model as M  # noqa: E402
 from v41_gguf import Source  # noqa: E402
 
+def cache_weights():
+    """model.py's fp8_gemm / fp4_gemm (our torch stand-ins) dequantize the whole weight to fp32 on every call - ~2G
+    params per draft step.  FP8 e4m3 / FP4 e2m1 times a power-of-two scale are exact in bf16, and so is the FP8-quantized
+    activation, so each weight is dequantized ONCE into a bf16 cache (keyed by storage address) and the GEMM runs in
+    bf16 (fp32 accumulation): the same values, only the summation order differs."""
+    import kernel as K
+    cache = {}
+
+    def deq(b, b_s, fp4, block_size):
+        key = (b.data_ptr(), b_s.data_ptr())
+        w = cache.get(key)
+        if w is None:
+            w = (K.dequant_fp4_weight(b, b_s) if fp4 else K.dequant_fp8_weight(b, b_s, block_size)).to(torch.bfloat16)
+            cache[key] = w
+        return w
+
+    def fp8_gemm(a, a_s, b, b_s, scale_dtype=torch.float32, block_size=128):
+        A = K._dequant_act(a, a_s, block_size).to(torch.bfloat16)
+        return (A @ deq(b, b_s, False, block_size).t()).to(torch.get_default_dtype())
+
+    def fp4_gemm(a, a_s, b, b_s, scale_dtype=torch.float32, act_block_size=128):
+        A = K._dequant_act(a, a_s, act_block_size).to(torch.bfloat16)
+        return (A @ deq(b, b_s, True, 0).t()).to(torch.get_default_dtype())
+
+    M.fp8_gemm, M.fp4_gemm = fp8_gemm, fp4_gemm
+    return cache
+
+
 DT = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8m0fnu, "I8": torch.float4_e2m1fn_x2,
       "BF16": torch.bfloat16, "F32": torch.float32}
 
@@ -67,6 +95,7 @@ def main():
     M.world_size, M.rank, M.default_dtype = 1, 0, torch.float8_e4m3fn
     D = args.dim
 
+    wcache = cache_weights()
     src = Source()
     t0 = time.time()
     with torch.no_grad():
@@ -112,6 +141,9 @@ def main():
                 h, pre_mix = layer(h, pos, pre_mix, main_x)
             r = mtp[-1].forward_head(h, pre_mix, nxt[:, 0])
             if j < n_seed or j + 1 + BS >= len(seq):
+                if j % 16 == 0:
+                    gb = sum(w.numel() for w in wcache.values()) * 2 / 1e9
+                    print(f"  step {j}/{n} ({(time.time() - t0) / (j + 1):.2f} s/step, weight cache {gb:.1f} GB)", flush=True)
                 continue
             out_ids, _, conf = r
             draft = out_ids[0, 1:].tolist()             # tokens for seq[j+2 .. j+1+BS]

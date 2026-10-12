@@ -388,12 +388,13 @@ int main(int argc, char ** argv) {
     // STRATA_SPEC_L1=1: also read the next layer's predicted file-tier experts (one layer of lead: mostly late)
     const bool spec_l1 = std::getenv("STRATA_SPEC_L1") && std::getenv("STRATA_SPEC_L1")[0] == '1';
     // STRATA_DUMP_MAIN=F (measurement only, slower): per decode step append {int32 token, int32 pos, 3 x n_embd f32} to F
-    // = the step's input token and the HC-mean of layers 37/38/39's output state (DeepSeek model.py's DSpark
-    // main_hidden), for the offline DSpark acceptance test (tools/v41/dspark_accept.py).  The one-shot run then feeds
-    // the last 128 prompt tokens (DSpark's attention window) as steps too.
+    // = the step's input token and DeepSeek model.py's DSpark main_hidden: the HC-mean of the state ENTERING target
+    // layers 37/38/39 ("the MTP head reads the attention input of its target layers, not their output") = the output
+    // of layers 36/37/38 - for the offline DSpark acceptance test (tools/v41/dspark_accept.py).  The one-shot run then
+    // feeds the last 128 prompt tokens (DSpark's attention window) as steps too.
     const char * dump_main_path = std::getenv("STRATA_DUMP_MAIN");
     std::FILE * dump_main = dump_main_path ? std::fopen(dump_main_path, "wb") : nullptr;
-    const int dm_layers[3] = { 37, 38, 39 };
+    const int dm_layers[3] = { 36, 37, 38 };   // outputs of these = inputs of the targets 37 / 38 / 39
     std::vector<float> dm_x, dm_pre, dm_row;
     int dm_tok = 0, dm_pos = 0;
     const bool file_pred = std::getenv("STRATA_FILE_PRED") != nullptr;
