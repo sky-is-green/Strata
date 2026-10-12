@@ -1,7 +1,43 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-12 ~08:30 by Claude (arena verdict in; continuing the queue: fq patch, then MTP).
-**READ §UPDATE 2026-10-12 ~10:15 FIRST**, then §UPDATE ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**READ §UPDATE 2026-10-12 ~18:00 FIRST**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## UPDATE 2026-10-12 ~18:00 (evening session) - READ FIRST
+
+**HF release LIVE (public): https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored** - card =
+tools/v41/hf/README.md (full GSQ process, measured tier mix 42.8% ternary / 39.2% Q2_0 / 18.0% Q3_K = 2.250 bpw,
+per-layer held-out error from /media/Crucial1TB/v41-quant-mixed/quant.log), reassemble.sh (tested: join, --delete-parts,
+corrupt part refused), Engram placeholders model-0004{7,8}-...NEED-TO-DOWNLOAD.txt.  Upload = tools/v41/hf/hf_upload.py
+(resumable, 16 x 10 GiB byte parts staged to NVME1TB/hf-staging, source GGUF O_RDONLY only, deletes only its staged parts);
+start/pause: tools/v41/hf/upload-start.sh / upload-stop.sh, log ~/AI/v41-dev/hf/upload.log, state (sha256 of every
+part + whole file) ~/AI/v41-dev/hf/state.json.  ~1.6 h per part at ~1.85 MB/s; after a reboot just run upload-start.sh.
+README links HF; HF card links GitHub.
+
+**DSpark (V4.1 native drafter) - offline acceptance on OUR trunk: 0.73 accepted / pass (1.73 tokens per verify pass;
+first draft token 47%; dist 0:53% 1:29% 2:11% 3:5% 4:1.1% 5:0.3%).**  V4 DSpark in llama.cpp: 3.4.  Harness:
+tools/v41/dspark_accept.py (DeepSeek model.py on our torch kernels + bf16 weight cache, ~2 s/draft) on
+STRATA_DUMP_MAIN dumps.  BUG FIXED on the way: main_hidden = the state ENTERING target layers 37-39 (= output of
+36-38; model.py "reads the attention input of its target layers") - the first dump was one layer late (0.15).
+IN FLIGHT: exact-routing dump (~/AI/v41-dev/dspark/dump_exact.sh -> main_exact.bin + gen_exact.txt, --route-bias 0
+--route-bias-file 0).  Run dspark_accept.py on it: if acceptance jumps, the decode biases are the cause (verify with
+less bias); if not, DSpark is a poor match for the 2-bit trunk -> spend the effort on dense/prefill instead.
+
+**Prefill finding:** the prompt path's expert kernels are dp4a MMVQ (CUDA cores), ~10 s GPU per 4K tokens.  Strata's
+MMQ (int8 tensor cores) covers Q2_0 + Q3_K (+ MXFP4) but NOT PTQ1_0, and --chunk-mmq gates per class -> every class
+with a ternary matrix stayed on MMVQ.  BUILT (uncommitted, unbuilt into ds41_generate yet): tools/v41/engine/
+ds41_transcode.cu (PTQ1_0 -> Q2_0 on the device, same d, code = trit+1: LOSSLESS; test_ds41_transcode ALL PASS, 11.8M
+values incl. a full gate matrix + edge d) + ds41_moe.cpp mmq_plan()/mmq_launch transcode path (STRATA_MMQ_PTQ1=0 off;
+copies in gp.m_tc capped by free VRAM - 2 GiB; release_chunk now frees MMQ buffers).  NEXT: build, test_ds41_moe --gpu
+--chunk 512 --chunk-mmq on layers 0,20,39 (vs F32 ref), then 8K prompt --chunk-mmq A/B (speed, md5 WILL differ:
+different kernels; gate on 4096 code ppl 2.3799 +- tiny and KL).  H2D: cudaHostAlloc 22.5 GB/s, 4K-page registered
+arena 18.8-19.7 GB/s (scratchpad h2d.py), engine achieves ~13 -> the copies are fed badly, not page-size-limited.
+
+**Dense requant experiment (Mal: side project):** STRATA_DENSE_REQUANT=q6_K|q5_K|q4_K (load-time, file untouched,
+every Q8_0 dense matrix; STRATA_DENSE_REQUANT_HEAD=0 keeps output.weight Q8_0) added to ds41_dense.cpp (uncommitted).
+Measure 4096 code + agentic ppl + KL vs Q8_0 + decode tok/s + slots freed; Mal decides.  Dense = ~7 GB of 163.
+
+nsys profiles queued/running: ~/AI/v41-dev/nsys/run.sh -> pf8k.nsys-rep (8K prefill) + dec.nsys-rep (decode).
 
 ## UPDATE 2026-10-12 ~10:15 (Mal shut the PC down mid-run) - READ FIRST
 
