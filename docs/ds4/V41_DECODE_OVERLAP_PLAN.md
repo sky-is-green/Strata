@@ -95,6 +95,34 @@ critical path - which is the more likely explanation for why the demand-copy ove
 The prefetch's own break-even was measured NET NEGATIVE once already (resume doc: finish graph +1.5 ms, issuing
 +1.3 ms, vs -1.8 ms tier) - this volume number says why, and says the fix is to send far less.
 
+### 1c-bis. THE ABOVE WAS WRONG - the `--pf-b` sweep says the prefetch EARNS its traffic (2026-10-12 ~22:05)
+
+`dec10/seq10.sh` swept `--pf-b` with forced tokens (all runs byte-identical output, so identical work):
+
+| `--pf-b` | tok/s | tier ms | VRAM hits / 256 tok |
+|---|---|---|---|
+| **1.43 (default)** | **27.45 / 27.49** | **16.x** | 59511 |
+| 0 (off) | 25.23 / 25.69 | **21.x** | **56939** |
+| 3.0 | 25.90 / 25.74 | 18.x | 59966 |
+| 6.0 | 25.64 | 18.x | 60049 |
+
+**The default is the FASTEST of the four, and turning the prefetch OFF is the slowest.**  With `pf-b 0` the VRAM
+hits fall 59511 -> 56939 (-2.4 points) and the tier rises 16 -> 21 ms: so the 275 MB/token is buying exactly the
+hits it is supposed to, worth ~5 ms of tier, and its DMA overlaps well enough to be net positive.  Going the
+other way (3.0, 6.0) buys a few more hits but less than the extra traffic costs.  **So: the prefetch is
+well-tuned; "the volume is waste" was a wrong inference from the byte counts alone.**  Do not touch `--pf-b`.
+
+**What the same traces DO establish (the real picture):**
+- With the prefetch off, **GPU busy activity falls to 10.01 ms/token** (idle 78.6%) - so the actual COMPUTE is
+  only ~10 ms/token; of the 19.47 ms "busy" at the default, **~9.5 ms is prefetch DMA activity**, not compute.
+  The remaining ~17 ms of the token is host waits.  That is the budget to attack, and it is not a kernel problem.
+- `MAX CONCURRENT ACTIVITIES` is 2 with the prefetch on and **1 with it off** - the prefetch stream is the only
+  source of concurrency in the engine.  Slice A added a second copy stream and did not raise the peak, which is
+  consistent with its ~0.5 ms of effect.
+- NOTE for anyone reusing `~/AI/v41-dev/nsys/calls.py`: it assumes the window is the last 4.5 s == N tokens, so
+  the per-token numbers drift when a config changes the decode rate (the window is fixed wall-clock).  Compare
+  like-for-like runs, or pass the real token count.
+
 ## 2. Why it is serial - the root cause
 
 Per layer the chain is `attn_router(l)` -> **[host reads the top-k ids]** -> `tier.run_to_dev(l)` ->
