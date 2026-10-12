@@ -247,6 +247,10 @@ struct Gpu {
     void* d_pf = nullptr;         ///< kMaxPf staging slots, one expert blob each
     cudaStream_t s_pf = nullptr;  ///< the prefetch stream (never the main one: the DMAs run under the dense work)
     cudaEvent_t ev_pf = nullptr;
+    cudaStream_t s_dc = nullptr;  ///< STRATA_DMA_OVERLAP: the demand-copy stream.  A layer's PCIe/file blob DMAs run
+                                  ///< here, so they overlap that layer's resident-expert kernels on `s` instead of
+                                  ///< queueing behind them; `s` waits on ev_dc before the miss kernels are launched.
+    cudaEvent_t ev_dc = nullptr;
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
     void* h_parts = nullptr;      ///< pinned D2H landing pad for the expert outputs
@@ -317,6 +321,8 @@ struct Gpu {
             if (p) cudaFree(p);
         if (ev_pf) cudaEventDestroy(ev_pf);
         if (s_pf) cudaStreamDestroy(s_pf);
+        if (ev_dc) cudaEventDestroy(ev_dc);
+        if (s_dc) cudaStreamDestroy(s_dc);
         if (s) cudaStreamDestroy(s);
         if (h_dummy) cudaFreeHost(h_dummy);
         if (h_x) cudaFreeHost(h_x);
@@ -1208,6 +1214,13 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
     ck(cudaMalloc(&gp.d_meta, kMetaBytes), "d_meta");
     ck(cudaMallocHost((void**) &gp.h_meta, kMetaBytes), "h_meta");
+    // STRATA_DMA_OVERLAP=1 (slice A, docs/ds4/V41_DECODE_OVERLAP_PLAN.md): a separate stream for the demand copies
+    // so a layer's PCIe/file DMA overlaps that layer's resident-expert kernels.  Off by default: unproven until the
+    // nsys overlap metric (max concurrent kernels > 1) and repeated forced-token identity both hold.
+    if (std::getenv("STRATA_DMA_OVERLAP")) {
+        ck(cudaStreamCreateWithFlags(&gp.s_dc, cudaStreamNonBlocking), "dc stream");
+        ck(cudaEventCreateWithFlags(&gp.ev_dc, cudaEventDisableTiming), "ev_dc");
+    }
     if (cfg.pf_b > 0) {
         ck(cudaStreamCreateWithFlags(&gp.s_pf, cudaStreamNonBlocking), "pf stream");
         ck(cudaMalloc(&gp.d_pf, (size_t) Ds41MoeConfig::kMaxPf * (size_t) im_->blob), "d_pf");
@@ -1997,9 +2010,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // file reads/token without this).  Both copies run on gp.s: the D2H after the incoming blob left the arena slot,
     // the slot write after the D2H.
     auto arena_slot = [&](int32_t e) { return gp.arena.base ? gp.arena.slot_of[(size_t) (layer * NXL + e)] : -1; };
-    auto demote = [&](int32_t victim_slot, int32_t into_arena, int64_t bytes) {
+    auto demote = [&](int32_t victim_slot, int32_t into_arena, int64_t bytes, cudaStream_t st) {
+        // reads the victim cache slot: it MUST be on the same stream as whoever overwrites that slot afterwards (the
+        // lru pf copy, or the pcie group's stage copy under STRATA_DMA_OVERLAP), or the demoted blob is corrupted.
         ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) into_arena],
-                           gp.cache->device_slot(victim_slot), (size_t) bytes, cudaMemcpyDeviceToHost, gp.s), "lru demote");
+                           gp.cache->device_slot(victim_slot), (size_t) bytes, cudaMemcpyDeviceToHost, st), "lru demote");
     };
     auto lru_victim = [&](int32_t incoming) -> int32_t {
         int32_t v = -1;
@@ -2040,7 +2055,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             if (arena_slot(v) < 0) {
                 dem = arena_slot(ids6[k]);   // prefetches come from the arena (never the dummy: pf_e = -1 then)
                 if (dem < 0) continue;
-                demote(sl, dem, BLX(v));
+                demote(sl, dem, BLX(v), gp.s);
             }
             ck(cudaMemcpyAsync(gp.cache->device_slot(sl), (const void*) pf_ptr[k], (size_t) BLX(ids6[k]), cudaMemcpyDeviceToDevice,
                                gp.s), "lru pf copy");
@@ -2051,6 +2066,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         }
     }
     if (np > 0) {
+        // STRATA_DMA_OVERLAP (see the Gpu::s_dc comment): the copies go on the demand-copy stream so they overlap the
+        // resident-expert kernels already launched on gp.s, then ONE event orders gp.s before this group's kernels.
+        // Sources are this call's arena experts and destinations are d_stage (or their own victim slot); the pool's
+        // readers only write victims, and a victim is never routed this call, so the two sets are disjoint.
+        const cudaStream_t cs = gp.s_dc ? gp.s_dc : gp.s;
         std::vector<unsigned long long> ptr((size_t) np);
         std::vector<int32_t> start((size_t) np + 1), dst((size_t) np, 0), tok((size_t) np, 0);
         for (int i = 0; i < np; ++i) {
@@ -2065,24 +2085,28 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
                 int32_t dem = -1;
                 if (arena_slot(v) < 0) {   // demote: arena -> stage, victim -> arena slot, stage -> victim slot
                     dem = arena_slot(ids6[pcie_i[i]]);
-                    ck(cudaMemcpyAsync(to, p, (size_t) BL, cudaMemcpyHostToDevice, gp.s), "pcie dma");
-                    demote(gp.cache->slot_of(layer, v), dem, BL);
-                    ck(cudaMemcpyAsync(vs, to, (size_t) BL, cudaMemcpyDeviceToDevice, gp.s), "lru stage copy");
+                    ck(cudaMemcpyAsync(to, p, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                    demote(gp.cache->slot_of(layer, v), dem, BL, cs);
+                    ck(cudaMemcpyAsync(vs, to, (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
                 } else {   // the DMA lands in the victim slot: the kernel below reads it there, and it stays
                     to = vs;
-                    ck(cudaMemcpyAsync(to, p, (size_t) BL, cudaMemcpyHostToDevice, gp.s), "pcie dma");
+                    ck(cudaMemcpyAsync(to, p, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
                 }
                 lru_old[n_lru] = v;
                 lru_dem[n_lru] = dem;
                 lru_new[n_lru++] = ids6[pcie_i[i]];
             } else {
-                ck(cudaMemcpyAsync(to, p, (size_t) BL, cudaMemcpyHostToDevice, gp.s), "pcie dma");
+                ck(cudaMemcpyAsync(to, p, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
             }
             ptr[(size_t) i] = (unsigned long long) to;
             start[(size_t) i] = i;
             dst[(size_t) i] = pcie_i[i];
         }
         start[(size_t) np] = np;
+        if (gp.s_dc) {   // this group's bytes must be home before its kernels run - one wait covers the whole group
+            ck(cudaEventRecord(gp.ev_dc, cs), "record demand copies");
+            ck(cudaStreamWaitEvent(gp.s, gp.ev_dc, 0), "wait demand copies");
+        }
         launch_group(1, np, ptr, start, dst, tok);
         ck(cudaEventRecord(gp.ev[3], gp.s), "record pcie");
         ev_pcie = 3;

@@ -24,6 +24,77 @@ Per decode token (256-token prompt, greedy, 4.5 s trace window, 96 tokens):
 Two independent attributions agree on all of this (counts within window trim), which is why the numbers are
 trusted.
 
+## 1b. BASELINE for slice A - measured on `gen.v7` (packing + S4 in), `nsys/dec7.sqlite`
+
+Reproduce with `python3 ~/AI/v41-dev/nsys/calls.py nsys/dec7.sqlite 96`.
+
+| metric | gen.v7 | dec3 (before packing/S4) |
+|---|---|---|
+| GPU busy / idle | 18.42 ms/tok / **60.7% idle** | 18.27 / 61% |
+| **MAX CONCURRENT KERNELS** | **1** | 1 |
+| host calls/token (total) | **1606** | 1680 |
+| `cuKernelGetName` | 418.5 | - (not in the top list) |
+| `cudaLaunchKernel` | 418.5 | 417.7 |
+| `cudaMemcpyAsync` | **350.7** | 387.1 |
+| `cudaStreamSynchronize` | **217.5** | 257.7 |
+| `cudaEventRecord` | 106.1 | 105.4 |
+| `cudaGraphLaunch` | 80.6 | 80.7 |
+| `cudaStreamWaitEvent` | 10.0 | 10.1 |
+| stream sync ms/tok | s16 17.13, s14 4.73 | s16 17.02, s14 5.03 |
+| kernels/token | s14 322.9, s16 56.3 | s14 322.1, s16 56.2 |
+
+**The two changes show up exactly in the counts and nowhere else - which is the point:**
+- S4 removal = **-40.2 syncs/token = 1.0/layer**, precisely as designed, and still speed-neutral because the wait
+  moves into the sum sync (the tier profile proves it).
+- Metadata packing = **-36.4 memcpyAsync/token, NOT the ~280 that "one copy per class" predicted** - most groups
+  have only 2-3 distinct format classes among 6 experts, not 9.  That is why it measured neutral, and it is now
+  explained rather than just observed.
+- `cuKernelGetName` is issued **once per kernel launch** (418.5/token) - a pure diagnostic, ~0.09 ms/token,
+  removable for free if anyone wants the last crumbs.
+
+**Slice A's acceptance test:** `MAX CONCURRENT KERNELS > 1` in an `STRATA_DMA_OVERLAP=1` trace, plus forced-token
+identity across >=3 runs (it is a race, so one clean run is not evidence).
+
+## 1c. Slice A VERDICT + the volume finding it exposed (2026-10-12 ~21:35)
+
+**Slice A is implemented and CORRECT, but its ceiling is small - and measuring it exposed where the bytes are.**
+
+- Implemented: `STRATA_DMA_OVERLAP=1` (default off) puts the PCIe group's blobs on a new copy stream `gp.s_dc`
+  with one event handoff before the miss kernels (see 3b).  It demonstrably took effect: `gp.s` (stream 14)
+  memcpy fell **69.87 -> 43.27 MB/token** and the new stream holds the **26.59 MB** the PCIe group moves.
+- **Correctness PASS**: 5 forced-token runs (2 off, 3 on) all byte-identical to the forcing file - no corruption,
+  which is the bar that matters because this is a race.
+- **Speed: no gain.**  off 26.87 / 26.96 tok/s, on 26.52 / 26.55.  GPU idle 60.7% -> 59.3% (only ~0.5 ms/token
+  filled).  The ceiling is arithmetic: the PCIe group moves 26.6 MB/token = **~1.7 ms at 15.8 GB/s**, and only
+  part of that hides.  Below the noise floor of tok/s, so this is a keep-or-revert-on-taste change, not a win.
+- **METRIC BUG FOUND AND FIXED:** `calls.py` swept only `CUPTI_ACTIVITY_KIND_KERNEL`, so a kernel||DMA overlap is
+  invisible - it read `MAX CONCURRENT KERNELS = 1` for BOTH traces.  It now sweeps kernels+memcpy+memset and is
+  named `MAX CONCURRENT ACTIVITIES`.  On these traces it reads **2 for both** - i.e. slice A did not raise the
+  peak concurrency either, consistent with the tiny gain.
+
+**THE FINDING - the H2D volume is one activity, and it is almost all PREFETCH:**
+
+| stream | MB/token | what |
+|---|---|---|
+| `s_pf` (prefetch) | **274.71** | the speculative expert prefetch - 29.2 DMAs/token of 9.5 MB |
+| `gp.s` / demand (pcie+file+metadata) | 69.87 -> 43.27 | the actual misses |
+| ggml's stream / s_cg | 0.93 | activations |
+| stream 13 | 0.58 | - |
+
+**274.71 MB/token at 15.8 GB/s is 17.4 ms/token of PCIe time - comparable to the entire 37.5 ms token - and the
+engine's own counters say only 2499 of 8065 prefetch DMAs per 256 tokens are ever USED (31%; ~10/token vs
+~31.5/token issued).**  So roughly two thirds of the expert traffic (and 5x the demand traffic) is speculative
+guesses that miss.  Even if it overlaps, it competes for the same PCIe path as the demand copies that ARE on the
+critical path - which is the more likely explanation for why the demand-copy overlap (slice A) bought so little.
+
+**Therefore the next slice is not more overlap, it is LESS PREFETCH VOLUME:**
+1. skip a prefetch whose expert is already VRAM-resident (is it even checked? - verify in `prefetch()`), and
+2. cut the issued set: today `kPredW=16` / `kMaxPf=6` issues ~29 DMAs/token for ~10 used - try issuing only the
+   top 4-8, or only when the prediction score is above a percentile (the Fate widening, scout §1), and
+3. re-measure with `MAX CONCURRENT ACTIVITIES` plus the `prefetch N issued / D outside / U used` counters, not tok/s.
+The prefetch's own break-even was measured NET NEGATIVE once already (resume doc: finish graph +1.5 ms, issuing
++1.3 ms, vs -1.8 ms tier) - this volume number says why, and says the fix is to send far less.
+
 ## 2. Why it is serial - the root cause
 
 Per layer the chain is `attn_router(l)` -> **[host reads the top-k ids]** -> `tier.run_to_dev(l)` ->
@@ -76,6 +147,38 @@ for `native_expert_grouped` **in place**.  Then the host never needs the ids: it
 ahead of the device.  S1 (the last unavoidable host wait) disappears, the bubble disappears, and the copies
 overlap by construction.  Prerequisite: slice B's fixed metadata layout.  This is the one that changes the
 architecture; A and B are the steps that pay for themselves on the way.
+
+## 3b. Slice A - implementation gotchas found by reading the code (READ BEFORE EDITING)
+
+- **`gp.s_cp` does NOT exist on the decode path.**  It is created only in the prefill/chunk path
+  (`ds41_moe.cpp:2834`) and every user guards on it (`2708`, `2733`).  Slice A needs a stream created next to
+  `gp.s` in the context init (`ds41_moe.cpp:1194`, where `gp.s`/`gp.s_pf` are made) plus its destroy in the same
+  place as theirs, not a reuse of `s_cp`.
+- **The arena/pool question is ANSWERED - the ordering is simpler than it first looks.**  The CPU pool's reader
+  threads write only arena **victim** slots, and a victim is only ever an arena expert with `last_use < im.tick`,
+  i.e. NOT routed by this call (`ds41_moe.cpp:2174-2175`); the PCIe DMAs read THIS call's arena experts, which all
+  have `last_use >= im.tick`, so **source and victim sets are disjoint by construction**.  Arena slots are
+  indexed per `(layer, expert)` (`NXA`-strided `slot_of`), and a layer is visited once per token, so there is no
+  cross-layer aliasing either.  The host also joins the reader threads before any DMA is issued
+  (`for (auto& t : rd) t.join();`, `2198`), so "writes before the async copy call" holds in program order.
+  Precedent in-tree for the pattern that IS needed: `if (direct && gp.s_pf) cudaStreamSynchronize(gp.s_pf), "pf
+  sync"` at `2167` (no prefetch DMA may read a slot the readers are about to overwrite).
+- **So the change is:** issue the `pcie dma` copies (`2068/2073/2079`) plus the `lru stage copy` D2D (`2070`) on
+  the new copy stream, `cudaEventRecord` on it, then a single `cudaStreamWaitEvent(gp.s, ev)` immediately before
+  `launch_group(1, np, ...)` at `2086` - one wait covers the whole group, and the kernels keep running on gp.s.
+  `gp.s_cp`-style discipline: nothing else may be issued on the copy stream within the layer without its own
+  ordering.
+- d_stage regions are disjoint per group (pcie at `[0, np)`, file at `[np, np+nfg)`, stride `B`), so the pcie and
+  file copies can share the one copy stream; the file group's copies are issued after its reader threads join
+  (`2198`), so they order after the reads for free.
+- Ship it behind an env flag (`STRATA_DMA_OVERLAP=1`), default OFF, until the nsys overlap metric
+  (max concurrent kernels > 1) and forced-token identity both hold across several runs.  The forced-token check
+  is the correctness bar but it is a RACE-check, not a proof: run it several times, and read the overlap number
+  as the real evidence that the copies moved off the compute path.
+- Expected size: the pcie DMA is ~3.3 ms/token and the file DMA ~1 ms (scout's miss math), so overlapping them
+  with the resident-expert compute is worth ~4 ms/token - real but BELOW the 5 ms noise floor of tok/s, which is
+  why the metric must be the nsys overlap count, not throughput.  (The scan's 11-14 ms ceiling assumed
+  overlapping the copies with the attention too, which needs slice C first.)
 
 ## 4. How to measure (mandatory - the noise floor will lie to you)
 
