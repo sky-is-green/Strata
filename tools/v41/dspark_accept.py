@@ -83,6 +83,10 @@ def main():
     ap.add_argument("gen_txt")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--max", type=int, default=0, help="score at most N decode steps")
+    ap.add_argument("--teacher", default=None, metavar="WORKDIR",
+                    help="main_hidden from the FP8 teacher instead: v41_calib.py prep-ids/init/layer work dir "
+                         "(h/L37-39.bin = the streams ENTERING the target layers, tokens.npy); the records cover the "
+                         "same positions as main_bin's (main_bin then only gives positions)")
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     torch.set_default_dtype(torch.bfloat16)
@@ -120,6 +124,20 @@ def main():
     toks = rec[:, 0:4].copy().view(np.int32)[:, 0]
     poss = rec[:, 4:8].copy().view(np.int32)[:, 0]
     hid = rec[:, 8:].copy().view(np.float32)
+    eng = hid
+    if a.teacher:   # replace the engine's states by the teacher's, same positions / tokens
+        tt = np.load(os.path.join(a.teacher, "tokens.npy"))[0]
+        S = len(tt)
+        hs = []
+        for L in args.dspark_target_layer_ids:
+            hm = np.memmap(os.path.join(a.teacher, "h", f"L{L:02d}.bin"), dtype=np.int16, mode="r").reshape(S, args.hc_mult, D)
+            hs.append((np.asarray(hm).view(np.uint16).astype(np.uint32) << 16).view(np.float32).mean(axis=1))   # bf16 bits -> f32, HC-mean
+        th = np.concatenate(hs, axis=1)                                             # [S, 3D]
+        assert np.all(toks == tt[poss]), "teacher tokens differ from the engine's at the dumped positions"
+        hid = th[poss].astype(np.float32)
+        print(f"teacher states from {a.teacher}: cosine vs engine per target layer: " + " ".join(
+            f"{float(np.mean([np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-30) for x, y in zip(hid[:, i*D:(i+1)*D], eng[:, i*D:(i+1)*D])])):.4f}"
+            for i in range(3)), flush=True)
     gen = [int(x) for x in open(a.gen_txt).read().split() if x.lstrip("-").isdigit()]
     # the token after record j: record j+1's input; after the last record: the last generated id
     seq = list(toks) + [gen[-1]]

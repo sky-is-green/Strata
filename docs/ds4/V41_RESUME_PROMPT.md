@@ -1,7 +1,97 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
 **Last updated:** 2026-10-12 ~08:30 by Claude (arena verdict in; continuing the queue: fq patch, then MTP).
-**READ §UPDATE 2026-10-12 ~19:10 FIRST**, then ~18:00, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**READ §HANDOFF 2026-10-12 ~19:30 FIRST**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## HANDOFF 2026-10-12 ~19:30 - READ THIS FIRST (supersedes everything below where they differ)
+
+Session ended for a fresh-context restart.  All code is committed + pushed (repo Indras-Mirror/Strata-DSV4.1, branch
+deepseek4 -> `git push ds4 deepseek4:main`).  Below: state, numbers, in-flight jobs, the exact next steps.
+
+### Current numbers (RTX 4090 24 GB, Ryzen 7 5700X 8C/16T, 90 GB DDR4, NVMe)
+- Prefill 8K: **244-248 tok/s** (MMQ default; was 219-220).  Exactness ref (default path): 8K `--dump-last` md5
+  **ee31507a0e88** (`--no-chunk-mmq`: 4d229102872a).  4096 code ppl 2.3790 (MMVQ 2.3799).
+- Decode p256 x 256 (fq patch applied in third_party): **28.3-29.5 tok/s** (dq q8 baseline runs), 26.6-27.4 earlier.
+- Per decode token (nsys, decode-only): dense Q8_0 mat-vec 8.84 ms (bandwidth floor); expert kernels ~7 ms
+  (native_gu<143> 2.72, down<143> 1.31, gu_multi<42> 0.93, down_multi<42> 0.75, Q3_K ~1.1); argsort 0.72; F32
+  router+predict 0.77; F16 indexer/compressor 0.7; flash-attn 0.69; NVMe reads ~5.7 ms; ~270 host syncs/token.
+
+### Done this session (commits 5f1a768c .. this one)
+- HF release **public**: https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored - card =
+  tools/v41/hf/README.md (full GSQ process from the real data: 42.8% ternary / 39.2% Q2_0 / 18.0% Q3_K = 2.250 bpw;
+  per-layer held-out error from /media/Crucial1TB/v41-quant-mixed/quant.log), reassemble.sh (tested), Engram
+  placeholders, base_model_relation quantized.  Re-upload the card after edits:
+  `python3 -c "from huggingface_hub import HfApi; HfApi().upload_file(path_or_fileobj='tools/v41/hf/README.md', path_in_repo='README.md', repo_id='IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored')"`
+- Prefill: PTQ1_0 -> Q2_0 lossless device transcode (tools/v41/engine/ds41_transcode.cu, test_ds41_transcode ALL
+  PASS) + MMQ for every class (mmq_plan in ds41_moe.cpp), default ON (`--no-chunk-mmq` = old).  +12% 8K.
+- STRATA_DENSE_REQUANT=<q6_K|q5_K|q4_K> load-time dense requant (file untouched; ds41_dense.cpp).  Works: 321 Q8_0
+  matrices, q6_K 7.59 -> 5.86 GB.
+- DSpark offline harness (tools/v41/dspark_accept.py; `--teacher WORKDIR` mode added, UNRUN), STRATA_DUMP_MAIN dump
+  fixed (states ENTERING layers 37-39), v41_calib.py `prep-ids` (teacher forward over given token files), logits_kl.py.
+- Upload hardening: xet fixed concurrency 3, read/connect timeouts 300s/30s, supervisor loop (upload-start.sh /
+  upload-stop.sh).  A restart does NOT lose a part: xet dedups chunks already on the server.
+
+### Committed but UNBUILT / UNMEASURED (opt-in, default path unchanged)
+- `src/kernels/cuda/fork/fork_vecdot.cuh` vec_dot_ptq1_0_q8_1_quarter + `fork_fmt.cuh` Fmt<143> ipb 4 behind
+  **-DSTRATA_PTQ1_QUARTER** (default = llama-tq whole-block dot).  Build: CMAKE_CUDA_FLAGS is empty in
+  build-ds4-gpu's cache -> `cmake -S . -B build-ds4-gpu -DCMAKE_CUDA_FLAGS=-DSTRATA_PTQ1_QUARTER` (rebuilds
+  strata_kernels, ~5 min all cores; never while a GPU run uses the binary).
+- `iq_kernels.cu`: STRATA_EXP_MODE_T<type>=<1|2|4> per-type layout override + PTQ1_0 (143) / Q3_K (11) added to the
+  multi-row "AMD" layouts (mode 2 = two rows per warp, 4 = four rows, 1 = 64-lane row).  Runtime env, no rebuild flag.
+- ds41_moe.cpp: m_tc transcode scratch capped at STRATA_MMQ_TC_GIB (1) - should restore the 3 GiB prestage region
+  and the ~1.2 s dense-half loss on 8K (verify: 8K prompt split dense ~10.8 s, prestage 3.00 GiB in the log).
+
+### In flight when the session ended
+1. **HF upload** (supervisor loop, survives terminal/Claude restarts; NOT a reboot): part 1 of 16 at ~5 MB/s
+   (~9 h total).  Check: `tail ~/AI/v41-dev/hf/upload.log`; chunk progress in the newest
+   ~/.cache/huggingface/xet/logs/*.log ("Completed upload_xorb").  After a reboot: mount SSD NVME
+   (`udisksctl mount -b /dev/nvme0n1p3`) then `bash tools/v41/hf/upload-start.sh`.  When ALL DONE: remove the
+   "Upload in progress" notes from tools/v41/hf/README.md + README.md, re-upload the card.
+2. **Dense requant test** ~/AI/v41-dev/dq/run.sh -> results.txt (q5_K / q4_K rows were still running).  So far:
+   q6_K code ppl 2.3818 (q8 2.3790, KL 0.010, top-1 97.6%), reason 6.6496 (6.5974, KL 0.015), agent 14.16 (14.47 but
+   KL 0.28, top-1 82.9% - high-entropy text, needs a noise baseline), **decode NOT faster** (26.8/28.6 vs 28.3/29.5:
+   ggml's Q6_K mat-vec costs more per byte than Q8_0's).  Mal: if a type is promising (faster AND close quality), do a
+   full coding-quality run with it; else drop the idea (it frees VRAM, ~+100 experts, but does not speed decode).
+
+### NEXT (Mal's priorities: decode kernels first; he is happy with prefill for now)
+1. **Ternary decode kernels.**  Gate: `build-ds4-gpu/test_ds41_moe_gpu GGUF --layers 0,20,32,39 --gpu --tokens 8`
+   (decode path vs F32; today worst rel ~1.2e-2).  Speed: `~/AI/v41-dev/k143/ab.sh TAG [ENV=VAL ...]` (p256 x 256,
+   --slots 1500 pinned, STRATA_DEC_PROF; appends to ~/AI/v41-dev/k143/results.txt).  Order: baseline (current
+   binary) x2; STRATA_EXP_MODE_T143=2, =4; T11=2/4; rebuild with -DSTRATA_PTQ1_QUARTER, gate, x2 (+ with T143 modes).
+   Then the Prism-fork idea (PrismML-Eng/llama.cpp ggml-cuda/vecdotq.cuh): exact int16 activation sums in q8_1 ds.y
+   (quantize_q8_1<exact_isum>) -> drop the sumu dp4a (half the ternary dp4a work).  Safe here: our Q2_0 / Q3_K dots
+   do not read ds.y (checked: iq_kernels.cu vec_dot_q2_0_q8_1 maps codes with a byte-perm table).  Re-profile with
+   nsys (~/AI/v41-dev/nsys/run.sh pattern; decode-only window via nsys export sqlite).
+2. Other decode items: argsort of 384 (k_argsort 9 us x 80/token) -> top_k; F16 indexer/compressor matrices -> Q8_0
+   (V4 engine's --f16-q8: ~0.4 ms + VRAM); router computed twice per layer (attn_router + finish_predict F32 7.9 MB
+   each); host syncs (~270/token: attn_router readback, tier layer sync, predict readback).
+3. **DSpark decisive test** (it looked weak: 0.73 accepted/pass with decode biases, 0.41 EXACT routing; V4 in
+   llama.cpp 3.4).  Teacher states for the same 639 tokens:
+   `V41_WORK=/media/Crucial1TB/v41-teacher python3 tools/v41/v41_calib.py prep-ids ~/AI/v41-dev/r1ab-1237/p256.i32
+   ~/AI/v41-dev/dspark/gen_exact.i32` -> `init` -> `layer L --no-gptq` for L = 0..39 (GPU ~20 GB VRAM + ~20 GiB RAM;
+   NOT beside the engine; shards on Crucial1TB, ~15-30 min) -> `python3 tools/v41/dspark_accept.py
+   ~/AI/v41-dev/dspark/main_exact.bin ~/AI/v41-dev/dspark/gen_exact.txt --teacher /media/Crucial1TB/v41-teacher`
+   (prints engine-vs-teacher cosine per target layer too).  Teacher ~3 accepted -> our 2-bit trunk drift is the
+   cause; teacher also ~0.5 -> harness bug or DSpark is weak, stop.
+4. Vision (exported in the sidecar /media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf, no engine code).
+
+### Rules (keep)
+- Kill by PID only - never `pkill -f`/`pgrep -f` + kill with a pattern that appears in your own command line (killed
+  my own shell again this session).  GPU runs via `STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 86 72 -- ...`;
+  wait for MemAvailable >= 75 GiB between runs; one GPU job at a time; never rebuild build-ds4-gpu while a run uses
+  it; CPU-heavy work (builds, torch harnesses) skews decode timing - serialise.
+- Measure before claiming; report ppl/KL for anything lossy; Mal decides quality trades; soft routing only.
+- README = current results; history in docs/ds4/V41_PROGRESS.md; commit messages end with the Co-Authored-By line.
+- Mal OK'd "a couple of workers for extra hands" (/conductor, flash): good fits = the A/B run batches, nsys
+  analysis, docs; keep kernel edits + verification with the conductor.
+
+### Paste-able resume prompt
+Continue the DeepSeek-V4.1-Flash Strata engine work for Mal in ~/AI/Strata-DS4 (branch deepseek4; push with
+`git push ds4 deepseek4:main`).  FIRST read docs/ds4/V41_RESUME_PROMPT.md section "HANDOFF 2026-10-12 ~19:30"
+fully (copy: ~/AI/DS4_V41_RESUME_2026-10-12.md).  Check the two in-flight jobs (HF upload log, dense requant
+results), then work the NEXT list in order: ternary decode kernels (gate, then A/B), other decode items, the DSpark
+teacher test, vision.  Mal may use /conductor with a couple of flash workers for extra hands; verify their work
+yourself.
 
 ## UPDATE 2026-10-12 ~19:10 - READ FIRST (then ~18:00)
 

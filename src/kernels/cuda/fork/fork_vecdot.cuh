@@ -177,3 +177,62 @@ __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void* __restrict__ vb
     for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[iqs + k].ds) * (float) (sumi[k] - sumu[k]);
     return __half2float(bq->d) * acc;
 }
+
+// Strata-DS4 fork: ONE QUARTER of a PTQ1_0 block per call (Fmt<143> ipb 4; q = iqs = 0..3; bq8_1 = the block's 4
+// q8_1 sub-blocks).  The whole-block dot gave a K = 5120 row 40 calls for 32 lanes (two rounds, the second 8 lanes
+// wide, each call a 128-weight chain): decode's native_gu_kernel<143> ran at ~136 GB/s (nsys 2026-10-12).  Quarter q:
+//   qs[4q..4q+3]  trits t = 0..4 -> elements 16t + 4q .. +3   (contiguous per t: 5 dp4a, the same SIMD extraction)
+//   qs[16+2q], qs[17+2q] trits t -> elements 80 + 8t + 2q, +1 (10 weights, scalar)
+//   qh[0], qh[1] trit q          -> elements 120 + 2q, +1     (2 weights, scalar)
+// = 32 weights; the -1 folded in per q8_1 sub-block as above.  Same values; the float sum order over a block changes.
+__device__ __forceinline__ float vec_dot_ptq1_0_q8_1_quarter(const void* __restrict__ vbq,
+                                                             const block_q8_1* __restrict__ bq8_1, const int& kbx,
+                                                             const int& q) {
+    const strata_block_ptq1_0* bq = (const strata_block_ptq1_0*) vbq + kbx;
+    int sumi[4] = {0, 0, 0, 0};
+    int sumu[4] = {0, 0, 0, 0};
+    {
+        const uint32_t packed = ((const uint32_t*) bq->qs)[q];
+        uint32_t v_lo = __byte_perm(packed, 0, 0x4140);   // [b0, 0, b1, 0]
+        uint32_t v_hi = __byte_perm(packed, 0, 0x4342);   // [b2, 0, b3, 0]
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3u, w_hi = v_hi * 3u;
+            v_lo = w_lo & 0x00FF00FFu;
+            v_hi = w_hi & 0x00FF00FFu;
+            const int e = t * 16 + 4 * q;
+            const int u = get_int_b4(bq8_1[e >> 5].qs, (e & 31) >> 2);
+            const int dq = __byte_perm(w_lo, w_hi, 0x7531);
+            sumi[e >> 5] = ggml_cuda_dp4a(dq, u, sumi[e >> 5]);
+            sumu[e >> 5] = ggml_cuda_dp4a(0x01010101, u, sumu[e >> 5]);
+        }
+    }
+    {
+        uint32_t v = (uint32_t) bq->qs[16 + 2 * q] | ((uint32_t) bq->qs[17 + 2 * q] << 16);   // two 16-bit lanes
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w = v * 3u;
+            v = w & 0x00FF00FFu;
+            const int e = 80 + 8 * t + 2 * q;   // even: e and e + 1 share a q8_1 sub-block
+            const int8_t* a = bq8_1[e >> 5].qs + (e & 31);
+            const int a0 = a[0], a1 = a[1];
+            sumi[e >> 5] += (int) ((w >> 8) & 0xFFu) * a0 + (int) (w >> 24) * a1;
+            sumu[e >> 5] += a0 + a1;
+        }
+    }
+    {
+        const uint32_t p3 = q == 0 ? 1u : q == 1 ? 3u : q == 2 ? 9u : 27u;   // trit q of a byte b: ((b * 3^q) mod 256) * 3 >> 8
+        const int8_t* a = bq8_1[3].qs + (120 + 2 * q - 96);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint32_t v = ((uint32_t) bq->qh[h] * p3) & 0xFFu;
+            const int d = (int) ((v * 3u) >> 8);
+            sumi[3] += d * a[h];
+            sumu[3] += a[h];
+        }
+    }
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[k].ds) * (float) (sumi[k] - sumu[k]);
+    return __half2float(bq->d) * acc;
+}

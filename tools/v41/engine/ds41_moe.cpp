@@ -2927,7 +2927,12 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 size_t fr = 0, tot = 0;
                 cudaMemGetInfo(&fr, &tot);
                 const size_t keep = (size_t) 2 << 30;   // room for the dense pass buffer (grows with the prompt)
-                size_t got = fr > keep ? std::min(want, fr - keep) : 0;
+                // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
+                // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
+                // per MMQ launch
+                const char* tce = std::getenv("STRATA_MMQ_TC_GIB");
+                const size_t tc_cap = (size_t) ((tce ? std::atof(tce) : 1.0) * 1073741824.0);
+                size_t got = fr > keep ? std::min(std::min(want, tc_cap), fr - keep) : 0;
                 got = got / MP.SL2 * MP.SL2;
                 if (got >= MP.SL2 && cudaMalloc(&gp.m_tc, got) == cudaSuccess) gp.m_tc_cap = got;
                 else { (void) cudaGetLastError(); gp.m_tc = nullptr; }
