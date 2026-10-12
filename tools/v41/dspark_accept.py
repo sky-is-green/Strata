@@ -3,15 +3,21 @@
     STRATA_DUMP_MAIN=main.bin build-ds4-gpu/ds41_generate ... --temp 0 -n N > gen.txt     # the engine side
     python3 tools/v41/dspark_accept.py main.bin gen.txt [--threads 16] [--max N]
 
-main.bin: per engine step {int32 token, int32 pos, 3 x 5120 f32} = the step's input token and the HC-mean of layers
-37/38/39's output (model.py's main_hidden).  The first 128 records are the prompt tail (they fill DSpark's sliding
-window); the rest are decode steps.  gen.txt: the generated ids, one per line (the memguard line is skipped).
+main.bin: per engine step {int32 token, int32 pos, 3 x 5120 f32} = the step's input token and the HC-mean of the
+stream ENTERING layers 37/38/39 (model.py:1264-1266 `main_hiddens.append(h.mean(dim=2))` before `layer(h,...)`;
+v41_calib's `h/L37..L39` are the same quantity).  The first 128 records are the prompt tail (they fill DSpark's
+sliding window); the rest are decode steps.  gen.txt: the generated ids, one per line (the memguard line skipped).
 
 DeepSeek's own model.py (~/AI/gsq-rco/dsv41-inference) runs the draft on our torch kernels (tools/v41/torch_kernels),
 weights straight from the FP8/FP4 checkpoint.  At each step j it calls forward_spec(next token, main_hidden_j, pos_j)
 exactly like model.py's __main__ loop, and scores the 5 drafted tokens against what the engine actually produced
 (greedy): accepted length = the matching prefix.  Also reports acceptance when the verify is cut at depth 1..5 and
 the confidence head's calibration.
+
+The checkpoint keeps `attn.wo_a` as FP8 (E8M0 32x32 block scales) while model.py builds that module in bf16 (its
+comment: "convert.py dequantizes it to bf16"), so `load()` must apply the block scale itself - without it wo_a is
+~512..2050x too large and every draft is garbage (measured 2.58 -> 0.35 accepted/step).  `--no-fp8-dequant` turns
+the dequantization off to reproduce that failure.
 """
 import argparse
 import json
@@ -60,9 +66,16 @@ DT = {"F8_E4M3": torch.float8_e4m3fn, "F8_E8M0": torch.float8_e8m0fnu, "I8": tor
       "BF16": torch.bfloat16, "F32": torch.float32}
 
 
-def load(module, prefix, src):
-    """Every parameter of `module` from checkpoint tensor prefix + its name (dtype-converted when they differ)."""
-    missing = []
+def load(module, prefix, src, fp8_dequant=True):
+    """Every parameter of `module` from checkpoint tensor prefix + its name (dtype-converted when they differ).
+
+    FP8 tensors whose module parameter is NOT fp8 (model.py's `wo_a` is bf16: "convert.py dequantizes it to
+    bf16") need the checkpoint's E8M0 block scale applied by hand.  `_dequant_fp8_weight`/convert.py's rule is
+    `w = q * scale[row // bs, col // bs]` on a 32x32 or 128x128 grid; without it the value is off by 1/scale
+    (measured 512..2050x for the DSpark blocks) and the draft stack outputs garbage.  Returns (missing, notes).
+    """
+    import kernel as K  # torch_kernels (put first on sys.path above): dequant_fp8_weight
+    missing, notes = [], []
     for name, p in module.named_parameters():
         ck = prefix + name
         if ck not in src:
@@ -70,11 +83,23 @@ def load(module, prefix, src):
             continue
         dt, shape, _, _ = src.info(ck)
         t = torch.frombuffer(bytearray(src.read(ck)), dtype=torch.uint8).view(DT[dt]).reshape(shape)
+        if dt == "F8_E4M3" and p.dtype != torch.float8_e4m3fn:
+            sk = ck.rsplit(".", 1)[0] + ".scale"
+            if sk in src:
+                if fp8_dequant:
+                    sdt, sshape, _, _ = src.info(sk)
+                    s = torch.frombuffer(bytearray(src.read(sk)), dtype=torch.uint8).view(DT[sdt]).reshape(sshape)
+                    bs = t.shape[0] // s.shape[0]
+                    assert bs == t.shape[1] // s.shape[1] and bs in (32, 128), (ck, tuple(t.shape), tuple(s.shape))
+                    t = K.dequant_fp8_weight(t, s, bs)          # fp32: q * e8m0 block scale
+                    notes.append(f"dequant {ck} {tuple(t.shape)} x{tuple(s.shape)} bs{bs}")
+                else:
+                    notes.append(f"SCALE DROPPED {ck} (was off by 1/scale ~1e3)")
         if t.dtype != p.dtype:
             t = t.to(torch.float32).to(p.dtype)
         assert tuple(t.shape) == tuple(p.shape), (ck, tuple(t.shape), tuple(p.shape))
         p.data = t
-    return missing
+    return missing, notes
 
 
 def main():
@@ -87,7 +112,16 @@ def main():
                     help="main_hidden from the FP8 teacher instead: v41_calib.py prep-ids/init/layer work dir "
                          "(h/L37-39.bin = the streams ENTERING the target layers, tokens.npy); the records cover the "
                          "same positions as main_bin's (main_bin then only gives positions)")
+    ap.add_argument("--teacher-top1", default=None, metavar="NPY",
+                    help="v41_calib.py head --save-argmax output (stats/head_argmax_L40.npy) over the same tokens: also "
+                         "report the first draft token vs the teacher's own next-token argmax, and how often our trunk's "
+                         "token equals it (separates 'DSpark is weak' from 'our trunk's tokens differ from the teacher's')")
+    ap.add_argument("--no-fp8-dequant", action="store_true",
+                    help="compile-time bug reproduction: do NOT apply the E8M0 block scale of a checkpoint fp8 tensor "
+                         "whose module parameter is bf16 (model.py's wo_a).  Off by 1/scale (~512..2050x on the DSpark "
+                         "blocks) -> the old 0.35-0.44 numbers.  Default = dequantize (correct).")
     a = ap.parse_args()
+    t1am = np.load(a.teacher_top1)[0] if a.teacher_top1 else None   # t1am[p] = teacher's argmax for token p+1
     torch.set_num_threads(a.threads)
     torch.set_default_dtype(torch.bfloat16)
 
@@ -102,18 +136,27 @@ def main():
     wcache = cache_weights()
     src = Source()
     t0 = time.time()
+    miss, notes = [], []
     with torch.no_grad():
         embed = M.ParallelEmbedding(args.vocab_size, D)
         head = M.ParallelHead(args.vocab_size, D, args.norm_eps, args.hc_eps)
-        miss = load(embed, "embed.", src) + load(head, "head.", src)
+        for mod, pre in ((embed, "embed."), (head, "head.")):
+            m, n = load(mod, pre, src, not a.no_fp8_dequant)
+            miss += m; notes += n
         mtp = []
         for i in range(args.n_mtp_layers):
             b = M.DSparkBlock(args.n_layers + i, args)
-            miss += load(b, f"mtp.{i}.", src)
+            m, n = load(b, f"mtp.{i}.", src, not a.no_fp8_dequant)
+            miss += m; notes += n
             b.embed, b.head = embed, head
             mtp.append(b)
     if miss:
         raise SystemExit(f"checkpoint lacks {len(miss)} parameters, e.g. {miss[:5]}")
+    if notes:
+        print(f"fp8-with-scale for a non-fp8 parameter ({'dequantized' if not a.no_fp8_dequant else 'DROPPED'}):",
+              flush=True)
+        for n in notes:
+            print("   ", n, flush=True)
     print(f"loaded DSpark stack ({args.n_mtp_layers} blocks, block size {args.dspark_block_size}) in {time.time() - t0:.0f} s",
           flush=True)
 
@@ -146,7 +189,7 @@ def main():
     BS = args.dspark_block_size
     print(f"{n} records ({n_seed} prompt-tail seed steps), positions {poss[0]}..{poss[-1]}, {len(gen)} generated", flush=True)
 
-    acc_len, conf_rows = [], []
+    acc_len, conf_rows, t1_rows = [], [], []
     t0 = time.time()
     with torch.inference_mode():
         for j in range(n):
@@ -170,6 +213,9 @@ def main():
             while k < len(truth) and draft[k] == truth[k]:
                 k += 1
             acc_len.append(k)
+            if t1am is not None and pos + 1 < len(t1am):   # the token at pos+2, as the teacher would pick it given ours up to pos+1
+                tt1 = int(t1am[pos + 1])
+                t1_rows.append((draft[0] == tt1, truth[0] == tt1, draft[0] == truth[0]))
             c = conf[0].float().tolist()
             conf_rows.append([(c[i], draft[i] == truth[i]) for i in range(len(truth))])
             if len(acc_len) % 32 == 0:
@@ -184,6 +230,15 @@ def main():
     print("  distribution of accepted length: " + " ".join(f"{k}:{np.mean(L == k) * 100:.1f}%" for k in range(BS + 1)))
     for d in range(1, BS + 1):
         print(f"  verify depth {d}: tokens per pass {1 + np.minimum(L, d).mean():.3f}")
+    if t1_rows:
+        T = np.array(t1_rows, dtype=bool)   # columns: draft1 == teacher, trunk == teacher, draft1 == trunk
+        agree = T[:, 1]
+        print(f"  teacher top-1 ({len(T)} steps): first draft == teacher {T[:, 0].mean() * 100:.1f}% | our trunk's token == "
+              f"teacher {agree.mean() * 100:.1f}% | first draft == trunk {T[:, 2].mean() * 100:.1f}%")
+        if agree.any() and (~agree).any():
+            print(f"    where trunk == teacher: first draft accepted {T[agree, 2].mean() * 100:.1f}%; "
+                  f"where trunk != teacher: {T[~agree, 2].mean() * 100:.1f}% (draft took the teacher's token "
+                  f"{T[~agree, 0].mean() * 100:.1f}%)")
     flat = [x for row in conf_rows for x in row]
     if flat:
         cs = np.array([c for c, _ in flat])

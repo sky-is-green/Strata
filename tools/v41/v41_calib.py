@@ -581,6 +581,7 @@ def cmd_head(a):
     h_in = h_memmap(L, "r", N, S)
     pre = np.load(wpath("pre", f"L{L:02d}.npy"))
     res = {}
+    am = np.zeros((N, S - 1), np.int32) if a.save_argmax else None   # argmax at position p = the model's guess for p+1
     t0 = time.time()
     with torch.inference_mode():
         for i in range(N):
@@ -594,6 +595,8 @@ def cmd_head(a):
                 t = tgt[c:c + lg.shape[0]]
                 nll += float(F.cross_entropy(lg, t, reduction="sum"))
                 hit += int((lg.argmax(-1) == t).sum())
+                if am is not None:
+                    am[i, c:c + lg.shape[0]] = lg.argmax(-1).cpu().numpy()
             key = (meta["domains"][i], "eval" if meta["is_eval"][i] else "fit")
             r = res.setdefault(key, [0.0, 0, 0])
             r[0] += nll; r[1] += hit; r[2] += S - 1
@@ -605,6 +608,8 @@ def cmd_head(a):
     os.makedirs(wpath("stats"), exist_ok=True)
     json.dump({"layer": L, "seconds": round(time.time() - t0, 1), "by_domain": out},
               open(wpath("stats", f"head_L{L:02d}.json"), "w"), indent=1)
+    if am is not None:
+        np.save(wpath("stats", f"head_argmax_L{L:02d}.npy"), am)
     for k, v in out.items():
         log(f"head L{L}: {k:22s} ppl {v['ppl']:9.3f}  top1 {v['top1']:.3f}  ({v['tokens']} tokens)")
 
@@ -618,6 +623,7 @@ def main():
     p = sub.add_parser("prep-ids"); p.add_argument("ids", nargs="+"); p.add_argument("--domain", default="custom")
     p = sub.add_parser("head"); p.add_argument("--layer", type=int, default=40, help="h/L to read (40 = after the last block)")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--save-argmax", action="store_true", help="also write stats/head_argmax_LNN.npy (int32 [N, S-1])")
     p = sub.add_parser("layer"); p.add_argument("layer", type=int); p.add_argument("--batch", type=int, default=0, help="sequences per attention batch (0: ~4K tokens)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--no-gptq", action="store_true"); p.add_argument("--gptq-experts", type=int, default=NE); p.add_argument("--min-fit", type=int, default=32)

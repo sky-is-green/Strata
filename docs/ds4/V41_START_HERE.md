@@ -1,7 +1,7 @@
 # Strata-DSV4.1 — START HERE
 
 **A new session reads THIS file and nothing else before starting work.**  Everything below is current and measured.
-Open the long files only for a specific question (see "Where the details live").  Last updated 2026-10-13 ~05:20.
+Open the long files only for a specific question (see "Where the details live").  Last updated 2026-10-13 ~06:00 (end of session 5).
 
 ## 1. What this is
 Our own engine (`tools/v41/engine/`) running **DeepSeek-V4.1-Flash** (40 layers x 384 routed experts, top-6, Engram,
@@ -19,7 +19,7 @@ Q3_K = 2.25 bpw; dense Q8_0) on **one RTX 4090 24 GB + Ryzen 7 5700X + 90 GB DDR
 | Decode p256 x 256, forced tokens (identical work) | **26.4-27.5 tok/s = 37.5 ms/token** (28-29.5 on luckier token paths) |
 | Quality | 4096-tok code ppl 2.3790 exact routing; decode biases (defaults) cost code 2.38 -> 2.87 |
 | Head gate vs FP8 teacher (held-out) | ppl 5.645 vs 4.915, top-1 0.674 vs 0.701 |
-| DSpark (offline, our trunk states) | 0.73 accepted drafts/pass (biased routing), 0.41 (exact) |
+| DSpark (offline harness, FIXED 2026-10-13) | **2.58 accepted drafts/pass = 3.58 tokens/pass on teacher states** (96 steps; first draft 77%, confidence head calibrated 12/40/78/99%). Old 0.4 was a HARNESS weight-loading bug (`wo_a` FP8 block scale dropped). On OUR engine states: not yet measured with the fix |
 | Our hidden states vs teacher at layers 37-39 (exact routing, 639 tokens) | cosine **0.876-0.879** (large drift) |
 | Vision / DSpark in the engine | **NOT implemented** (weights exported in the sidecar only) |
 
@@ -44,38 +44,77 @@ tier metadata packing / tier CUDA graph `STRATA_TIER_GRAPH` / demand-copy overla
 bit-identical, all neutral: host calls under a busy device) · `--pf-b` other than 1.43 · bigger arena (62/65 GiB:
 neutral) · speculative NVMe reads as implemented (`STRATA_SPEC_TOP`: tier -1.4 ms but its extra predict graph +1.4 and
 decode-thread issuing +1.2 ate it) · attention-level levers (KV quant, window, MLA absorb, split-K: <= 0.7 ms total) ·
-quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · dense requant q5_K/q6_K as a SPEED lever (unforced runs
-showed no gain - unexplained, see §6 item 3c; it does free VRAM) · hard pruning (soft penalties only - Mal).
+quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft penalties only - Mal).
 
-## 5. In flight (2026-10-13 morning)
-- **DSpark teacher test**: `~/AI/v41-dev/dspark/teacher.sh` + `followup.sh` (log `teacher.log`).  FP8 teacher states
-  for the same 639 tokens in `/media/Crucial1TB/v41-teacher/h/L37-39.bin`; results `accept_teacher.log` (teacher
-  states), `accept_exact_t1.log` / `accept_teacher_t1.log` (+ first draft vs the teacher's own argmax, via new flags
-  `v41_calib.py head --save-argmax` and `dspark_accept.py --teacher-top1`, uncommitted until this run proves them).
-- **Vision slice 1** (conductor worker `v41-vision-enc`, packet `~/.quetza-data/conductor/packets/v41-vision-enc-task.md`,
-  report `~/.quetza-data/conductor/reports/v41-vision-enc.md`): `tools/v41/vision/ds41_vision.py`, a torch encoder
-  process that is a drop-in for Strata server's `strata-vision` protocol, sidecar weights, gated vs model.py.
+## 5. State at shutdown (2026-10-13 ~06:00, session 5) - nothing is running; resume from here
+- **DSpark teacher test: DONE.**  Teacher (FP8) states 0.437 accepted/pass vs ours 0.405 (`~/AI/v41-dev/dspark/
+  accept_teacher.log`): our 2-bit drift is NOT the cause.  Production DSpark: SGLang accept length ~5 at bs=1 on
+  V4-Pro, ~100% at bs=1 on V4-Flash (lmsys blog 2026-07-06; r/LocalLLaMA 1uqpers) => **our harness feeds DSpark
+  wrongly**.  model.py's own DSpark loop is an untested smoke test ("nothing calls forward_spec").  Already ruled out
+  in our harness: FP8 block size (32, honoured), RoPE/YaRN (compress ratio 0 = plain rope).  Teacher workdir
+  `/media/Crucial1TB/v41-teacher`: `h/L00..L40.bin` (4 HC streams ENTERING each layer, 639 tokens = p256 prompt +
+  383-token exact-routing generation), `pre/`, `tokens.npy`, `stats/head_argmax_L40.npy` (teacher greedy next token;
+  teacher top-1 vs the text 0.857) - any main_hidden variant can be built on the CPU.
+- **DSpark audit: SOLVED** (report `docs/ds4/V41_DSPARK_AUDIT.md`).  The harness drove DSpark exactly like
+  SGLang / vLLM / model.py (main_hidden = HC-mean of the streams ENTERING 37/38/39; slot 0 = bonus token at p+1 + 4
+  noise slots, drafts p+2..p+6; window = each block's own kv of main_x for accepted positions, non-causal block) - the
+  bug was `load()`: checkpoint `mtp.N.attn.wo_a` is FP8 + 32x32 E8M0 scales but model.py builds it bf16, so the scale
+  was dropped (~1000x too large).  Fixed in `tools/v41/dspark_accept.py` (default on; `--no-fp8-dequant` = old).
+  Teacher states, 96 steps: **2.58 accepted (3.58 tokens/pass)**, accepted-length dist 0:23% 1:18% 2:10% 3:8% 4:8%
+  5:32%, first draft 77% (78% vs teacher top-1).  The engine/GGUF never had the bug (our export dequantizes wo_a).
+  **First thing next session (CPU, ~15 min each, never beside an engine run):**
+  `python3 tools/v41/dspark_accept.py ~/AI/v41-dev/dspark/main_exact.bin ~/AI/v41-dev/dspark/gen_exact.txt
+  --teacher-top1 /media/Crucial1TB/v41-teacher/stats/head_argmax_L40.npy` (OUR states - the number that sizes the
+  engine work; our 37-39 states have cosine 0.876 to the teacher's) and the same with `--teacher
+  /media/Crucial1TB/v41-teacher` for the full 378-step teacher number.  Also check the SIDECAR's `mtp.N.attn.wo_a`
+  was exported with its block scale (`tools/v41/v41_sidecar.py`; its export check reported rel RMS 6e-3, so likely
+  fine - verify before the engine uses it).
+- **Vision slice 1 (encoder): DONE, committed** - `tools/v41/vision/ds41_vision.py` + `test_ds41_vision.py`; report
+  `~/.quetza-data/conductor/reports/v41-vision-enc.md` (worker's gate PASS: per-row cosine >= 0.999 vs model.py on the
+  original weights, 0.0 vs same-weights, protocol smoke as Strata's server drives it; CPU ~11 s/image quiet).
+  **Conductor re-run of `python3 tools/v41/vision/test_ds41_vision.py` still pending** (needs a quiet CPU, ~8 min).
+  Facts for slice 2: output file = int32 header {'SVE1', n, nx, ny, n_embd} + f32 [n][5120], `n` = the WHOLE span
+  incl. delimiters, `nx=n ny=1`; the Strata engine keys image rows on Qwen's `kImagePad 248056` - V4.1 uses
+  `image_token_id 129264`; `bias_vl` IS in our GGUF as `blk.N.exp_probs_b_vl.bias`; image tokens get no Engram and no
+  attention-mask change; an image span must be prefilled in one chunk.
+- **Dense requant (q4_K/q5_K): MEASURED, NOT ADOPTED (Mal: no code/agent quality drop; benchmark first).**  Forced-token
+  speed (1 run each): `attn_router` q8 17.11 / q5_K 14.87 / q4_K 13.52 ms -> 26.64 / 27.73 / 29.75 tok/s.  Quality
+  (`~/AI/v41-dev/dq/results.txt`, 4096-tok ppl + KL vs the arena-60 q8 logits): a q8 CONTROL at arena 40 already differs
+  (code KL 0.0095 / agent KL 0.25, top-1 agreement 0.98 / 0.85 - routing flips on near-ties, accuracy unchanged) - so
+  judge candidates against a same-arena control.  q4_K: code ppl +1.7% (2.393 -> 2.434), KL 0.026 (2.8x floor); agent
+  ppl 14.87 -> 13.43 (more confident) with KL 0.48 (2x floor), accuracy 0.561 -> 0.559.  q4_K reason + the head-kept-Q8
+  variant were cut off by the shutdown (`~/AI/v41-dev/dq/q4qual.sh`, resumable by editing the loop).
+- **Folder cleanup done**: 12 old `~/AI/Strata-DS4-*` worker worktrees removed (branches kept in the repo; the wire
+  worktree's 2 modified files = `git stash@{0}`), `~/AI/Strata-architectds` deleted (public clone).  Kept: Strata (its
+  server is what serve_ds41.py runs), Strata-data, Strata-DS4-private, Strata-MiMo, Strata-GLM* (GLM's; GLM-rebase has
+  382 uncommitted changes - Mal to decide), PolyStrata (GLM files in it).
+- Repo/GitHub/HF: everything committed + pushed at shutdown (see `git log -5`); HF card has the 4-step quick start and
+  the Engram placeholders `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt`.
 
-## 6. Work queue (in order unless Mal says otherwise)
-1. **DSpark**: (a) read the teacher result - teacher states ~2-3 accepted => our state drift is the cause => (b)
-   **retrain** DSpark's input projection `main_proj` (15360->5120) + `main_norm` (+ light adapters if needed) on OUR
-   engine's states/tokens (self-distillation; data = engine prefill dumps of layer-37-39 HC-mean states + the trunk's
-   top-k next tokens; MoE experts frozen; harness = `tools/v41/dspark_accept.py`, which runs DeepSeek's DSpark modules
-   on our torch kernels); (c) **engine draft + verify**: DSpark stack as a ggml graph (resident dense, experts resident
-   or tiered), main_hidden captured in-graph, verify pass of 1+k tokens (dense passes `pass_m` + tier `run_multi`),
-   KV rollback, draft depth adaptive by DSpark's confidence head; port the shape from the V4 engine's `--mtp/--verify`
-   (`tools/ds4`).  Teacher states also ~0.5 => DSpark is weak here; lean on (d) instead.
-   (d) **n-gram / prompt-lookup drafting** on the same verify path (free drafts; agent sessions re-emit context).
-2. **Vision**: (a) encoder process [in flight]; (b) engine `GENI`: image-span embeddings overwrite the prompt rows
-   (`[IMAGE_START] + ([IMAGE]*w + [NEWLINE])*h + [IMAGE_END]`, all positions carry `image_token_id` 129264), router
-   `bias_vl` on image positions, image tokens excluded from Engram n-grams, anything else model.py does with
-   `image_mask`; gate = a synthetic image with a known word + coloured shape answered correctly; (c) serve shim image
-   input + template; (d) `serve_ds41.py` hard-codes `~/AI/Strata` - make it portable for outside users.
-3. **Plain decode** (kernel work), each A/B'd with forced tokens: (a) **fuse the elementwise zoo** (5.45 ms; bit-exact
-   fused ops as opt-in patches under `tools/v41/ggml/`, like the fake-quant op that gave +5%); (b) **NVMe misses**:
-   issue reads from the top-16 `finish_predict` already computes, on a dedicated I/O thread (no extra graph);
-   frequency/utility cache admission instead of pure LRU; smaller blobs for the rarely-used file tier; (c) re-measure
-   q5_K/q4_K dense with forced tokens + the phase timer (did `attn_router` drop?); (d) faster ternary expert kernel.
+## 6. Work queue (Mal's order; ONE flash worker at a time)
+1. **DSpark on OUR states** (the two runs in §5, CPU).  If ours is close to the teacher's 2.58 -> go straight to item 4
+   (engine draft+verify), no retraining.  Only if ours << teacher: retrain `main_proj` (15360->5120) on our states.
+2. **Kernel fusion of the elementwise zoo** (packet ready: `~/.quetza-data/conductor/packets/v41-zoo-fusion-task.md`):
+   ~3,300 tiny kernels/token = 5.45 ms; bit-exact fused ops (forced-token 0-diff is the gate); expect -1.5..-3 ms (+4-8%).
+3. **Quality benchmark baseline** (Mal: decide every lossy change against it): (a) DwarfStar's official V4.1 fixtures
+   `~/AI/ds4-ref/gguf-tools/quality-testing/deepseek-v4.1-flash-20260919-router/` (112 prompts with official API
+   continuations + top-20 logprobs; teacher-forced NLL / API top-1 agreement / top-20 recall; comparable to DwarfStar's
+   Q2 = 90.1% top-1) - score exact routing AND the default decode biases (`--bias-prompt` decode-routing proxy);
+   (b) Mal's agentic harness bench `~/AI/quetza-workspace/model-gauntlet/harness-bench/` (real QuetzaCodetl runs,
+   hidden-graded Scheme/JSON tasks; add a `strata-ds41` backend).  Note: the decode route bias (code ppl 2.38 -> 2.87)
+   is a bigger quality lever than any dense quant - benchmark the configs Mal would actually choose between.
+4. **DSpark engine draft + verify** (after 1): DSpark stack as a ggml graph (resident dense, experts resident/tiered),
+   main_hidden in-graph, verify pass of 1+k tokens (dense `pass_m` + tier `run_multi`), KV rollback, depth adaptive by
+   the confidence head; port the shape from the V4 engine's `--mtp/--verify` (`tools/ds4`).  Then **n-gram /
+   prompt-lookup drafting** on the same verify path.  50 tok/s = 20 ms/token -> needs ~2+ accepted per pass.
+5. **Vision engine + serve** (slice 2): `GENI` for V4.1 (facts in §5), `VRAM <mib>` + `--vram-elastic` in `--serve` so
+   Strata's server can run the encoder LAZILY (Mal's wish: not resident; start on the first uncached image, the engine
+   lends ~1-2 GB of expert slots while it encodes, stop after `idle_s`, cache grows back - the server side exists:
+   `start_lazy_vision`, `Engine.vram()` in `~/AI/Strata/serve/server.py`); config `"vision": {..., "lazy": true}`;
+   CPU-encode fallback; gate = a synthetic image with a known word + coloured shape answered correctly.  Then make
+   `serve_ds41.py` portable (it hard-codes `~/AI/Strata`).
+6. Later: NVMe-miss work (reads from the existing top-16 prediction on an I/O thread; frequency admission), dense requant
+   decision after the benchmark, faster ternary expert kernel.
 
 ## 7. How to measure (mandatory)
 - **Correctness bar = forced-token identity**: `STRATA_FORCE_IDS=~/AI/v41-dev/dec7/force256.tok` makes every run
@@ -91,8 +130,9 @@ showed no gain - unexplained, see §6 item 3c; it does free VRAM) · hard prunin
 - Prefill exactness md5 (`--dump-last`) is NOT reproducible right now (MMQ grouping depends on free VRAM); decode is.
 
 ## 8. Rules (Mal)
-- Kill by PID only.  Never `pkill -f`/`pgrep -f` a pattern that can match your own command line; never
-  `tmux kill-server`.  Never edit a running bash script in place (write a copy, `mv`).
+- Kill by PID only.  Never `pkill -f`/`pgrep -f` a pattern that can match your own command line - that includes a
+  `case *x*` glob over `/proc/*/cmdline` (matches your own shell; match the EXACT cmdline); never `tmux kill-server`.
+- Never run a full-model engine beside a worker's ~16 GB CPU torch job: RAM runs out and memguard kills the engine.  Never edit a running bash script in place (write a copy, `mv`).
 - GPU runs: `STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 86 72 -- <cmd>` (env vars INSIDE as `env X=1 cmd`
   or before `bash memguard.sh` as ab.sh does); wait for MemAvailable >= 75 GiB; one GPU job at a time; it takes
   `~/.quetza-data/conductor/ds4-gpu.lock`.  Never a CPU-only full-model load (froze the box once).
