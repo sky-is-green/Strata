@@ -187,6 +187,7 @@ How each number was reached, step by step:
 | `V41-GSQ.gguf.part-NN-of-MM` | the 163 GB model, split into ~10 GiB byte ranges (Hub file-size limit) |
 | `reassemble.sh` | checks every part, joins them into `V41-GSQ.gguf`, verifies the result |
 | `SHA256SUMS` | hashes of every part and of the joined file |
+| `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD.txt` | **placeholders**: the two Engram shards (101.5 GB each) are not hosted here, and these say where to get them |
 | `V41-GSQ.gguf.experts.json` | per-expert offsets and formats |
 | `rank.bin` | expert hotness ranking, used to seed the VRAM cache and RAM arena |
 | `tokenizer/` | V4.1 tokenizer + chat template |
