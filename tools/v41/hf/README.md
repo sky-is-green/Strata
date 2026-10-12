@@ -3,6 +3,7 @@ license: mit
 base_model:
 - dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8
 - deepseek-ai/DeepSeek-V4.1-Flash
+base_model_relation: quantized
 tags:
 - deepseek
 - deepseek-v4.1
