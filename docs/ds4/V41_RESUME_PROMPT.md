@@ -1,7 +1,105 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-12 ~08:30 by Claude (arena verdict in; continuing the queue: fq patch, then MTP).
-**READ §HANDOFF 2026-10-12 ~19:30 FIRST**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**Last updated:** 2026-10-12 ~20:45 by Claude (session 3: forced-token A/B verdicts, S4 sync removal pending seq6, prefill md5 reproducibility not fixed).
+**READ §UPDATE 2026-10-12 ~20:45 FIRST, then §UPDATE ~19:50, then §HANDOFF ~19:30**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## UPDATE 2026-10-12 ~20:45 (session 3) - READ FIRST: the forced A/B verdicts, and the S4 sync removal
+
+**The forced-token A/B is the load-bearing tool now: every kernel number below was re-run with
+`STRATA_FORCE_IDS=<file>` (both variants decode the SAME 256 tokens), because greedy text divergence
+confounded the earlier numbers.**  Read §19:50's "+11% quarter-block" as RETRACTED.
+
+- **Quarter-block dot, FORCED A/B (dec3):** whole 26.92 / 26.68 tok/s (tier 16.9 / 16.7 ms), quarter
+  26.81 / 26.74 (tier 16.8 / 16.9), old path 26.15 / 26.03 (tier 17.0 / 17.2); **all 6 runs produced the
+  same 256 tokens** (0 lines differ from `k143/whole_1.tok`).  So the quarter dot is **~0.4 ms of the tier
+  (~1%), not 11%** - the unforced 29.6-30.3 runs came from a token path with ~45% fewer misses.
+  `STRATA_EXP_MODE_T143=2 / T11=2`: no gain.  **Misses drive decode speed.**
+- **Rank argsort + warp top-k (ggml patch):** unit test 140/140 ok; **warp top-k k=6 2.99 us vs bitonic
+  8.70 us** (rank kernel alone 6.38).  Forced decode A/B: within noise.  Kept (it is a clean win on the
+  kernel's own cost, just not visible at 80 sorts/token in a 37.5 ms token).
+- **x-skip: bit-identical on prefill** - `pf_xhost_rank0 [STRATA_X_HOST=1]` and `pf_rank0_b` gave the SAME
+  8K md5 `5c2b0e1ed697`.  Decode: within noise.  Costs nothing, so keep.
+- **Prefetch dummy-DMA skip (`STRATA_PF_NO_DUMMY=1`):** tokens identical, no measurable gain (the DMA is on
+  the idle-ish copy engine while the host waits anyway).  Prefetch counters now print: ~8065 issued /
+  708 outside the arena / 2499 used per 256 tokens.
+- **PREFILL md5 REPRODUCIBILITY: NOT FIXED by the MoE-only deterministic MMQ patch (seq5).**  8K `--dump-last`
+  is now `9b20b5335929` (cap 1 GiB), `b1ad8e47781f` (64), `3de2ed258753` (cap 1 GiB again!), `3084d9c87087`
+  (4 GiB) - **four different md5s, and the two identical-cap runs differ too.**  The `chunk prestage` region
+  size varies run to run (1.30 / 1.05 / 1.59 / 1.38 GiB) = free VRAM at load varies -> the expert *grouping*
+  inside the prefill chunk varies.  So the residual nondeterminism is NOT in the MoE MMQ launcher (that one
+  is now tile-only) - look next at the DENSE MMQ path (`mmq.cu`, `mul_mat_q_case` stream-k by free VRAM) and
+  at `src/prefill/moe_mmq.cu` (the engine's own MMQ context - it may not go through ggml's launcher at all).
+  **Consequence: there is no stable prefill exactness reference right now.  Decode IS deterministic**
+  (per-expert dot + `decode_rows_sum` in k order), which is why the forced A/B is trustworthy.
+- **S4 layer sync REMOVED on the decode (run_to_dev) path** (`ds41_moe.cpp gpu_run`): the per-layer
+  `cudaStreamSynchronize` there was a *second* host round trip on the same stream - the `sum sync` at the
+  end of the same call already waits for the identical work.  Kept on the host-readback path (there it IS
+  the wait) and under `DS4_CHECK_LRU` (it compares slots against the file right there) and
+  `STRATA_LAYER_SYNC=1` (old behaviour).  hit_ms/pcie_ms (diagnostics, never printed) are now only read when
+  that sync ran, because `cudaEventElapsedTime` on an incomplete event returns `cudaErrorNotReady`.
+  **STATUS: measured by dec6/seq6 (build gen.v6, gate, forced A/B off vs on x2, tier profile, then the
+  predictive-file-read instruments).  Reported saving into the record only after seq6 lands.**
+  Tier profile said 0.123 ms/call x ~40 = ~4.9 ms/token was going into that bucket.
+- **Host-sync budget (graph-level nsys `nsys/dec3.sqlite` + `DS4_TIER_PROF`, 3800 layer calls, 0.510 ms/call):**
+  `cpu pool 0.216 · gpu launch 0.132 · layer sync 0.123 · activation 0.021 · sum 0.018`.  Decode under the
+  profiler 21.2 tok/s (slowed); live per-token: `begin 0.9 predict 0.25 attn_router 17.2 tier 16.5 finish 2.0`.
+  **GPU busy ~20 ms of 37.5 ms** -> the host is on the critical path; that is the decode target.
+- **Scout reports (read-only workers):** `~/.quetza-data/conductor/reports/moe-miss-research.md` (36 KB - miss
+  arithmetic: ~10.2 ms of the 37.5 ms token is miss latency, zero-miss ~+36%; ranked top-5: free-to-issue +
+  deeper speculative reads, utility/frequency admission vs pure LRU, miss-only low-precision tier,
+  residency-conditional routing bias (+10-15%, ppl-gated), Fate percentile widening / HOBBIT stacking) and
+  `decode-overlap-scan.md` (upstream GitHub scan, in flight).
+- **HF upload:** 16 x 10.7 GB parts, 3 done at ~20:00, ~7-8 MB/s (part 1 spiked to 127 MB/s), loop alive
+  (`~/AI/v41-dev/hf/loop.pid`, `upload.log`).
+
+## UPDATE 2026-10-12 ~19:50 (session 2 after the handoff) - READ FIRST, then HANDOFF ~19:30 below
+
+- **Dense requant: DROPPED.**  q5_K decode 29.17 / 28.85 tok/s = q8 (28.31 / 29.46) although the dense bytes fell 7.59 ->
+  4.91 GB; q5_K costs code ppl 2.3790 -> 2.4150 (+1.5%), agent 14.47 -> 15.61 (+7.9%, KL 0.35), reason 6.60 -> 6.74.
+  q6_K: same speed as q8, small loss.  q4_K not run (stopped).  Decode is not dense-bandwidth-bound.
+- **Ternary quarter-block dot (-DSTRATA_PTQ1_QUARTER) gate PASS** (test_ds41_moe_gpu worst rel 1.440e-02 = whole).
+  Unforced A/B: quarter 29.58 tok/s vs whole 26.61 (tier 13.0 vs 17.0 ms) BUT the texts diverge at ~token 6 (float
+  sum order + greedy near-ties) and the quarter run had fewer misses (98.5% vs 97.3% VRAM hits) -> CONFOUNDED.
+  Added **STRATA_FORCE_IDS=<file>** (ds41_generate one-shot decode: decode a fixed token list, e.g. a previous run's
+  stdout) so variants do the same work.  Forced A/B queue: ~/AI/v41-dev/dec2/seq2.sh -> dec2/results.txt + k143/results.txt (f_*).
+- **Rank argsort (ggml-cuda argsort.cu, rows <= 1024; GGML_CUDA_RANK_ARGSORT=0 = bitonic):** the router top-6 + the
+  prefetch top-16 = ~80 bitonic sorts of 384 a token at 9 us.  Unit test ~/AI/v41-dev/argsort/test_rank_argsort.cu
+  (vs bitonic + std::stable_sort).  Ties now come out in ascending column order (bitonic: network order) -> the 8K md5
+  can move only through exact float ties.  Ships as tools/v41/ggml/rank-argsort.patch (third_party is gitignored).
+- **x-skip (ds41_moe.cpp gpu_run):** the activation D2H + stream sync + H2D only when the CPU pool runs (nk > 0) or a
+  diagnostic needs h_x; else quantize x_dev in place (bit-identical).  STRATA_X_HOST=1 = old path.
+- **Decode time budget (nsys dec.sqlite, 96 tokens):** GPU kernels busy ~20 ms/token (union); expert H2D 314 MB/token
+  (27.6 prefetch copies on stream 15 + 5.3 demand on stream 14, ~9.5 MB each); GPU-idle gaps 32.6 ms/token under
+  nsys (host in cudaGraphLaunch 10.9 - node-level tracing inflates it, re-measure with ~/AI/v41-dev/nsys/run2.sh
+  --cuda-graph-trace=graph; syncs 4.1; blocking memcpy 2.6; no CUDA call ~11).  CUDA graphs ARE used (352k of 404k
+  kernels).  The 87 graph instantiates are warm-up (clustered), not per token.
+- **Forced A/B (first attempt) was NOT forced** (the .tok files start with a memguard banner line; the reader stopped
+  at it) - fixed: non-id lines skipped, log prints "STRATA_FORCE_IDS: N forced tokens".  What it still showed, at
+  similar miss counts (~1400 pcie / ~640 file per 256): quarter 26.73 / 26.65 vs whole 26.92 / 26.68 tok/s, tier
+  16.3-16.5 vs 16.7-16.9 ms -> **the quarter dot is worth ~0.4 ms of tier (~1%), not 11%**; quarter_1/2's 29.6-30.3
+  came from a token path with far fewer misses (802 pcie / 481 file).  **Misses drive decode speed** (file reads cost
+  ~2.7 ms each, 1.5-1.8 s per 256 tokens).  STRATA_EXP_MODE_T143=2 / T11=2: no gain.
+- **Prefill exactness (8K --dump-last):** reference ee31507a0e88 is NOT reproducible any more: uncapped m_tc
+  (STRATA_MMQ_TC_GIB=64) gives f4bc02e65a97 - the transcode scratch took ALL free VRAM, so how the experts were split
+  into MMQ launches (= the sum order) depended on free VRAM.  The 1 GiB cap makes it environment-independent
+  (bitonic: 5694d4c88b26) but costs ~1.1 s of the 8K experts half (241.7 vs 250.5 tok/s) and does NOT return the dense
+  half (12.0-12.1 s either way).  Testing 2 / 4 GiB caps (dec4).  Rank argsort moves bits through exact ties
+  (0371cfb1d96b), the quarter dot through sum order (4e64b88329d3) -> quality check (ppl + KL vs dq/*_q8.logits)
+  before any becomes default.
+- **Prefetch dummies:** prefetch() DMAs a 9.5 MB ZERO blob for each predicted expert outside the arena ("the replay's
+  rule": timing faithfulness to moe_replay) - wasted H2D time that shares the copy engine with demand misses.
+  STRATA_PF_NO_DUMMY=1 skips the DMA (slot stays -1: tokens unchanged).  Decode summary now prints "prefetch N issued /
+  D outside the arena / U used".
+- **Warp top-k:** ggml_argsort_top_k records k in op_params[1]; CUDA k <= 32 & ncols <= 1024 -> one warp per row
+  selects the first k (same order as the rank kernel / stable sort).  Rank kernel alone: 6.43 vs 8.74 us (only -26%,
+  one block does all 384^2 compares).  Patch: tools/v41/ggml/rank-argsort.patch (ggml.c + ggml-cuda/argsort.cu,
+  relative to the fq-patched tree; apply after dsv41-fake-quant.patch).  NOTE ~/anaconda3/bin/patch is broken (RAM
+  damage) - use /usr/bin/patch.
+- Queues: ~/AI/v41-dev/dec3/seq3.sh (argsort+topk unit test, builds gen.v3 / gen.v3q, 8K md5, forced A/B g_*, nsys
+  graph-level dec3 with DS4_TIER_PROF) -> ~/AI/v41-dev/dec4/seq4.sh (x-skip prefill check, TC caps 2/4, PF_NO_DUMMY A/B h_*).
+- Scout report (read-only, flash worker): ~/.quetza-data/conductor/reports/dec-scout.md - argsort sites, router-twice
+  (not removable: different layer + input; a Q8_0/F16 copy for the PREDICTION only is exact), F16 indexer/compressor
+  -> Q8_0 (V4 --f16-q8 precedent, lossy), sync table S1-S9.
 
 ## HANDOFF 2026-10-12 ~19:30 - READ THIS FIRST (supersedes everything below where they differ)
 

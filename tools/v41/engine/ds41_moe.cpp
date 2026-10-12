@@ -1598,8 +1598,13 @@ void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
             ++im_->st.prefetch_dummy;
             dummy = true;
         }
-        ck(cudaMemcpyAsync((uint8_t*) gp.d_pf + (size_t) im_->pf_n * (size_t) im_->blob, src,
-                           (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
+        // STRATA_PF_NO_DUMMY=1: no DMA for a guess outside the arena (its slot is -1 below either way, so routing and
+        // tokens are unchanged) - the zero blob only kept the replay's timing, and it shares the H2D engine with the
+        // demand misses
+        static const bool no_dummy = std::getenv("STRATA_PF_NO_DUMMY") && std::getenv("STRATA_PF_NO_DUMMY")[0] == '1';
+        if (!(dummy && no_dummy))
+            ck(cudaMemcpyAsync((uint8_t*) gp.d_pf + (size_t) im_->pf_n * (size_t) im_->blob, src,
+                               (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
         // A dummy slot holds ZEROS, not the expert: it must never be matched by run() (found by
         // tools/mimo/test_mimo_moe: prefetched experts outside the arena were computed from the zero blob, rel 0.2-0.5).
         // -1 matches no expert id; the DMA above still happens, so the replay-measured timing is unchanged.
@@ -1838,14 +1843,24 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     }
 
     // ---- the activation, on both sides: Q8_K for the pool, q8_1 for the card ----
-    if (x_dev) {
-        ck(cudaMemcpyAsync(gp.h_x, x_dev, (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "x d2h");
-        ck(cudaStreamSynchronize(gp.s), "x sync");   // the pool needs it on the host, now
+    // The host copy feeds only the CPU pool (nk > 0) and the two diagnostics.  Without them the card quantizes x_dev
+    // where it lies (attn_router's output, already synchronized; this call's layer sync ends before the next graph can
+    // rewrite it): no D2H, stream sync and H2D on ~39 of 40 layers a token.  The same bytes -> the same q8_1, bit for
+    // bit.  STRATA_X_HOST=1 = always through the host (the old path).
+    static const bool x_host_always = std::getenv("STRATA_X_HOST") || std::getenv("DS41_CHECK_POOL_BATCH") ||
+                                      std::getenv("DS4_CHECK_GPU");
+    if (x_dev && nk == 0 && !x_host_always) {
+        strata::kernels::native_quantize_q8_1((const float*) x_dev, gp.d_xq, (int) H, 1, gp.s);
     } else {
-        std::memcpy(gp.h_x, x_host, (size_t) H * 4);
+        if (x_dev) {
+            ck(cudaMemcpyAsync(gp.h_x, x_dev, (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "x d2h");
+            ck(cudaStreamSynchronize(gp.s), "x sync");   // the pool needs it on the host, now
+        } else {
+            std::memcpy(gp.h_x, x_host, (size_t) H * 4);
+        }
+        ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
+        strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, 1, gp.s);
     }
-    ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
-    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, 1, gp.s);
     ck(cudaEventRecord(gp.ev[0], gp.s), "record activation");
     mark(1);
 
@@ -2214,7 +2229,16 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         launch_group(1, nfg, ptr, start, dst, tok);
     }
     mark(3);
-    ck(cudaStreamSynchronize(gp.s), "layer sync");
+    // S4, the per-layer stream sync: it makes this layer's expert DMAs and kernels home before the bookkeeping
+    // below publishes the slot swaps.  No GPU work inside this layer reads that bookkeeping, and the next
+    // gpu_run (next token - a layer is visited once per token) reads it only after THIS call's own wait: the
+    // sum on the run_to_dev path, the parts readback on the host path.  So on the decode path that later wait
+    // already covers it and this sync is a second host round trip per layer (~40/token, measured 0.12 ms).
+    // Kept where the caller reads parts on the host (there it IS that wait) and under DS4_CHECK_LRU, which
+    // compares the slots against the file right here.  STRATA_LAYER_SYNC=1 = always sync (the old path).
+    static const bool layer_sync_always = std::getenv("STRATA_LAYER_SYNC") != nullptr;
+    const bool layer_synced = !out_dev || layer_sync_always || std::getenv("DS4_CHECK_LRU") != nullptr;
+    if (layer_synced) ck(cudaStreamSynchronize(gp.s), "layer sync");
     if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter
         for (int64_t k = 0; k < K; ++k)
             if (slot_i[k] < 0) im.vmiss[(size_t) (layer * NXL + ids6[k])] = lc;
@@ -2249,11 +2273,13 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     }
     mark(4);
     float ms = 0;
-    if (ev_hit > 0) {
+    // cudaEventElapsedTime on an event that has not yet completed returns cudaErrorNotReady, so these need the
+    // launches finished: layer_synced says the sync above ran.  hit_ms/pcie_ms are diagnostics only (never printed).
+    if (layer_synced && ev_hit > 0) {
         ck(cudaEventElapsedTime(&ms, gp.ev[0], gp.ev[ev_hit]), "hits elapsed");
         st.hit_ms = ms;
     }
-    if (ev_pcie > 0) {
+    if (layer_synced && ev_pcie > 0) {
         ck(cudaEventElapsedTime(&ms, gp.ev[ev_hit > 0 ? ev_hit : 0], gp.ev[ev_pcie]), "pcie elapsed");
         st.pcie_ms = ms;
     }

@@ -962,8 +962,22 @@ int main(int argc, char ** argv) {
     const double td0 = now_ms();
     std::vector<float> lg = last_logits;
     int pos = (int) prompt.size(), gen = 0;
+    // STRATA_FORCE_IDS=<file>: decode this token sequence (one id per line - a previous run's stdout) in place of the
+    // sampled tokens, so kernel A/Bs whose variants round differently still do the same work (greedy decoding flips on
+    // near-ties, and a different text means different experts and a different VRAM hit rate)
+    std::vector<int> forced;
+    if (const char * fp = std::getenv("STRATA_FORCE_IDS")) {   // lines that are not a bare id (a memguard banner) skipped
+        std::ifstream f(fp);
+        for (std::string line; std::getline(f, line);) {
+            char * end = nullptr;
+            const long t = std::strtol(line.c_str(), &end, 10);
+            if (end != line.c_str() && *end == '\0') forced.push_back((int) t);
+        }
+        std::fprintf(stderr, "STRATA_FORCE_IDS: %zu forced tokens from %s\n", forced.size(), fp);
+    }
     for (; gen < a.n_predict; ++gen) {
-        const int tok = sample_p(lg.data(), nv, a.temp, 0, 1.0f, 0.0f, rng);
+        int tok = sample_p(lg.data(), nv, a.temp, 0, 1.0f, 0.0f, rng);
+        if (gen < (int) forced.size()) tok = forced[(size_t) gen];
         std::printf("%d\n", tok);
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
@@ -974,11 +988,13 @@ int main(int argc, char ** argv) {
     const double dec_ms = now_ms() - td0;
     const Ds41MoeStats st = tier.stats();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
-                 "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used\n",
+                 "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "
+                 "%lld outside the arena / %lld used\n",
                  gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), (long long) st.hits,
                  (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
-                 (long long) st.spec_issued, (long long) st.spec_hits);
+                 (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
+                 (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
     if (dump_main) std::fclose(dump_main);
     if (file_pred) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);

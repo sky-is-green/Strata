@@ -215,6 +215,11 @@ struct Ds41Dense::Impl {
     }
     ggml_tensor * W(const std::string & n) const { return w.get(n); }
     ggml_tensor * BL(int64_t il, const std::string & s) const { return w.get("blk." + std::to_string(il) + "." + s); }
+    // the router as the prediction graphs read it: the STRATA_PRED_ROUTER copy when the loader made one, else the F32
+    ggml_tensor * BLpred(int64_t il) const {
+        const auto it = w.t.find("blk." + std::to_string(il) + ".ffn_gate_inp_pred.weight");
+        return it != w.t.end() ? it->second : BL(il, "ffn_gate_inp.weight");
+    }
     bool compute(ggml_cgraph * gf, bool cached);
     bool upload_inputs(const int * tids, int n, int pos0);
 };
@@ -266,45 +271,75 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
             return rq != GGML_TYPE_COUNT && (ggml_type) ti.type == GGML_TYPE_Q8_0 && ti.shape.size() == 2 &&
                    (int64_t) ti.shape[0] % ggml_blck_size(rq) == 0 && (rq_head || ti.name != "output.weight");
         };
-        size_t rq_n = 0, rq_from = 0, rq_to = 0;
+        // STRATA_PRED_ROUTER=<ggml type> (q8_0, f16; OFF by default): the PREDICTION graphs (the prefetch top-16 and the
+        // speculative reads' rows) read a copy of each layer's F32 router in that type (q8_0: 7.9 -> 2.1 MB a read); the
+        // routing itself (build_attn) keeps the file's F32.  Only which experts are prefetched can change.
+        ggml_type pq = GGML_TYPE_COUNT;
+        if (const char * e = std::getenv("STRATA_PRED_ROUTER"); e && *e)
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+                if (ggml_get_type_traits((ggml_type) t)->type_name && strcasecmp(ggml_type_name((ggml_type) t), e) == 0) pq = (ggml_type) t;
+        auto pred_name = [&](const TensorInfo & ti) -> std::string {   // "" = no prediction copy for this tensor
+            static const std::string suf = "ffn_gate_inp.weight";
+            const std::string & n = ti.name;
+            if (pq == GGML_TYPE_COUNT || (ggml_type) ti.type != GGML_TYPE_F32 || ti.shape.size() != 2 ||
+                (int64_t) ti.shape[0] % ggml_blck_size(pq) != 0 || n.size() <= suf.size() ||
+                n.compare(n.size() - suf.size(), suf.size(), suf) != 0) return std::string();
+            return n.substr(0, n.size() - suf.size()) + "ffn_gate_inp_pred.weight";
+        };
+        size_t rq_n = 0, rq_from = 0, rq_to = 0, pq_n = 0;
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
                 w.t[ti.name] = make(ti, requant(ti) ? (int) rq : -1);
+                if (const std::string pn = pred_name(ti); !pn.empty()) {
+                    ggml_tensor * tp = make(ti, (int) pq);
+                    ggml_set_name(tp, pn.c_str());
+                    w.t[pn] = tp;
+                }
             }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(w.ctx, ggml_backend_get_default_buffer_type(im.backend));
         if (!buf) { err = "cannot allocate the dense weights on the backend"; return false; }
         w.bufs.push_back(buf);
+        // rows of the file's tensor `ti` (bytes `src`) converted to t->type and uploaded; returns the bytes uploaded
+        auto convert_upload = [&](ggml_tensor * t, const TensorInfo & ti, const uint8_t * src) -> size_t {
+            const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
+            const size_t src_row = ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
+            std::vector<uint8_t> dst((size_t) nr * dst_row);
+            const int nth = (int) std::max(1u, std::thread::hardware_concurrency());
+            std::vector<std::thread> th;
+            for (int k = 0; k < nth; ++k)
+                th.emplace_back([&, k] {
+                    std::vector<float> f((size_t) n0);
+                    for (int64_t r = k; r < nr; r += nth) {
+                        if ((ggml_type) ti.type == GGML_TYPE_F32) std::memcpy(f.data(), src + (size_t) r * src_row, (size_t) n0 * 4);
+                        else ggml_get_type_traits((ggml_type) ti.type)->to_float(src + (size_t) r * src_row, f.data(), n0);
+                        ggml_quantize_chunk(t->type, f.data(), dst.data() + (size_t) r * dst_row, 0, 1, n0, nullptr);
+                    }
+                });
+            for (auto & x : th) x.join();
+            ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+            return dst.size();
+        };
         for (size_t s = 0; s < model.size(); ++s)
             for (const auto & ti : model.shard(s).tensors()) {
                 if (skip(ti.name)) continue;
                 ggml_tensor * t = w.t[ti.name];
+                const uint8_t * src = model.shard(s).tensor_data(ti);
+                if (const std::string pn = pred_name(ti); !pn.empty()) {
+                    convert_upload(w.t[pn], ti, src);
+                    ++pq_n;
+                }
                 if ((int) t->type == (int) ti.type) {
-                    ggml_backend_tensor_set(t, model.shard(s).tensor_data(ti), 0, ggml_nbytes(t));
+                    ggml_backend_tensor_set(t, src, 0, ggml_nbytes(t));
                     continue;
                 }
-                const int64_t n0 = t->ne[0], nr = ggml_nrows(t);
-                const size_t src_row = ggml_row_size((ggml_type) ti.type, n0), dst_row = ggml_row_size(t->type, n0);
-                const uint8_t * src = model.shard(s).tensor_data(ti);
-                std::vector<uint8_t> dst((size_t) nr * dst_row);
-                const int nth = (int) std::max(1u, std::thread::hardware_concurrency());
-                std::vector<std::thread> th;
-                for (int k = 0; k < nth; ++k)
-                    th.emplace_back([&, k] {
-                        std::vector<float> f((size_t) n0);
-                        for (int64_t r = k; r < nr; r += nth) {
-                            ggml_get_type_traits((ggml_type) ti.type)->to_float(src + (size_t) r * src_row, f.data(), n0);
-                            ggml_quantize_chunk(t->type, f.data(), dst.data() + (size_t) r * dst_row, 0, 1, n0, nullptr);
-                        }
-                    });
-                for (auto & x : th) x.join();
-                ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+                rq_to += convert_upload(t, ti, src);
                 ++rq_n;
-                rq_from += (size_t) nr * src_row;
-                rq_to += dst.size();
+                rq_from += (size_t) ggml_nrows(t) * ggml_row_size((ggml_type) ti.type, t->ne[0]);
             }
         if (rq_n) std::fprintf(stderr, "dense requant: %zu Q8_0 matrices -> %s, %.2f -> %.2f GB\n", rq_n, ggml_type_name(rq),
                                rq_from / 1e9, rq_to / 1e9);
+        if (pq_n) std::fprintf(stderr, "prediction routers: %zu F32 copies as %s\n", pq_n, ggml_type_name(pq));
     }
     size_t si = 0;
     const TensorInfo * te = model.find("token_embd.weight", &si);
@@ -718,7 +753,7 @@ static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int 
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
     ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, 1), b.cols2(im.pre_state, HC, 1));
-    ggml_tensor * rl = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
+    ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
@@ -752,7 +787,7 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     ggml_tensor * st = ggml_cpy(gc, x, b.cols3(im.x_state, D, HC, 1, 0));
     ggml_build_forward_expand(gf, st);
     ggml_tensor * xp = ggml_dsv4_hc_pre(gc, st, b.cols2(im.pre_state, HC, 1));
-    ggml_tensor * rl = ggml_mul_mat(gc, im.BL(next_il, "ffn_gate_inp.weight"), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
+    ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(next_il), b.rms_w(xp, im.BL(next_il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(next_il, "exp_probs_b.bias")),
                                 ggml_reshape_2d(gc, im.ly[(size_t) next_il].rbias, im.NE, 1));
@@ -761,7 +796,7 @@ static ggml_cgraph * build_finish_predict(Ds41Dense::Impl & im, ggml_context * g
     for (int a = 1; a <= ahead && aout; ++a) {
         const int il = next_il + a;
         if (il >= (int) im.ly.size()) break;
-        ggml_tensor * ra = ggml_mul_mat(gc, im.BL(il, "ffn_gate_inp.weight"), b.rms_w(xp, im.BL(il, "ffn_norm.weight")));
+        ggml_tensor * ra = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(xp, im.BL(il, "ffn_norm.weight")));
         ggml_mul_mat_set_prec(ra, GGML_PREC_F32);
         ggml_tensor * sa = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, ra)), im.BL(il, "exp_probs_b.bias")),
                                     ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
