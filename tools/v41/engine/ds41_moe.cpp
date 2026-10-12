@@ -57,6 +57,8 @@ constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 
 constexpr int kMaxTok = 4;     ///< tokens one run_multi call takes (draft verify: last token + up to 3 drafts)
 constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct experts of one run_multi call
 constexpr size_t kMetaBytes = 16384;   ///< run(): one call's grouped-launch metadata (<= 12 launches x ~200 B)
+constexpr int kMetaSites = 3;   ///< gpu_run's grouped-launch sites: the VRAM hits, the PCIe share, the file misses
+constexpr int kMetaClsMax = 9;  ///< DS4 is per_expert = 9 format classes, each getting a fixed metadata slot (slice B)
 constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what route_probe tokenises)
 
 [[maybe_unused]] double now_ms() {
@@ -96,6 +98,21 @@ void ck(cudaError_t e, const char* what) {
         std::fprintf(stderr, "ds4_moe: %s: %s\n", what, cudaGetErrorString(e));
         std::abort();
     }
+}
+
+/// The five metadata arrays of ONE grouped launch sit in a region of the pinned h_meta block at `b`:
+/// [ptr n x u64][st n+1 x i32][ng 1 x i32][dst n x i32][tok n x i32], each part 16-byte aligned.
+struct MetaOff { size_t ptr, st, ng, dst, tok, end; };
+inline MetaOff meta_off(size_t b, int n) {
+    auto al = [](size_t x) { return (x + 15) & ~(size_t) 15; };
+    MetaOff m;
+    m.ptr = b;
+    m.st = al(m.ptr + 8 * (size_t) n);
+    m.ng = al(m.st + 4 * (size_t) (n + 1));
+    m.dst = al(m.ng + 4);
+    m.tok = al(m.dst + 4 * (size_t) n);
+    m.end = al(m.tok + 4 * (size_t) n);
+    return m;
 }
 
 /// The host arena: every expert the budget allows, in the order it was ranked, pinned when asked.  Whatever the
@@ -254,6 +271,21 @@ struct Gpu {
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
     void* h_parts = nullptr;      ///< pinned D2H landing pad for the expert outputs
+    /// STRATA_TIER_GRAPH (slice B): each of gpu_run's kMetaSites sites gets ONE fixed metadata block - kMetaClsMax
+    /// slots, one per format class, sized for kMaxParts entries - and every (site, class) launch is captured once
+    /// into a CUDA graph of its own.  native_expert_grouped reads the group/entry counts from DEVICE memory and its
+    /// grid is pinned by cap_groups/cap_entries with grid_groups=0, so the nodes' parameters are constant and only
+    /// the block's CONTENTS change per token: per site ONE cudaMemcpyAsync + one cudaGraphLaunch per class the
+    /// routing actually produced, in place of that class's three kernel launches and their cudaGetLastError.
+    /// One exec per class (not one per site) is deliberate: the class set varies per layer, and a graph is a fixed
+    /// set of kernels - a single 9-class graph would dispatch nine classes' gate/up+SwiGLU+down every layer where
+    /// the routing needs ~2.7, which measured 3-4 ms/token of pure dispatch (see the report).
+    cudaGraphExec_t tier_g[kMetaSites * kMetaClsMax] = {};
+    bool tier_graph_ready = false;   ///< the captures succeeded: the fixed layout is in use
+    bool tier_graph_off = false;     ///< capture refused (or does not apply): the direct per-class launches stay
+    int tier_graph_cls = 0;          ///< classes = gp.gll.size() at capture (DS4 per_expert: 9)
+    size_t tier_site_span = 0;       ///< bytes of one site's fixed metadata block
+    size_t tier_w_off = 0;           ///< the out_dev sum weights, after the sites (never inside a captured block)
 
     /// run_chunk (prompt chunks, MiMo prefill): allocated on first use, for up to `c_tok` tokens.  The streamed
     /// experts go through two device halves of `c_half` bytes (copy stream `s_cp` fills one while `s` computes
@@ -313,6 +345,8 @@ struct Gpu {
     void close() {
         for (auto& e : ev)
             if (e) cudaEventDestroy(e);
+        for (cudaGraphExec_t g : tier_g)
+            if (g) cudaGraphExecDestroy(g);
         void* bufs[] = {d_x, d_xq, d_parts, d_grp_ptr, d_grp_start, d_ngroups, d_ent_dst, d_ent_tok, d_scratch,
                         d_stage, d_pf, d_meta};
         if (h_meta) cudaFreeHost(h_meta);
@@ -1742,6 +1776,55 @@ bool cpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
 
 #if defined(DS4_MOE_CUDA)
 
+/// STRATA_TIER_GRAPH (slice B, docs/ds4/V41_DECODE_OVERLAP_PLAN.md §3): capture each (site, class) grouped launch
+/// ONCE, over a fixed per-class metadata layout.  native_expert_grouped takes ptr/st/ng/dst/tok as device pointers,
+/// reads the group/entry counts from device memory and launches a grid pinned by its host args, so captured nodes'
+/// parameters never change - only the CONTENTS of the metadata block do, once a token.  The launcher gives every
+/// ENTRY its own group (grp_start = 0..n), so ng = the class's entry count and the group loop strides by gridDim.y:
+/// one group row still covers all of them and grid.x spreads the rows over the card, while the direct path's `n`
+/// rows dispatched n-1 that iterated zero times.  Measured, that fixed one-row grid is within 0.6 ms/token of the
+/// direct launches, against 3-4 ms/token for the single 9-class graph this first tried (see the report): a graph is
+/// a FIXED kernel set, so "cheap when absent" cannot be a property of a node - only a per-class graph may be
+/// skipped.  A class launch is three kernels (gate/up, SwiGLU+quantize, down) plus `ck`'s cudaGetLastError, so a
+/// replay replaces six host calls with one.  Returns false, leaving the direct per-class path in place, when the
+/// geometry has no fixed class set or CUDA refuses any part of the capture.
+constexpr int kTierGraphGroups = 1;   ///< the fixed group rows per class (the kernels stride the real ng themselves)
+static bool tier_graph_capture(Gpu& gp) {
+    const int ncls = (int) gp.gll.size();
+    const size_t slot = meta_off(0, kMaxParts).end;
+    const size_t span = (size_t) ncls * slot;
+    if (ncls <= 0 || ncls > kMetaClsMax || (size_t) kMetaSites * span + sizeof(float) * 64 > kMetaBytes) return false;
+    cudaStream_t cs = nullptr;
+    if (cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) != cudaSuccess) return false;
+    bool ok = true;
+    for (int st = 0; st < kMetaSites && ok; ++st) {
+        for (int c = 0; c < ncls && ok; ++c) {
+            const uint8_t* dm = (const uint8_t*) gp.d_meta + (size_t) st * span + (size_t) c * slot;
+            const MetaOff o = meta_off(0, kMaxParts);
+            if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { ok = false; break; }
+            strata::kernels::native_expert_grouped(
+                gp.gll[(size_t) c], (const unsigned long long*) (dm + o.ptr), (const int32_t*) (dm + o.st),
+                (const int32_t*) (dm + o.ng), (const int32_t*) (dm + o.dst), (const int32_t*) (dm + o.tok),
+                kTierGraphGroups, kMaxParts, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, cs, 0);
+            cudaGraph_t g = nullptr;
+            if (cudaStreamEndCapture(cs, &g) != cudaSuccess) { ok = false; break; }
+            ok = cudaGraphInstantiate(&gp.tier_g[(size_t) st * ncls + (size_t) c], g, nullptr, nullptr, 0) == cudaSuccess;
+            cudaGraphDestroy(g);
+        }
+    }
+    cudaStreamDestroy(cs);
+    if (!ok) {
+        for (cudaGraphExec_t g : gp.tier_g)
+            if (g) cudaGraphExecDestroy(g);
+        for (cudaGraphExec_t& g : gp.tier_g) g = nullptr;
+        return false;
+    }
+    gp.tier_graph_cls = ncls;
+    gp.tier_site_span = span;
+    gp.tier_w_off = (size_t) kMetaSites * span;
+    return true;
+}
+
 /// One layer of the three-tier path.  The shape is `moe_replay.cpp`'s `Engine::layer`, with the replay's
 /// synthetic dense gap and `--serial` wait removed: `run` is called AFTER the layer's dense work by contract, so
 /// there is nothing to overlap the CPU tier against except the GPU tier, which is what runs beside it.
@@ -1877,27 +1960,33 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     ck(cudaEventRecord(gp.ev[0], gp.s), "record activation");
     mark(1);
 
-    // ---- one group's metadata, then the grouped kernel: w 0 = the GPU's hits, 1 = the PCIe share ----
-    // one launch per format class among the entries (dst = routing index -> the expert's class); the metadata
+    // STRATA_TIER_GRAPH: capture the three sites' class launches once, on the first layer that gets here - gp.gll
+    // and the env-selected kernels are final by now.  Declared before the launch lambdas because they capture it by
+    // reference.  Default OFF (nothing set), like STRATA_DMA_OVERLAP; the direct per-class path stays when CUDA
+    // refuses the capture (a geometry without a fixed class set, or a non-capturable call under it).
+    static const bool tier_graph_on = [] {
+        const char* v = std::getenv("STRATA_TIER_GRAPH");
+        return v != nullptr && v[0] != '0';
+    }();
+    if (tier_graph_on && !gp.tier_graph_ready && !gp.tier_graph_off) {
+        if (tier_graph_capture(gp)) gp.tier_graph_ready = true;
+        else {
+            gp.tier_graph_off = true;
+            std::fprintf(stderr, "ds4_moe: STRATA_TIER_GRAPH: CUDA refused the capture; keeping the per-class launches\n");
+        }
+    }
+    const bool grp_graph = gp.tier_graph_ready;
+
+    // ---- one group's metadata, then the grouped kernel: site 0 = the GPU's hits, 1 = the PCIe share, 2 = the file
+    // misses.  One launch per format class among the entries (dst = routing index -> the expert's class); the metadata
     // buffers are reused between launches on the same stream, so they are uploaded per launch, in order
     // the five metadata arrays of a launch go into one region of the pinned h_meta block and up in ONE async copy
     // (they were five pageable copies per launch, ~20 per layer); regions are never reused within this call, and the
     // next call starts after this one's layer sync, so no copy can read a region that is being rewritten
     size_t meta_at = 0;
-    // The five metadata arrays of ONE class sit in a region of the pinned h_meta block, laid out at `b`:
-    // [ptr n x u64][st n+1 x i32][ng 1 x i32][dst n x i32][tok n x i32], each part 16-byte aligned.
-    struct MetaOff { size_t ptr, st, ng, dst, tok, end; };
-    auto moff = [](size_t b, int n) {
-        auto al = [](size_t x) { return (x + 15) & ~(size_t) 15; };
-        MetaOff m;
-        m.ptr = b;
-        m.st = al(m.ptr + 8 * (size_t) n);
-        m.ng = al(m.st + 4 * (size_t) (n + 1));
-        m.dst = al(m.ng + 4);
-        m.tok = al(m.dst + 4 * (size_t) n);
-        m.end = al(m.tok + 4 * (size_t) n);
-        return m;
-    };
+    // The five metadata arrays of ONE class sit in a region of the pinned h_meta block, laid out at `b` (meta_off) -
+    // and under STRATA_TIER_GRAPH every class has its own FIXED region at that same layout, capacity kMaxParts.
+    auto moff = [](size_t b, int n) { return meta_off(b, n); };
     auto pack_group1 = [&](int n, const std::vector<unsigned long long>& ptr, const std::vector<int32_t>& start,
                            const std::vector<int32_t>& dst, const std::vector<int32_t>& tok) -> size_t {
         const MetaOff o = moff(meta_at, n);
@@ -1923,12 +2012,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // host calls a layer.  The classes read disjoint regions and gp.s orders them after the copy, so this is
     // bit-identical: same kernels, same bytes, same order.  STRATA_GRP_ONE_COPY=0 = the per-class copy.
     static const bool grp_one_copy = !std::getenv("STRATA_GRP_ONE_COPY") || std::atoi(std::getenv("STRATA_GRP_ONE_COPY")) != 0;
-    auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr,
+    auto launch_group = [&](int site, int n, const std::vector<unsigned long long>& ptr,
                             const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
                             const std::vector<int32_t>& tok) {
-        (void) w;
         (void) start;
-        if (n <= 0) return;
+        if (n <= 0) return;   // a site with nothing to run is skipped: all nine of its classes are idle anyway
         struct Cls { int c = -1; int n = 0; size_t off = 0; std::vector<unsigned long long> p2;
                      std::vector<int32_t> d2, t2, s2; };
         std::vector<Cls> gs;
@@ -1951,6 +2039,30 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             g.n = (int) g.p2.size();
             done += g.n;
             gs.push_back(std::move(g));
+        }
+        if (grp_graph) {
+            // Slice B: this site's block is FIXED - one slot per class (kMetaClsMax), each laid out for kMaxParts
+            // entries, which is exactly what the capture used, so a class's slot is a stable address for the graph.
+            // Only the classes the routing produced are written AND launched: an unrouted class costs nothing here
+            // (a graph is a fixed kernel set, so cheap-or-absent cannot be a property of a node - see the note on
+            // tier_g).  One cudaMemcpyAsync of the site's whole block, then one cudaGraphLaunch per class.
+            const size_t span = gp.tier_site_span;
+            const size_t base = (size_t) site * span;
+            const size_t slot = moff(0, kMaxParts).end;
+            for (const Cls& g : gs) {
+                const MetaOff o = moff(base + (size_t) g.c * slot, kMaxParts);
+                std::memcpy(gp.h_meta + o.ptr, g.p2.data(), sizeof(unsigned long long) * (size_t) g.n);
+                std::memcpy(gp.h_meta + o.st, g.s2.data(), sizeof(int32_t) * (size_t) (g.n + 1));
+                std::memcpy(gp.h_meta + o.ng, &g.n, sizeof(g.n));
+                std::memcpy(gp.h_meta + o.dst, g.d2.data(), sizeof(int32_t) * (size_t) g.n);
+                std::memcpy(gp.h_meta + o.tok, g.t2.data(), sizeof(int32_t) * (size_t) g.n);
+            }
+            ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + base, gp.h_meta + base, span, cudaMemcpyHostToDevice, gp.s),
+               "tier graph meta");
+            for (const Cls& g : gs)
+                ck(cudaGraphLaunch(gp.tier_g[(size_t) site * (size_t) gp.tier_graph_cls + (size_t) g.c], gp.s),
+                   "tier graph launch");
+            return;
         }
         bool one_copy = grp_one_copy;
         if (one_copy) {
@@ -2297,7 +2409,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             dst[(size_t) j] = fg_k[j];
         }
         start[(size_t) nfg] = nfg;
-        launch_group(1, nfg, ptr, start, dst, tok);
+        launch_group(2, nfg, ptr, start, dst, tok);
     }
     mark(3);
     // S4, the per-layer stream sync: it makes this layer's expert DMAs and kernels home before the bookkeeping
@@ -2367,7 +2479,9 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) k * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
                                gp.s), "cpu row h2d");
         }
-        size_t o_w = (meta_at + 15) & ~(size_t) 15;
+        // the sum weights live AFTER the captured blocks under STRATA_TIER_GRAPH (the graph's nodes must never see
+        // them rewritten), and in the running region otherwise
+        size_t o_w = grp_graph ? gp.tier_w_off : ((meta_at + 15) & ~(size_t) 15);
         if (o_w + sizeof(float) * (size_t) K > kMetaBytes) {
             ck(cudaStreamSynchronize(gp.s), "meta wrap");
             o_w = 0;

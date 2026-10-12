@@ -224,3 +224,157 @@ between runs on a loaded box, against 16.5-17.2 on a quiet one.  A ~2 ms host-ti
    decode run - it is what produced the 30% swing.
 4. The gate for a numerics-affecting change is still `test_ds41_moe_gpu` (worst rel ~1.44e-2) plus ppl/KL on
    code/agent/reason against the saved `dq/*_q8.logits` if the change can move bits.
+
+## 5. Slice C verdict — CORRECTED (2026-10-12 ~22:30, adversarially verified)
+
+**§3's Slice C does NOT remove S1, and its stated mechanism was mis-attributed.** Two independent readings (worker
+`slice-c-ondev-select` + a read-only verifier `verify-slice-c`) agree the negative stands. **Do not re-attempt "move
+selection on-device so the host never reads the ids" — the premise is false.**
+
+- **The exact serialising dependency (VERIFIED):** `routed(l)` = `decode_rows_sum` (`ds41_moe.cpp:2378`), which is
+  **k-ordered in double** (`iq_kernels.hpp:72-74`), and it is the input of `attn_router(l+1)`
+  (`ds41_generate.cpp:451`). It cannot run until **all** k rows exist — including the miss rows produced by
+  **host-only work keyed on the host copy of `ids6`**: the NVMe `read_part` threads (`ds41_moe.cpp:2155`/`2218`) and
+  the CPU pool dispatch (`2270`). So the host must **both** read the ids **and** finish the miss service *every
+  layer*. There is no end-of-token sync; layers cannot run ahead.
+- **The id readback is not the bubble.** It is already one batched async sync for all three tensors
+  (`ds41_dense.cpp:1322-1326`). Splitting it onto a copy stream removes at most one sync/layer.
+- **On-device hits buys ~0.** The hits launches (`2000`) already precede the file join (`2286`) and the pool finish
+  (`2283`), so the hits already overlap the miss service.
+- **The 12.21 ms bubble ≈ the per-layer host NVMe read wall** (`file 1538 ms` / 256 tok = **6.0 ms/token**, inside
+  the 16.58 ms tier) — INFERRED from code order + measured `file_ms` (a direct nsys gap↔reader-window correlation
+  would confirm; not run here). Killing S1 does not touch it.
+- **Corrections to the §3 text:** the headline "**97.2% hits**" dropped the 672 file routings from the denominator —
+  the honest fraction is **96.2%** (and the file tier is the *dominant* time). `launch_group` is at
+  `ds41_moe.cpp:1926-1986` (not 1901). "9 classes" is a runtime fact printed at `ds41_generate.cpp:364`.
+  The CPU pool (`2270`) is a host *load-balancing* choice, not hardware-forced — unlike the NVMe read.
+
+**Lever ranking, verified (verifier Task C):** **B (#1)** graph-capture the tier's classes (~884→~80 host
+calls/token; risk MED; payoff 0–5 ms **UNPROVEN** — S4 sync removal and metadata packing both measured *neutral*)
+> **C′ (#2)** device-servable file tier — the only lever that removes the 6.0 ms read wall (risk HIGH; needs
+GPUDirect Storage/cuFile, which is still **host-issued** so S1 stays) > **hit-rate (#3)** (pf-b already optimal,
+retracted) > **device-hits (#4)** (~0).
+
+Evidence: `~/.quetza-data/conductor/reports/slice-c-ondev-select.md`, `verify-slice-c.md`.
+
+## 6. C′ verdict + the FALSIFIED bubble attribution (2026-10-12 ~22:40, read-only scout `gds-scout`)
+
+**C′ (device-servable file tier) is NOT worth its entry cost — do not start it.**
+- The 6.0 ms/token `file_ms` **IS the NVMe transfer itself**: 672 file routings/256 tok = 2.625 blobs × ~9.6 MB =
+  **25.2 MB/token** at the measured **4.65 GB/s** = 5.4 ms. It is **not** the thread join and **not** the H2D hop
+  (the `file dma` H2D at `ds41_moe.cpp:2403` is separate, ~1 ms, and outside `file_ms`).
+- **GPUDirect Storage is not operational here:** `libcufile`/`cufile.h`/`libcufile-13-4` are present, but the
+  **`nvidia-fs` kernel module is absent** (not loaded, not on disk, `modinfo` fails, no `/proc/driver/nvidia-fs`)
+  — `libcufile` itself prints "nvidia-fs driver is not loaded". Repo has **0** cuFile/GDS refs.
+- **Decisive blocker:** the gguf lives on `/dev/nvme0n1p3`, fstype **`ntfs3`**, which is **not** in libcufile's
+  supported-fs list (ext4/btrfs/lustre/tmpfs/wekafs) -> C′ needs the **152 GiB blob tier relocated to ext4/xfs** on
+  a box whose `/` is 93% full. AD102/4090 GDS is officially best-effort. GDS' ceiling anyway is **~1–1.5 ms/token**
+  (removes the bounce-memcpy + H2D hop only; the NVMe transfer and the **host-issued** read — hence S1 — remain).
+- **Resident-experts form is capacity-impossible:** file tier ≈ 8652 × 9.6 MB ≈ **83 GB** vs ~13.5 GiB free VRAM /
+  60 GiB arena cap / 90 GiB RAM.
+
+> **CORRECTION 2026-10-13 ~05:10 (session 5): the next paragraph's conclusion is a MISREAD.** In the `spec4` run
+> the tier phase DID shrink (16.58 -> 15.15 ms/token, -1.43); the gain was eaten by the speculation's own costs
+> (`finish` 1.91 -> 3.34 = +1.43 for the extra predict-ahead graph + readback, and a new `spec` phase of 1.23 ms of
+> issuing on the decode thread). So the NVMe read wall **is** on the critical path; that implementation cost as much
+> as it saved. A version that issues the reads from the top-16 prediction `finish_predict` already computes, on a
+> dedicated I/O thread (no extra graph, nothing on the decode thread), would convert.
+
+**THE IMPORTANT PART — the bubble attribution is FALSIFIED:** `STRATA_SPEC_TOP=4` cut `file_ms` 1538 -> 1098 ms
+(**−1.7 ms/token = 29% of the wall**) and gained **0.0 tok/s** (26.48 vs 26.35). So the **file read wall is NOT the
+critical path** — §5's "the 12.21 ms bubble ≈ the NVMe read wall" was *inferred* and is now **contradicted**.
+`spec8` 25.21 / `FILE_PRED` 23.51 (both worse); `--pf-b` already optimal.
+
+**Emerging target:** `attn_router` = **17.83 ms/token (47%** of the token) ≈ the ggml dense stream's **17.13 ms** of
+`cudaStreamSynchronize` (121.7 syncs/token, 3/layer) — vs the tier stream `gp.s` at only **4.73 ms** (the stream
+slice B targets). Under investigation by `attn-router-decomp`.
+
+Untried cheap partials the scout identified: smaller quant on **file-tier-only** blobs (the wall is linear in
+bytes); `arena_adapt=1` (default off — reads straight into the victim arena slot, bits-identical, skips a host
+memcpy); more `read_part` threads (drive has ~30% BW headroom). Dead end: `advise_file` (O_DIRECT bypasses the page
+cache). Evidence: `~/.quetza-data/conductor/reports/gds-scout.md`.
+
+## 7. CORRECTION — §1/§1b/§2's attribution was a TOOLING ARTIFACT (2026-10-12 ~23:00)
+
+**The engine is NOT host-blocked, and `attn_router` is DEVICE time.** The dense half runs as **CUDA graphs**
+(ggml-cuda capture): **80.6 `cudaGraphLaunch`/token (2.01/layer) = 16.28 ms/token of device execution**. Those
+activities appear **only** in `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` — a table `calls.py` and `idle_attrib.py` do **not**
+sweep — and with the default `--cuda-graph-trace=graph` the graph *nodes* never enter the KERNEL table. Verified
+directly in `dec7.sqlite`: `KERNEL` = 36406 rows, **0 with a non-NULL `graphId`**; `GRAPH_TRACE` = 7742 rows in the
+same 4.5 s window = 1563.16 ms = **16.28 ms/token**, 84 distinct `graphExecId`. That single missing table is why the
+dense stream looked empty to every tool in the tree.
+
+**Overrides:** §1/§1b GPU busy **18.42 -> 27.66 ms/token**; idle **60.7% -> 41.0%**. §2's "117.7 of 121.7
+ggml-stream syncs start >2 ms after that stream's last kernel = ~140 us each with nothing to wait for" is
+**REFUTED**: with graphs included, **81.9 of 121.7 s16 syncs find device work in flight (17.10 of 17.13 ms)** and the
+median sync returns **2.7 us** after the device drains — device-bound, not host-bound. §1c-bis "compute is ~10
+ms/token" -> with the prefetch off the dense graph is still **15.07 ms/token**; compute is **~15+ ms**.
+
+**`attn_router` (17.83 ms/token) decomposes as:** **15.18 ms** attention+router graph (39.5 big graphs/token, 384 us
+each, one exec per layer) + **1.10 ms** predict graph (27 us, 41.1/token) + ~1.5 ms host/batched readback. §5's
+"the 12.21 ms bubble ≈ the NVMe read wall" is a *host* statement inside the tier phase — it is **not** part of
+`attn_router`, which has no room for it once the graphs are visible.
+
+**Consequences:**
+- **Slice B targets the wrong stream and its premise is false.** It hits `gp.s` = the tier (**4.73 ms** sync) vs the
+  dense stream (**17.04 ms**, 3.6x larger). More importantly its rationale ("host blocked on an idle device") is
+  false on **both**: s14's syncs are equally device-bound (40.4/49.6 in flight, 1.4 us post-drain lag). B's honest
+  ceiling is host CPU (`cudaGraphLaunch` 3.62 ms/token + ~2 ms launch loops), which does not convert to tok/s while
+  the device is busy under it. Keep B only as host-CPU / loaded-box hygiene.
+- **"CUDA-graph the dense half" is ALREADY DONE** (80.6 launches/token) — plan text proposing it as new work is stale.
+- **The #1 and only double-digit lever is shrinking the 384 us/layer attention graph itself** (15.18 ms/token): KV
+  quantization (the PTQ1_0/Q3_K work already in the tree behind `STRATA_PTQ1_QUARTER`), a smaller window, MLA
+  absorb, split-K/flash-decoding. **Not yet measured** — needs an `nsys --cuda-graph-trace=node` run to see inside
+  the graph and get achieved GB/s per node. **That is the next experiment.**
+- §5/§6's ranking is superseded: **attention-graph shrink (15.18 ms, HIGH risk) >> host-CPU hygiene (B, B.3,
+  `cuKernelGetName` ~0.09 ms) > everything else (~0).**
+
+**Tooling:** `calls.py` / `idle_attrib.py` must add `CUPTI_ACTIVITY_KIND_GRAPH_TRACE` to the busy union and report
+graph launches/token, or every future reading repeats this error. Evidence:
+`~/.quetza-data/conductor/reports/attn-router-decomp.md`.
+
+## 8. Node-level profile — the real bottleneck, and §7's lever ranking REFUTED (2026-10-12 ~23:05)
+
+`nsys --cuda-graph-trace=node` (nodes EXPANDED into the KERNEL table) on the dense stream, 96-token window, forced
+tokens. **This is the first time anything inside the 384 us/layer graph has been visible.**
+
+**Per layer (~393 us of device time):** `mul_mat_vec_q<Q8_0>` **223.4 us (57%)** (8 nodes x 27.85 us) · ~86 us
+**elementwise zoo** (49 names, `k_bin_bcast`/`scale_f32`/`quantize_q8_1`/`rms_norm`/`concat`/`dsv4_hc_*`, mean < 5 us)
+· 46.4 us other quant matvecs (`mul_mat_vec_f` families) · 23.6 us `rms_norm` x4 · **13.2 us `flash_attn_ext_f16`
+(3.4%)**. **No single node is 384 us — the 384 us is the SUM.**
+
+**Per token:** `mul_mat_vec_q<Q8_0>` **8.94 ms** (320.9 nodes, 27.85 us each) · elementwise zoo **5.45 ms (33%)** ·
+attention total (flash_attn + softmax + indexer) **~0.74 ms = 4.5%**.
+
+**Bandwidth:** the dense Q8_0 matvecs move **6.17 GB/token at ~690 GB/s blended = 68% of the 4090's 1008 GB/s
+peak** -> the dense half is **bandwidth-bound on weight bytes**, NOT on the 2560 KV cache.
+
+**§7's own "#1 lever = shrink the attention graph / KV maths" is REFUTED** — attention is 3.4% of the layer. The
+combined ceiling of EVERY attention-level lever (KV quant, smaller window, MLA absorb, split-K) is **~0.7
+ms/token**. Do not spend a slice there.
+
+**Levers that have real money (ranked):**
+- **A) Requantize the dense projections Q8_0 -> Q4_0/Q4_K: the node profile's ESTIMATE is −4.0 to −4.5 ms/token, but
+  THE TREE ALREADY CONTRADICTS IT.** `STRATA_DENSE_REQUANT` was measured (`~/AI/v41-dev/dq/results.txt`): **q6_K
+  7.59 -> 5.86 GB and q5_K 7.59 -> 4.91 GB both keep decode at ~29 tok/s** (q5_K 29.17 / 28.85 vs the q8 baseline
+  28.3-29.5) — i.e. **22-35% fewer dense bytes bought no decode speed**, and the handoff already concluded "it frees
+  VRAM, ~+100 experts, but does not speed decode". The reason is the same one the q6_K row gives: **ggml's K-quant
+  `mul_mat_vec` kernels achieve LOWER effective bandwidth per byte than Q8_0's**, so cutting bytes does not cut time.
+  **Do NOT sell lever A as a speed lever — its real value is VRAM recovery.** If anyone wants to test it properly the
+  honest form is a KERNEL comparison (achieved GB/s of `mul_mat_vec_q<Q8_0>` vs `<Q4_K>` on this 4090), not a byte
+  argument. **HIGH risk = a quality trade — MAL'S CALL.**
+- **B) Fuse the elementwise zoo (5.45 ms/token, 33%, 3288 ops/token, mean < 5 us): −1 to −3 ms, MEDIUM risk** (must
+  stay bit-identical).
+- C) split-K flash-decoding −0.2/−0.3 · D) window 2560->512 −0.2/−0.4 (quality) · E) MLA absorb ~0 (`attn_kv` is
+  1.85% of the mmvq) · F) KV quant ~−0.05.
+- Residual: a `nrows=1024` mmvq bucket (1/layer, 1.60 ms/token, 18% of the mmvq) is unmatched to a tensor.
+  **RESOLVED 2026-10-13 (session 5, from the geometry, not a new trace):** it is the grouped output projection
+  `attn_output_a` = `ggml_reshape_3d(wo_a, OGD=4096, OL=1024, OG=8)` (`ds41_dense.cpp:617`) - one mmvq with 1024 rows
+  x 8 channels = 35.6 MB/layer, i.e. ~890 GB/s at 40 us, efficient. With it counted the dense Q8_0 mat-vecs move
+  ~7.6 GB/token (= the 7.59 GB the requant log reports) at ~850 GB/s = **~84% of peak**, so the dense half is at the
+  bandwidth wall - kernel tuning there is done. Still unexplained: q5_K cut those bytes 35% with no decode gain
+  (unforced runs - re-measure with forced tokens + the phase timer before believing either way).
+
+**Also:** `calls.py`/`idle_attrib.py` should derive tokens-in-window from graph launches rather than assuming N (the
+window is fixed wall-clock, so per-token figures drift when the decode rate changes). Evidence:
+`~/.quetza-data/conductor/reports/attn-node-profile.md`.

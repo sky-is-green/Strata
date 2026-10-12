@@ -1,7 +1,97 @@
 # DeepSeek-V4.1-Flash: GSQ-RCO quant + Strata-DS4 port — HANDOFF / RESUME
 
-**Last updated:** 2026-10-12 ~20:45 by Claude (session 3: forced-token A/B verdicts, S4 sync removal pending seq6, prefill md5 reproducibility not fixed).
-**READ §UPDATE 2026-10-12 ~20:45 FIRST, then §UPDATE ~19:50, then §HANDOFF ~19:30**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+**Last updated:** 2026-10-13 ~03:20 by Claude (session 4, conductor). Decode bottleneck MEASURED (dense Q8_0 weight bandwidth); the earlier GPU-idle attribution was a TOOLING BUG; slice C / C' / spec-reads refuted; HF upload complete.
+**READ §UPDATE 2026-10-13 ~05:10 FIRST, then §UPDATE ~03:20, then §UPDATE 2026-10-12 ~20:45, then §UPDATE ~19:50, then §HANDOFF ~19:30**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.
+
+## UPDATE 2026-10-13 ~05:10 (session 5, conductor, ONE flash worker max - Mal) - READ FIRST
+
+Mal's goal now: **DSpark speculative decode + vision, target 50 tok/s.**  Status: neither vision nor DSpark runs in the
+engine yet (sidecar weights only); decode is plain one-token 26.4-27.5 tok/s (forced) / 28-29.5 (luckier token paths).
+- **DSpark decisive teacher test RUNNING** (`~/AI/v41-dev/dspark/teacher.sh` -> `teacher.log`, then `followup.sh`):
+  FP8 teacher states for the same 639 tokens in `/media/Crucial1TB/v41-teacher`, then `dspark_accept.py --teacher`
+  (-> `accept_teacher.log`), then teacher layer 39 + `v41_calib.py head --save-argmax` and both state sources re-scored
+  with the new `--teacher-top1` report (-> `accept_exact_t1.log`, `accept_teacher_t1.log`).  Those two tool flags are
+  new and uncommitted until that run proves them.  50 tok/s = 20 ms/token: needs ~2+ accepted drafts per verify pass
+  (measured so far 0.73 biased / 0.41 exact = ceiling ~30 tok/s).
+- **Vision slice 1 in flight** (worker `v41-vision-enc`, packet `~/.quetza-data/conductor/packets/v41-vision-enc-task.md`):
+  a torch encoder process (`tools/v41/vision/`) that is a drop-in for Strata server's `strata-vision` protocol, sidecar
+  weights, gated vs model.py on the original weights.  Next: engine GENI + image-token rules (bias_vl, Engram mask),
+  then the serve shim (which hard-codes `~/AI/Strata` - make it portable for outside users).
+- Corrections to the 03:20 notes (details in `V41_DECODE_OVERLAP_PLAN.md` §6 / §8): the `spec4` result means the NVMe
+  wall IS on the critical path (the implementation's overhead ate its gain); the nrows=1024 mmvq is `attn_output_a`
+  (dense mat-vecs at ~84% of peak bandwidth).
+- HF repo housekeeping done (card 4-step quick start, Engram placeholders `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt`).
+
+## UPDATE 2026-10-13 ~03:20 (session 4, conductor; handoff 20261012-220915-805454) - READ FIRST: decode is BANDWIDTH-BOUND on the dense Q8_0 weights, and the old attribution was a TOOLING BUG
+
+**The number that matters.** Per layer ~393 us of *device* time = **223 us (57%) in `mul_mat_vec_q<Q8_0>`** (the
+dense projections), ~86 us in a 49-name elementwise zoo (**33% of the token**), 46 us other quant matvecs, 24 us
+`rms_norm` x4, and **13.2 us (3.4%) in `flash_attn_ext_f16`** - the actual attention. Per token the dense Q8_0
+matvecs move **6.17 GB at ~690 GB/s = 68% of the 4090's 1008 GB/s peak = 8.94 ms/token**. **Decode is
+bandwidth-bound on dense weight BYTES** - not host-bound, not KV-bound, not attention-bound.
+
+**TOOLING BUG (now fixed).** `calls.py` / `idle_attrib.py` unioned only KERNEL+MEMCPY+MEMSET. The dense half runs as
+**CUDA graphs** (ggml-cuda capture) whose activities live ONLY in `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`, and with the
+default `--cuda-graph-trace=graph` the graph *nodes* never enter the KERNEL table. Verified in `dec7.sqlite`:
+`KERNEL` 36406 rows, **0 with a non-NULL `graphId`**; `GRAPH_TRACE` 7742 rows / 1563.16 ms in the same 4.5 s window.
+So every earlier reading of this engine was wrong: **GPU busy 18.42 -> 27.66 ms/token; idle 60.7% -> 41.0%**, and
+the old "117.7 of 121.7 ggml syncs have nothing to wait for / the 17.83 ms is mostly host" is REFUTED (with graphs
+included: 81.9 of 121.7 syncs find device work in flight, median post-drain lag 2.7 us). Both scripts now sweep
+GRAPH_TRACE and report graph launches/token; `--kernels-only` reproduces the old numbers byte-for-byte.
+**Treat §1/§1b/§2 of `V41_DECODE_OVERLAP_PLAN.md` as SUSPECT; its §7/§8 carry the corrections.**
+
+**REFUTED - do not re-attempt:**
+1. **Slice C** (move expert selection on-device): the k-ordered `decode_rows_sum` (`iq_kernels.hpp:72-74`,
+   `ds41_moe.cpp:2378`) needs ALL k rows and feeds `attn_router(l+1)`, so the host must hold the ids AND finish the
+   miss service every layer. No cross-layer pipelining.
+2. **C'** (device-servable file tier): the 6.0 ms `file_ms` IS the NVMe transfer (25 MB/token at the measured
+   4.65 GB/s); GPUDirect Storage is not operational (`nvidia-fs` module absent, and the gguf is on `ntfs3`, which
+   libcufile does not accept), and resident is capacity-impossible (83 GB file tier vs 13.5 GiB free VRAM).
+3. **`STRATA_SPEC_TOP=4`** cut 29% of the file wall for **0.0 tok/s** - the file wall is NOT the critical path.
+
+**§3 slice B - CODED, flag `STRATA_TIER_GRAPH`, DEFAULT OFF.** Fixed per-class metadata layout + one CUDA graph per
+(site, class) site. Verified **bit-identical** (forced tokens 0-diff on the rebuilt binary) and **neutral**
+(26.90 off vs 26.40/26.55 on). It *does* cut `cudaLaunchKernel` 239.4 -> 52.3/token - and gains nothing, because the
+device is busy under those launches. Host-CPU hygiene only: keep default-OFF or revert.
+
+**THE LEVERS - only two have money:**
+- **A) requant the dense projections Q8_0 -> Q4_0/Q4_K** - the node profile ESTIMATES −4.0 to −4.5 ms/token, **but
+  the tree already contradicts it**: `STRATA_DENSE_REQUANT` was measured in `~/AI/v41-dev/dq/results.txt` - q6_K
+  (7.59 -> 5.86 GB) and q5_K (7.59 -> 4.91 GB) both hold decode at **~29 tok/s** (q5_K 29.17/28.85 vs the q8 baseline
+  28.3-29.5), and the ~19:30 handoff already concluded "frees VRAM, ~+100 experts, does NOT speed decode". Cause: **ggml's
+  K-quant `mul_mat_vec` gets lower effective bandwidth per byte than Q8_0's**, so fewer bytes != less time. Treat A as a
+  **VRAM-recovery** change, not a speed lever; a real test is a kernel achieved-GB/s comparison, not a byte argument.
+- B) fuse the elementwise zoo (5.45 ms/token, 33%, 3288 ops/token, mean < 5 us): −1 to −3 ms, MEDIUM risk (must stay
+  bit-identical). **This removes WORK rather than bytes, so it is the lever most likely to convert - prefer it.**
+- Every attention-level lever (KV quant / smaller window / MLA absorb / split-K) shares a **~0.7 ms** ceiling - skip.
+- Residual: an unmatched `nrows=1024` mmvq bucket (1/layer, 1.60 ms/token, 18% of the mmvq).
+
+**HF UPLOAD: COMPLETE** - 16/16 parts + `V41-MTP-Vision.gguf` + tokenizer/small files, "ALL DONE" 2026-10-13
+03:02:50, on `IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored`. The xet `upload_xorb` retry deadlock recurred once
+(part-12 stalled 64 min); fixed exactly as documented by killing the uploader **BY PID** (the until-loop respawns it
+in 60 s); parts 13-16 then completed.
+
+### RESUME PROMPT (paste this)
+
+> Maximize DeepSeek-V4.1-Flash **decode** tok/s on one RTX 4090; repo `~/AI/Strata-DS4`, branch `deepseek4`, HEAD
+> `5e5f4c16`. Decode is 26.4-27.5 tok/s = 37.5 ms/token. **The bottleneck is MEASURED: the dense half is
+> bandwidth-bound on Q8_0 weight bytes - `mul_mat_vec_q<Q8_0>` 8.94 ms/token = 57% of a layer at 68% of the 4090's
+> peak; attention is only 3.4%.** Read `docs/ds4/V41_DECODE_OVERLAP_PLAN.md` §7 + §8 FIRST (they correct §1/§1b/§2,
+> which were computed with a tool set that never swept `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`), then
+> `~/.quetza-data/conductor/reports/attn-node-profile.md` and `attn-router-decomp.md`.
+> **Dead ends - do not retry:** slice C (on-device selection), C' (device-servable file tier), removing ggml-stream
+> syncs, slice B's tier graph capture - all bit-identical and/or neutral. **The open decision is Mal's:** lever A
+> (requant dense Q8_0 -> Q4_0/Q4_K, ~−4.0/−4.5 ms/token, a quality trade) or lever B (fuse the elementwise zoo,
+> −1..−3 ms, bit-identity risk). Do not start either without his call.
+> Measurement rules that still hold: forced-token identity
+> (`STRATA_FORCE_IDS=~/AI/v41-dev/dec7/force256.tok`, diff = 0 differing lines, filter the memguard banner line) is
+> the correctness bar; measure with nsys **call counts + MAX CONCURRENT ACTIVITIES including GRAPH_TRACE**, never
+> tok/s (the noise floor lies); A/B with `~/AI/v41-dev/k143/ab.sh TAG [ENV=VAL ...]`; GPU runs via
+> `STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 86 72 -- <bin>` after `MemAvailable >= 75 GiB`; one GPU job at a
+> time; kill by PID only, never `tmux kill-server`.
+> Uncommitted work in the tree: `V41_DECODE_OVERLAP_PLAN.md` §5-§8 (+134) and `ds41_moe.cpp` +156/-21 (slice B,
+> default OFF, fully gated).
+
 
 ## UPDATE 2026-10-12 ~20:45 (session 3) - READ FIRST: the forced A/B verdicts, and the S4 sync removal
 
