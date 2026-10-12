@@ -9,7 +9,7 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
 > text, its GPU prompt path is deterministic (byte-identical logits run to run), and it serves an OpenAI / Anthropic
 > API with tool calls (one sequence at a time).  The GSQ model file is on Hugging Face:
 > **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
-> (uploading since 2026-10-12; the parts arrive over about a day).
+> (upload complete 2026-10-13; all 16 parts, the vision/MTP sidecar and the small files are on the Hub).
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
 

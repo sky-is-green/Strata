@@ -31,8 +31,8 @@ this class of machine, on top of [Strata](https://github.com/Niko1221/Strata).
 
 </div>
 
-> **Upload in progress (started 2026-10-12):** the 16 model parts arrive over about a day at home upload speed.
-> `SHA256SUMS` already lists every part; `reassemble.sh` refuses to join until all of them are present and intact.
+> **Upload complete (2026-10-13):** all 16 model parts, `V41-MTP-Vision.gguf` and the small files are on the Hub.
+> `SHA256SUMS` lists every part; `reassemble.sh` refuses to join until all of them are present and intact.
 
 > **Experimental research release** from a single developer, measured on one PC.
 > This file is **not** a llama.cpp / Ollama / LM Studio GGUF. It uses per-expert quant types those runtimes don't load.
@@ -184,55 +184,65 @@ How each number was reached, step by step:
 
 | File | What |
 | --- | --- |
-| `V41-GSQ.gguf.part-NN-of-MM` | the 163 GB model, split into ~10 GiB byte ranges (Hub file-size limit) |
+| `V41-GSQ.gguf.part-NN-of-MM` | the 163 GB model, split into ~10 GiB byte ranges so a slow or interrupted upload never has to restart more than one part |
 | `reassemble.sh` | checks every part, joins them into `V41-GSQ.gguf`, verifies the result |
 | `SHA256SUMS` | hashes of every part and of the joined file |
-| `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD.txt` | **placeholders**: the two Engram shards (101.5 GB each) are not hosted here, and these say where to get them |
+| `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt` | **placeholders - you need these two files, download them separately**: the two Engram shards (101.5 GB each) are not hosted here; these say where to get them (step 2 below) |
 | `V41-GSQ.gguf.experts.json` | per-expert offsets and formats |
 | `rank.bin` | expert hotness ranking, used to seed the VRAM cache and RAM arena |
 | `tokenizer/` | V4.1 tokenizer + chat template |
 | `V41-MTP-Vision.gguf` | the **DSpark** speculative-draft stack (`mtp.0-2`: experts MXFP4, a lossless repack of the original FP4; the rest Q8_0) plus the **vision tower** (Q8_0). Engine support is in progress. |
 
-### Reassemble
+## Quick start (4 steps)
+
+**You need:** Linux, an NVIDIA GPU with 24 GB, ~90 GB RAM (the RAM arena is 60 GiB by default; `--arena-gib` lowers
+it, at some speed cost), the CUDA 13 toolkit, and fast SSD space for **the model (163 GB) + the Engram tables
+(203 GB) = ~366 GB**, plus another ~203 GB *temporarily* while the Engram tables are extracted (or download the
+Engram shards to a different drive).
+
+**1. Download this repo and join the model** (~163 GB):
 
 ```bash
 hf download IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored --local-dir V41-GSQ
 bash V41-GSQ/reassemble.sh V41-GSQ                 # needs ~163 GB free on top of the parts
-bash V41-GSQ/reassemble.sh V41-GSQ --delete-parts  # or: delete each part once appended (~163 GB total)
+# or: bash V41-GSQ/reassemble.sh V41-GSQ --delete-parts   (deletes each part once appended: ~163 GB total)
 ```
 
-## Running it
-
-You also need the **Engram tables** (202.8 GB). They aren't in this repo because they're unchanged FP8 rows from the
-original checkpoint, so there is no point hosting a third copy. Download the two Engram shards
-(`model-00047-of-00048.safetensors` and `model-00048-of-00048.safetensors`, 101.5 GB each) plus
-`model.safetensors.index.json` and `config.json` from
-[dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8).
-The abliteration left Engram byte-identical to the base model, and
-[deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) has the same two shards,
-so either source works. Then extract them to fast drives (one table per drive is ideal):
+**2. Download the two Engram shards - they are NOT in this repo** (the `…NEED-TO-DOWNLOAD-ENGRAM.txt` files mark
+them; 101.5 GB each). V4.1 reads its Engram n-gram memory from disk at run time. The tables are unchanged FP8 rows
+from the original checkpoint (the abliteration left them byte-identical), so there is no point hosting a third copy:
+get them from [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8)
+or [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (same two files).
 
 ```bash
 hf download dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8 model-00047-of-00048.safetensors \
    model-00048-of-00048.safetensors model.safetensors.index.json config.json --local-dir FP8-engram
 ```
 
+**3. Build the engine and extract the Engram tables** (one table per fast drive is ideal: decode reads ~48 random
+256-byte rows per token):
 
 ```bash
 git clone https://github.com/Indras-Mirror/Strata-DSV4.1 && cd Strata-DSV4.1
-# build (CUDA, sm_89 shown) - see the repo README for the full line
+# CUDA build, sm_89 (RTX 40xx) shown - see the repo README for other GPUs
 cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
 ninja -C build-ds4-gpu ds41_generate
-python3 tools/v41/extract_engram.py FP8-engram --to layers.1=/fast/a --to layers.14=/fast/b
-STRATA_NO_LARGEPAGES=1 build-ds4-gpu/ds41_generate -m V41-GSQ.gguf --ids-file prompt.i32 -n 128 \
-     --backend cuda --experts gpu --engram "/fast/a:/fast/b" --rank rank.bin
+python3 tools/v41/extract_engram.py ../FP8-engram --to layers.1=/fast/a --to layers.14=/fast/b
+# when it has finished (it checks sizes and spot-checks 2000 rows per tensor), ../FP8-engram can be deleted
 ```
 
-An OpenAI- and Anthropic-compatible server with tool calls (`tools/v41/serve/`) is in the repo too.
+**4. Run** (the first load takes ~50 s: it pins the 60 GiB RAM arena):
 
-**Minimum hardware:** an NVIDIA GPU with 24 GB, ~90 GB RAM (the RAM arena is 60 GiB by default; `--arena-gib`
-lowers it, at some speed cost), and fast NVMe with room for the model plus the Engram tables (~366 GB total).
+```bash
+STRATA_NO_LARGEPAGES=1 build-ds4-gpu/ds41_generate -m ../V41-GSQ/V41-GSQ.gguf --ids-file prompt.i32 -n 128 \
+     --backend cuda --experts gpu --engram "/fast/a:/fast/b" --rank ../V41-GSQ/rank.bin
+```
+
+`--ids-file` takes int32 token ids. For chat and agents, run the OpenAI- and Anthropic-compatible server with tool
+calls in `tools/v41/serve/` (see "Serving it" in the
+[GitHub README](https://github.com/Indras-Mirror/Strata-DSV4.1#serving-it-openai--anthropic-api-tool-calls)); it uses
+`V41-GSQ/tokenizer/`.
 
 ## Credits
 
