@@ -1871,57 +1871,104 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     // (they were five pageable copies per launch, ~20 per layer); regions are never reused within this call, and the
     // next call starts after this one's layer sync, so no copy can read a region that is being rewritten
     size_t meta_at = 0;
-    auto launch_group1 = [&](const strata::kernels::NativeExpertLayout& GL, int n, const std::vector<unsigned long long>& ptr,
-                             const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
-                             const std::vector<int32_t>& tok) {
+    // The five metadata arrays of ONE class sit in a region of the pinned h_meta block, laid out at `b`:
+    // [ptr n x u64][st n+1 x i32][ng 1 x i32][dst n x i32][tok n x i32], each part 16-byte aligned.
+    struct MetaOff { size_t ptr, st, ng, dst, tok, end; };
+    auto moff = [](size_t b, int n) {
         auto al = [](size_t x) { return (x + 15) & ~(size_t) 15; };
-        size_t o_ptr = meta_at, o_st = al(o_ptr + 8 * (size_t) n), o_ng = al(o_st + 4 * (size_t) (n + 1)),
-               o_dst = al(o_ng + 4), o_tok = al(o_dst + 4 * (size_t) n), end = al(o_tok + 4 * (size_t) n);
-        if (end > kMetaBytes) {   // cannot happen with top-k 6 (<= 12 launches); stay correct anyway
-            ck(cudaStreamSynchronize(gp.s), "meta wrap");
-            meta_at = 0;
-            o_ptr = 0, o_st = al(8 * (size_t) n), o_ng = al(o_st + 4 * (size_t) (n + 1)), o_dst = al(o_ng + 4),
-            o_tok = al(o_dst + 4 * (size_t) n), end = al(o_tok + 4 * (size_t) n);
-        }
-        const int32_t one = n;
-        std::memcpy(gp.h_meta + o_ptr, ptr.data(), sizeof(unsigned long long) * (size_t) n);
-        std::memcpy(gp.h_meta + o_st, start.data(), sizeof(int32_t) * (size_t) (n + 1));
-        std::memcpy(gp.h_meta + o_ng, &one, sizeof(int32_t));
-        std::memcpy(gp.h_meta + o_dst, dst.data(), sizeof(int32_t) * (size_t) n);
-        std::memcpy(gp.h_meta + o_tok, tok.data(), sizeof(int32_t) * (size_t) n);
-        uint8_t* dm = (uint8_t*) gp.d_meta;
-        ck(cudaMemcpyAsync(dm + o_ptr, gp.h_meta + o_ptr, end - o_ptr, cudaMemcpyHostToDevice, gp.s), "grp meta");
-        strata::kernels::native_expert_grouped(GL, (const unsigned long long*) (dm + o_ptr), (const int32_t*) (dm + o_st),
-                                              (const int32_t*) (dm + o_ng), (const int32_t*) (dm + o_dst),
-                                              (const int32_t*) (dm + o_tok), kMaxParts, n, gp.d_xq, gp.d_scratch,
-                                              (float*) gp.d_parts, gp.s, n);
-        meta_at = end;
+        MetaOff m;
+        m.ptr = b;
+        m.st = al(m.ptr + 8 * (size_t) n);
+        m.ng = al(m.st + 4 * (size_t) (n + 1));
+        m.dst = al(m.ng + 4);
+        m.tok = al(m.dst + 4 * (size_t) n);
+        m.end = al(m.tok + 4 * (size_t) n);
+        return m;
     };
+    auto pack_group1 = [&](int n, const std::vector<unsigned long long>& ptr, const std::vector<int32_t>& start,
+                           const std::vector<int32_t>& dst, const std::vector<int32_t>& tok) -> size_t {
+        const MetaOff o = moff(meta_at, n);
+        const int32_t one = n;
+        std::memcpy(gp.h_meta + o.ptr, ptr.data(), sizeof(unsigned long long) * (size_t) n);
+        std::memcpy(gp.h_meta + o.st, start.data(), sizeof(int32_t) * (size_t) (n + 1));
+        std::memcpy(gp.h_meta + o.ng, &one, sizeof(int32_t));
+        std::memcpy(gp.h_meta + o.dst, dst.data(), sizeof(int32_t) * (size_t) n);
+        std::memcpy(gp.h_meta + o.tok, tok.data(), sizeof(int32_t) * (size_t) n);
+        meta_at = o.end;
+        return o.ptr;
+    };
+    auto launch_group1 = [&](const strata::kernels::NativeExpertLayout& GL, int n, size_t off) {
+        const MetaOff o = moff(off, n);
+        uint8_t* dm = (uint8_t*) gp.d_meta;
+        strata::kernels::native_expert_grouped(GL, (const unsigned long long*) (dm + o.ptr),
+                                              (const int32_t*) (dm + o.st), (const int32_t*) (dm + o.ng),
+                                              (const int32_t*) (dm + o.dst), (const int32_t*) (dm + o.tok),
+                                              kMaxParts, n, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, n);
+    };
+    // Group the entries by format class (one kernel launch per class), but pack EVERY class's metadata into the
+    // block first and copy the whole span up in ONE cudaMemcpyAsync - the old shape copied per class, ~7 extra
+    // host calls a layer.  The classes read disjoint regions and gp.s orders them after the copy, so this is
+    // bit-identical: same kernels, same bytes, same order.  STRATA_GRP_ONE_COPY=0 = the per-class copy.
+    static const bool grp_one_copy = !std::getenv("STRATA_GRP_ONE_COPY") || std::atoi(std::getenv("STRATA_GRP_ONE_COPY")) != 0;
     auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr,
                             const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
                             const std::vector<int32_t>& tok) {
         (void) w;
         (void) start;
+        if (n <= 0) return;
+        struct Cls { int c = -1; int n = 0; size_t off = 0; std::vector<unsigned long long> p2;
+                     std::vector<int32_t> d2, t2, s2; };
+        std::vector<Cls> gs;
         int done = 0;
         bool used[kMaxParts] = {};
         while (done < n) {
-            int c = -1;
-            std::vector<unsigned long long> p2;
-            std::vector<int32_t> d2, t2, s2;
+            Cls g;
             for (int i = 0; i < n; ++i) {
                 if (used[i]) continue;
                 const int ci = im.g.cls(layer, ids6[dst[(size_t) i]]);
-                if (c < 0) c = ci;
-                if (ci != c) continue;
+                if (g.c < 0) g.c = ci;
+                if (ci != g.c) continue;
                 used[i] = true;
-                s2.push_back((int32_t) p2.size());
-                p2.push_back(ptr[(size_t) i]);
-                d2.push_back(dst[(size_t) i]);
-                t2.push_back(tok[(size_t) i]);
+                g.s2.push_back((int32_t) g.p2.size());
+                g.p2.push_back(ptr[(size_t) i]);
+                g.d2.push_back(dst[(size_t) i]);
+                g.t2.push_back(tok[(size_t) i]);
             }
-            s2.push_back((int32_t) p2.size());
-            launch_group1(gp.gll[(size_t) c], (int) p2.size(), p2, s2, d2, t2);
-            done += (int) p2.size();
+            g.s2.push_back((int32_t) g.p2.size());
+            g.n = (int) g.p2.size();
+            done += g.n;
+            gs.push_back(std::move(g));
+        }
+        bool one_copy = grp_one_copy;
+        if (one_copy) {
+            size_t end = meta_at;   // top-k 6 -> <= 12 launches: the block always fits
+            for (const Cls& g : gs) end = moff(end, g.n).end;
+            if (end > kMetaBytes) {   // cannot happen with top-k 6; wrap once, and if it STILL does not fit
+                ck(cudaStreamSynchronize(gp.s), "meta wrap");   // fall back to the per-class path below -
+                meta_at = 0;                                    // never drop a group
+                end = 0;
+                for (const Cls& g : gs) end = moff(end, g.n).end;
+                one_copy = end <= kMetaBytes;
+            }
+        }
+        if (one_copy) {
+            const size_t lo = meta_at;
+            for (Cls& g : gs) g.off = pack_group1(g.n, g.p2, g.s2, g.d2, g.t2);
+            const size_t hi = meta_at;
+            ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + lo, gp.h_meta + lo, hi - lo, cudaMemcpyHostToDevice, gp.s),
+               "grp meta");
+            for (const Cls& g : gs) launch_group1(gp.gll[(size_t) g.c], g.n, g.off);
+        } else {
+            for (Cls& g : gs) {
+                if (moff(meta_at, g.n).end > kMetaBytes) {   // one class at a time: wrap like the old code did
+                    ck(cudaStreamSynchronize(gp.s), "meta wrap");
+                    meta_at = 0;
+                }
+                g.off = pack_group1(g.n, g.p2, g.s2, g.d2, g.t2);
+                ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + g.off, gp.h_meta + g.off, moff(g.off, g.n).end - g.off,
+                                   cudaMemcpyHostToDevice, gp.s), "grp meta");
+                launch_group1(gp.gll[(size_t) g.c], g.n, g.off);
+            }
         }
     };
 

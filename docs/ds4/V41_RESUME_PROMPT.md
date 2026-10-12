@@ -44,6 +44,118 @@ confounded the earlier numbers.**  Read §19:50's "+11% quarter-block" as RETRAC
   `cpu pool 0.216 · gpu launch 0.132 · layer sync 0.123 · activation 0.021 · sum 0.018`.  Decode under the
   profiler 21.2 tok/s (slowed); live per-token: `begin 0.9 predict 0.25 attn_router 17.2 tier 16.5 finish 2.0`.
   **GPU busy ~20 ms of 37.5 ms** -> the host is on the critical path; that is the decode target.
+- **HOST-CALL ATTRIBUTION (dec3.sqlite, graph-level, 4.5 s decode window, 96 tokens) - the decisive decode numbers:**
+  GPU busy union 18.27 ms/token, **idle 28.60 ms/token (61%)**.  161,295 host runtime calls = **1680/token**, of
+  which `cudaLaunchKernel 417.7` + `cudaMemcpyAsync 387.1` + `cudaStreamSynchronize 257.7` + `cudaGraphLaunch 80.7`
+  (2.0/layer - attn_router + finish_predict).  Host time: `cudaStreamSynchronize 26.21 ms/token` (101.7 us each!),
+  graphLaunch 3.46, memcpyAsync 3.03, launchKernel 2.12.  GPU gaps>5us: 357/token, **28.13 ms/token**, owned by
+  `cudaStreamSynchronize 11.28` + **14.68 ms with no single owner** (= the host doing ~884 short calls; 14.68/884
+  ~= 16 us of idle per call).  **By stream:** `stream 14 = gp.s, the tier` (322 kernels/tok: swiglu_q8_1_entries
+  81.0 = 2/layer, native_gu 53.6, native_down_multi 44.5, quantize_q8_1 39.6, decode_rows_sum 39.6 = 1/layer) with
+  89.2 syncs/token = 5.03 ms; `stream 16 = ggml's dense stream` (k_bin_bcast 8.5, mul_mat_vec_q 5.2, rms_norm 4.7)
+  with **121.7 syncs/token = 17.02 ms/token** (3/layer, 139.9 us each); stream 7 = the one-shot load sync (383 ms).
+  So the two attack surfaces, measured: **(i) ~14.7 ms/token of GPU idle from ~800 tier host calls/token** -
+  `launch_group` does 1 `cudaMemcpyAsync` + 1 kernel launch PER FORMAT CLASS (9 classes, 3 groups: hits/pcie/file)
+  = ~20 calls/layer, and the metadata pointers are already passed into device memory, so a fixed-slot metadata
+  layout + one graph-captured launch set per layer is the fix (884 -> ~80 calls/token);
+  **(ii) 17.0 ms/token of host blocking on ggml's stream**, 3 syncs/layer from `ggml_backend_synchronize`
+  (ds41_dense.cpp:1266/1326/1459/1471) for the attn_router + finish_predict readbacks (the finish_predict one
+  exists only to feed prefetch - `pf_b=0` should drop it).
+- **S4 REMOVAL: NOT DEMONSTRATED - and the first read of it was WRONG.**  I first called this a ~5 ms/token win
+  off `ls_off` 25.50/25.74 (tier 18.36/18.05) vs `ls_on_1` 21.96 (tier 23.06).  Then `ls_on_2` came in at
+  **26.35 tok/s, tier 17.63 - the FASTEST run of the four.**  Full set (identical tokens, identical work: 59511
+  VRAM hits / 255 cpu in every run):
+  `off 25.50 (tier 18.36) / on 21.96 (23.06) / off 25.74 (18.05) / on 26.35 (17.63)`.
+  `ls_on_1` was globally slow in EVERY phase (begin 1.52, predict 0.39, attn_router 18.43, finish 2.27) = machine
+  noise, not the flag.  **Verdict: the per-layer sync is subsumed by the sum sync that follows it - the host waits
+  for the same GPU work either way, so removing it is harmless (tokens identical, gate PASS worst rel 1.440e-02)
+  but unproven as a win.  Kept for now; revert freely.**
+  **And the tier profile now PROVES the mechanism (dec6 tp_on/tp_off, 10200 layer calls each):** with the sync,
+  `layer sync 0.160 + sum 0.011 = 0.171 ms/call`; without it, `layer sync 0.000 + sum 0.169 = 0.169 ms/call`.
+  The wait is not removed, it MOVES into the sum sync that follows - total unchanged (0.171 vs 0.169), which is
+  what the tok/s A/B could not resolve.  So: S4 is a no-op for speed.  The lesson generalises: **a sync only
+  costs time if it is not subsumed by a later wait in the same layer** - consolidate syncs, don't just move them.
+- **METHODOLOGY - the noise floor is now the problem, and tok/s cannot resolve these slices.**  With IDENTICAL
+  work the tier phase varied 17.63 - 23.06 ms (5.4 ms, 30%) between runs while the box was busy (HF upload +
+  local analysis).  The earlier dec3 A/B had tier 16.5-17.2 (0.5 ms) on a quiet box.  So: (a) for launch-overhead
+  work the decisive metric is the **host call/sync COUNT from nsys** (each `cudaLaunchKernel`/`cudaMemcpyAsync` is
+  ~5-8 us of host, so cutting 280 calls/token = ~2.2 ms, below the loud-box noise but plain in the counts), not
+  tok/s; (b) run A/Bs on a quiet box or with many reps; (c) never let the CPU-heavy local work run beside a timed
+  decode run.
+- **SCAN VERDICT (`reports/decode-overlap-scan.md`, and it corroborates the attribution above independently:
+  GPU busy 18.10 vs 18.27, sync-gap owner 11.28 same, no-single-owner 14.68 same).  THREE THINGS IT ADDS:**
+  (i) **max concurrent kernels = 1** across the whole decode window - streams 14 and 16 NEVER overlap, every layer
+  is serialised; (ii) **328 MB/token of expert H2D copies run strictly between the tier's syncs**, not overlapped
+  with compute (stream 15: 28.5 copies, 271 MB); (iii) **12.21 ms/token is a pure pipeline bubble** - neither the
+  GPU nor the host is doing work (host blocked in a serialising call, device queue empty), and only 47.6 syncs/token
+  exceed 100 us yet those account for 22.86 ms/token.  **Its ranking (bigger ceiling than the call-count work):**
+  1. **Overlap the per-layer expert H2D with compute - ceiling ~11-14 ms/token, output EXACT** (the weights are a
+     copy): double-buffer the selected experts' device staging (copy layer l+1's experts while layer l's kernels
+     run, on a copy stream with EVENTS instead of the stream sync); the chunk prefetch/prestage machinery is the
+     thing to build on.  **This is now the top slice.**
+  2. Collapse the 258 syncs/token (the 47.6 long ones are the whole stall) - and with S1/S4 gone make the two
+     streams actually concurrent instead of serialised.
+  3. Attack the 12.21 ms bubble: it is neither copy nor compute, so it is HOST DECISION latency - the tier's
+     `skip_miss` / PCIe-budget / resident host loops between graph launches - and moving those policy loops
+     on-device removes the gate.
+  4. Kernel micro-opt is NOT the lever (argsort's 0.72 ms/token is ~2% of the token); overlap is 10-20x larger.
+- **ROOT CAUSE / STRATEGIC (why everything is serial, and what would actually fix it):** the host must have the
+  router's top-k ids BEFORE it can launch the tier (that is S1, `attn_router`'s one sync/layer - the last
+  unavoidable host wait, and the reason max concurrency is 1).  Everything downstream (which tier each expert is
+  in, the PCIe budget, the arena slot -> device pointer) is decided by HOST loops over host-side tables
+  (`slot_of`, the cache, `skip_miss`), which is also the scan's 12.21 ms bubble.  So the structural fix is to
+  **move the expert selection + descriptor build on-device**: a small kernel that reads the router ids from
+  `im.o_ids`, looks up a device-side (tier, device-pointer) table, and writes the metadata block for
+  `native_expert_grouped` in place.  Then the host never needs the ids, every layer's work is merely ENQUEUED on
+  the stream, the host runs 40 layers ahead, the H2D copies overlap the compute by construction, and S1 + the
+  bubble both disappear.  The metadata packing + fixed slots (slices 2 below) are the prerequisites for that,
+  which is why they come first.
+- **SLICE QUEUE (decode, in order; each is env-gated so it can be A/B'd in one binary):**
+  1. **Overlap the expert H2D with compute** (scan's #1; ceiling 11-14 ms/token; EXACT) - see above.
+  2. **tier metadata packing - CODED, awaiting seq7.**  `launch_group` packed per format class (1 `cudaMemcpyAsync`
+     + 1 launch per class, 9 classes x 3 groups = ~20 host calls/layer); now every class of a group is packed into
+     the h_meta block first and copied up in ONE `cudaMemcpyAsync` (STRATA_GRP_ONE_COPY=0 = old).  Bit-identical by
+     construction (same kernels/bytes/order).  Expect ~7 fewer host calls/layer of the measured ~884/token.
+     MEASURE IT BY CALL COUNT IN NSYS, not tok/s (see the methodology note above - a ~2 ms host effect hides under
+     a 5 ms noise floor).
+  2. **CUDA-graph the tier's class launches** (the big one): `native_expert_grouped` already receives ptr/st/ng/
+     dst/tok as DEVICE pointers into the metadata block, so a graph's node params are FIXED - only the metadata
+     contents change per token.  Pack into fixed per-class slots, launch all 9 classes every layer (n=0 for
+     absent ones), capture once -> per layer: 1 memcpy + 1 `cudaGraphLaunch` instead of ~20 calls (884 -> ~80
+     calls/token).  Needs the kernel to accept ng=0.
+  3. **Defer the `finish_predict` readback** (the third ggml sync, 139.9 us each): it exists only to give
+     `tier.prefetch` the next layer's top-16, and it uses a blocking `ggml_backend_tensor_get`
+     (ds41_dense.cpp:1391).  `finish(l)` and `attn_router(l+1)` are on the SAME stream, so no host sync is
+     needed between them - issue the readback async, run `attn_router(l+1)`, then sync ONCE for both.  Trade-off
+     to measure: the prefetch would then overlap tier(l+1) instead of attn(l+1).
+  4. `pf_b=0` (plain `finish()`, no predict graph, no readback) - the cheap control for (3): the resume doc says
+     speculative prefetch measured NET NEGATIVE (finish graph +1.5 ms, issuing +1.3 ms vs -1.8 ms tier).
+- **SEQ6/SEQ7 VERDICTS (2026-10-12 ~21:05) - this stretch produced NO SPEED WIN; it closed three questions:**
+  - **Predictor recall curve MEASURED (the scout's open question #1, new evidence - no paper publishes 2-3-layer
+    DeepSeek numbers).**  `STRATA_FILE_PRED=1`, 672 file-tier routes per 256 tokens:
+    k=1 top4 50.2% / top8 59.7% / **top16 66.9%**; k=2 44.7 / 53.1 / **62.4**; k=3 40.0 / 46.8 / **54.1**;
+    candidates k=1 475/626/853, k=2 437/584/795, k=3 409/524/715, k=4 361/498/671.
+    So one layer ahead catches 2/3 of file misses in the top-16, and a 3-layer lead still gets 54% - **a 2-3
+    layer lead IS viable**, the blocker is purely the issuing cost.
+  - **Speculative file reads: DEAD AGAIN (third measurement).**  `STRATA_SPEC_TOP=4`: 26.48 tok/s, 589 reads issued
+    / 383 used (65%), file 1098 ms; `=8`: 25.21 tok/s, 781 issued / 446 used (57%), file 1180 ms.  Against
+    no-spec 26.73 / 26.64.  More depth = more overhead, no catch payoff.  Do not retry without first fixing the
+    issuing path (dedicated I/O pool, not the decode thread).
+  - **Tier metadata packing: CORRECT but SPEED-NEUTRAL, and that is the finding.**  `g1` (one copy/group)
+    27.30 / 26.16 (tier 16.22 / 16.84) vs `g1n` (`STRATA_GRP_ONE_COPY=0`, per class) 26.71 / 26.56; tier profile
+    0.410 vs 0.395 ms/call.  All runs bit-identical tokens.  **So the ~10 metadata copies a layer are NOT the
+    bottleneck** - the theoretical ~2 ms/token is unmeasurable, and the "gpu launch" bucket is dominated by the
+    grouping loops + kernel launches, not the copies.  Keep it (bit-identical, ~280 fewer host calls/token, and
+    it is the fixed-layout prerequisite for graph-capturing the launches) but do NOT count it as a win.
+  - **Therefore: the levers are the OVERLAP (slice A) and the ON-DEVICE SELECTION (slice C), not call-count
+    trimming.**  See `docs/ds4/V41_DECODE_OVERLAP_PLAN.md` - it now carries the full measured case, the three
+    slices with exact code sites, and the measurement rules (forced-token identity as the correctness bar; nsys
+    call counts + max-concurrent-kernels as the speed metric; never time a run with CPU-heavy work beside it).
+- **HANDOFF:** if this session hits its token limit the successor reads this section first; the running queues are
+  `~AI/v41-dev/dec{6,7}/seq{6,7}.sh` -> `results.txt` + `k143/results.txt` (g_/h_/ls_/tp_/g1_ prefixes), the HF
+  upload loop is `~/AI/v41-dev/hf/loop.pid` (kill the `python3 hf_upload.py` BY PID if a part stalls >45 min - it
+  wedged once at ~20:29 on an xet `cas::upload_xorb` retry and had to be restarted), and the hourly chronos wake
+  `cw10122040-4729` watches both.
 - **Scout reports (read-only workers):** `~/.quetza-data/conductor/reports/moe-miss-research.md` (36 KB - miss
   arithmetic: ~10.2 ms of the 37.5 ms token is miss latency, zero-miss ~+36%; ranked top-5: free-to-issue +
   deeper speculative reads, utility/frequency admission vs pure LRU, miss-only low-precision tier,
