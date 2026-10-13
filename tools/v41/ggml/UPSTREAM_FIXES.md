@@ -1,4 +1,4 @@
-# Upstream llama.cpp fixes ported to our vendored ggml (PREPARED, not applied)
+# Upstream llama.cpp fixes ported to our vendored ggml (APPLIED 2026-10-14 - the vendored tree is gitignored: re-apply with `/usr/bin/patch -p1` in third_party/llama.cpp on a fresh checkout)
 
 Patch: `tools/v41/ggml/upstream-fixes.patch` — `-p1` relative to `third_party/llama.cpp`.
 Source PRs (ggml-org/llama.cpp):
@@ -47,3 +47,10 @@ Rebuild: `mmq.cu.o` plus every TU that includes `mmq.cuh` — `quantize.cu.o`, `
   `mmq-deterministic.patch` (already applied). No shared files with fuse/fake-quant/rank-argsort;
   shares only `mmq.cuh` with mmq-deterministic (separate region — both dry-run clean).
 - Verify after applying: rebuild + forced-token md5 A/B, prefill D=512, run-to-run.
+
+## Applied (2026-10-14, session 9)
+- Applied with `/usr/bin/patch -p1` (anaconda's `patch` binary is corrupt on this box).
+- **Required companion change (80476a58):** #29953 turned `mmq_args`' last field from `ncols_opt` into `J_best`;
+  `src/prefill/moe_mmq.cu` builds `mmq_args` positionally, so it must compute `J_best` itself (it now does, same rule
+  as ggml's host code) - without it: `GGML_ABORT` "J_best=75" in the MoE prefill.  Identity id buffers +128 ints.
+- Verified: 512-token prefill logits bit-identical before/after AND run to run; DSpark decode 256 tokens identical.
