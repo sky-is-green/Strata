@@ -3,7 +3,7 @@
 <p align="center"><b>DeepSeek-V4.1-Flash (40 layers × 384 experts) on one gaming PC - 152 GiB of experts across VRAM, pinned RAM and NVMe</b><br>
 DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
 
-<p align="center"><b>RTX 4090 + 90 GB RAM:&nbsp; prefill ~250 tok/s (exact) &nbsp;·&nbsp; decode ~26 tok/s</b></p>
+<p align="center"><b>RTX 4090 + 90 GB RAM:&nbsp; prefill ~250 tok/s (exact) &nbsp;·&nbsp; decode ~26 tok/s &nbsp;·&nbsp; DSpark speculative decode 31.7-39.5 tok/s</b></p>
 
 > **Status: experimental, single-developer research code, measured on one PC.** The V4.1 engine generates correct
 > text, its GPU prompt path is deterministic (byte-identical logits run to run), and it serves an OpenAI / Anthropic
@@ -12,6 +12,26 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
 > (upload complete 2026-10-13; all 16 parts, the vision/MTP sidecar and the small files are on the Hub).
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
+
+## Latest (2026-10-14)
+
+- **DSpark speculative decoding works and beats plain decode** (one-shot `ds41_generate`, greedy): the checkpoint's
+  own `mtp.0-2` draft stack drafts 4 tokens, one batched verify pass checks them.  Recommended:
+  `STRATA_DSPARK=V41-MTP-Vision.Q2_K.gguf STRATA_DSPARK_DEPTH=4` (Q2_K sidecar on the Hub; frees 2.76 GB of VRAM for experts).
+  | Prompt (256 tokens, default decode biases) | plain | DSpark | |
+  | --- | ---: | ---: | ---: |
+  | docs | 29.9 | **39.5** | 1.32x |
+  | python | 20.6 | **31.7** | 1.53x |
+  | code | 26.7 | **35.6** | 1.33x |
+  The verify pass serves the union of the pass's experts once per layer (the batched "D3" tier: PCIe-all misses,
+  file-tier experts read in parallel and run on the GPU, VRAM LRU, one-slot cross-layer prefetch) - verify 167 -> ~100 ms.
+  Correctness: with biases off, every verify row matches an independent prefill except at near-ties.  PCIe is now the wall
+  (nsys: expert DMAs = 1/3 of decode).  Not yet in `--serve` (temperature-1 sampling needs speculative sampling - designed).
+- **Quality baseline on DwarfStar's 112 official DeepSeek-API fixtures** (`tools/v41/quality/`): exact routing 86.2% API
+  top-1 on the short prompts; **the default decode route bias costs 14 points (72.1%)** and causes repetition loops on some
+  prompts.  Bias x0.25 keeps 85.2% at 12.6 / 7.4 tok/s - pick for your use (curve in `docs/ds4/V41_START_HERE.md` §5c).
+  Smarter biases that only bend near-ties (`STRATA_RB_PROTECT`, `STRATA_RB_MARGIN`) are being measured.
+- ggml upstream fixes applied (#30103 flash-attn race, #29953 MMQ OOB reads); prefill logits unchanged bit for bit.
 
 ## DeepSeek-V4.1-Flash
 
