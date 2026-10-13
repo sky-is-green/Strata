@@ -113,6 +113,21 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   layer-major batch (`q_batch_short`) = 86.15% vs passes 86.21% (paired -0.06 pt, 95% CI [-0.35, +0.23]).  So the gap
   is our weights (GSQ) / numerics vs DwarfStar's IQ2_XXS-Q2_K - a baseline for the dense/expert quant decisions.
 
+- **Route-bias decision curve** (bias scale s: --route-bias s --route-bias-file 0.6s; quality = 102 short fixtures, pass
+  path with bias; speed = bench4 docs / python, 256 tokens, tok/s; DSpark = Q2_K sidecar + D3 + 1-slot prefetch).
+  DSpark's output = the trunk's greedy output, so quality per s is the same for plain and DSpark:
+  | s | API top-1 | NLL | plain docs / python | DSpark docs / python | DSpark verify ms (docs) |
+  |---|---|---|---|---|---|
+  | 0 | 86.21% | 0.516 | ~2.6 (42% hits) | - | - |
+  | 0.25 | 85.18% | 0.551 | 12.63 / 7.39 | 11.67 / 9.60 | 295.6 |
+  | 0.5 | 81.66% | 0.676 | 18.37 / 11.22 | 20.54 / 16.19 | 181.5 |
+  | 1.0 (default) | 72.13% | 1.111 | 29.85 / 20.63 | **39.51 / 31.66** | 91.2 |
+  Reading: s=0.25 keeps quality within 1 pt of exact at ~40% of the s=1 speed; DSpark's edge shrinks as s falls (weaker
+  bias -> fewer VRAM hits; a verify pass's expert union makes it PCIe-bound), though acceptance rises (python 4.20 ->
+  4.55 tokens/pass at s=0.5).  For Mal: speed-first = s=1 + DSpark (31.7-39.5 tok/s, 72% top-1); quality-first =
+  s=0.25-0.5 (82-85% top-1, 10-20 tok/s).  Raising the hit rate at low s (more VRAM for experts, smarter admission)
+  is the lever that moves this whole frontier.
+
 ### NEXT DESIGN ITEM (not started - needs Mal's go): DSpark in `--serve` (the speedup is one-shot only today)
 Why it matters: the Quetza wrappers talk to `ds41_generate --serve` (`tools/v41/serve/ds41-engine.sh`, binary
 `build-ds4-gpu`), so tonight's 1.3-1.5x is not reachable from Quetza yet.  Blocker: serve samples at **temperature 1.0,
