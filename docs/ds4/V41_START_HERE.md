@@ -145,6 +145,14 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   MXFP4 3.280 (8.61 GB on card) | Q3_K 3.246 (7.23 GB) | **Q2_K 3.233 (5.85 GB, -2.76 GB)** | **IQ3_XXS 3.280 (6.59 GB,
   identical acceptance)**.  Use `STRATA_DSPARK_EXP_TYPE=iq3_xxs` (or q2_K for max VRAM) - on-load env path == file path
   (cross-checked).  Files tool `tools/v41/v41_sidecar_requant.cpp`; `V41-MTP-Vision.{Q3_K,Q2_K}.gguf` on NVME1TB.
+- **Profiling (bias ON, depth 4, 2026-10-13 ~18:00)**: MXFP4 20.50 tok/s, 3.56 tokens/pass, verify 168.6 ms/pass, 91.1%
+  hits; on-load q3_K 18.74 tok/s, 2.87 tokens/pass, verify 148.5 ms, 93.0% hits (tokens/pass differs because the text
+  differs - the open bug).  The `pass_v split` line averages in the 8 seeding passes of 16 prompt tokens, so it is
+  NOT per verify pass (dense ~39 ms/pass for ~6-16 tokens; tier dominates).  Estimate: verify = dense ~35 ms + tier
+  ~130 ms for ~5 tokens (~25 ms/token, worse than plain's ~16 because pass_v has no prefetch).  D3 projection: a
+  batched tier at ~2x one token's (~35 ms) -> verify ~70 ms -> ~45-50 tok/s at 3.5 tokens/pass; ~100 ms -> ~35.
+  So DSpark clears Mal's 35-40 bar IF D3 lands.  TODO: split the seed passes out of the pass_v stats.
+- Bisect runs restarted at handoff via `nohup bash tools/v41/d2_bisect.sh` -> `~/AI/v41-dev/d2/bisect.out`.
 - Mal's bar: DSpark is worth it at **35-40 tok/s** (needs verify <= ~100-115 ms/pass at ~4 tokens/pass).
 - **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
 
