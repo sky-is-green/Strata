@@ -1,7 +1,7 @@
 # Strata-DSV4.1 — START HERE
 
 **A new session reads THIS file and nothing else before starting work.**  Everything below is current and measured.
-Open the long files only for a specific question (see "Where the details live").  Last updated 2026-10-13 ~06:00 (end of session 5).
+Open the long files only for a specific question (see "Where the details live").  Last updated 2026-10-13 evening (session 6: DSpark D1 in the engine DONE; D2 designed, not coded).
 
 ## 1. What this is
 Our own engine (`tools/v41/engine/`) running **DeepSeek-V4.1-Flash** (40 layers x 384 routed experts, top-6, Engram,
@@ -92,6 +92,68 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 - Repo/GitHub/HF: everything committed + pushed at shutdown (see `git log -5`); HF card has the 4-step quick start and
   the Engram placeholders `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt`.
 
+## 5b. Session 6 (2026-10-13 afternoon/evening) - READ THIS, it supersedes §5 where they differ
+- **DSpark on OUR states (fixed harness, 378 steps): 3.27 accepted/pass = 4.27 tokens/pass** (= FP8 teacher 3.24) ->
+  no retraining.  Logs `~/AI/v41-dev/dspark/fixed_ours.log`, `fixed_teacher.log`.
+- **D1 DONE + committed `c0fe0e06`: `tools/v41/engine/ds41_dspark.{hpp,cpp}` (class Ds41DSpark) + `test_ds41_dspark.cpp`**.
+  The draft stack on CUDA: sidecar weights (its `wo_a` verified correctly scaled, rel err 5.5e-3) + trunk
+  `output.weight` / `token_embd` loaded itself (standalone: 8.61 GB VRAM incl. a 0.7 GB duplicate head).  API:
+  `step(main_hidden[k*15360], pos[k], k, bonus, ids[5], conf[5])` appends k accepted rows to each block's 128-ring and,
+  if bonus >= 0, drafts p+2..p+6 (cached graph per (k, draft); 4.9 ms/draft).  **Gate PASS** on the harness's own
+  records (96 steps): engine 2.719 accepted vs harness 2.760; first draft identical 99.0% (slots 99.0/97.9/92.7/91.7/
+  89.6%).  Run: `flock ~/.quetza-data/conductor/ds4-gpu.lock build-ds4-dspark/test_ds41_dspark --sidecar
+  /media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf -m "$G" --main ~/AI/v41-dev/dspark/main_exact.bin --gen
+  ~/AI/v41-dev/dspark/gen_exact.txt --max 96 --dump F` (compare `dspark_accept.py ... --max 96 --dump-drafts F2`).
+  Built in a SEPARATE tree `build-ds4-dspark` (same options as build-ds4-gpu minus `STRATA_DSV41_HC_MIX`).
+- **Drafter precision cannot hurt output quality** (every draft is verified by the trunk) - only acceptance.  So the
+  6.8 GB of MXFP4 DSpark experts can be compressed hard (Q4/Q2/hot-subset) or tiered; measure acceptance with
+  test_ds41_dspark only.  Also share the trunk's head instead of loading a second copy (-0.7 GB).
+- **D2 DESIGN (not coded yet) - verify/accept/rollback in `ds41_generate.cpp` one-shot path, greedy (temp 0) v1,
+  `STRATA_DSPARK=<sidecar>`, `STRATA_DSPARK_DEPTH` (<= 4, see ring):**
+  1. *Verify pass* = the existing `pass_m` lambda (ds41_generate.cpp ~513: one dense pass of m tokens, tier per token
+     via `run_to_dev` into the routed rows), copied as `pass_v` that also captures main_hidden: after
+     `dense.finish(l)` for l in {36,37,38} call `dense.read_state(x, pre)` (token-major [m][HC][D]) and accumulate the
+     HC-mean into rows [m][3*D] (same math as the STRATA_DUMP_MAIN block ~490).  Logits: `dense.logits(row0, nrows, out)`.
+     Dense `max_pass` = S (512 with the default layer-major prompt batch) so m <= 6 fits.
+  2. *Loop*: state P (last fed position), t (trunk token for P+1, not yet fed), drafts d[0..k).  Emit t; pass tokens
+     [t, d0..d(k-1)] at P+1..P+1+k; g_i = argmax(row of position P+1+i); a = #leading d_i == g_i; emit d0..d(a-1);
+     t' = g_a; DSpark.step(main_hidden rows of P+1..P+1+a, a+1 rows, bonus t') -> new drafts; P += 1+a.
+  3. *Rollback is free except two rings*: every cache is position-indexed and simply overwritten when a position is
+     fed again (compressed rows, indexer keys, Engram history, sel/cand per column).  (a) the window K ring has
+     RAW = SWA+3 = 131 slots (`ds41_dense.cpp` init `im.RAW = im.SWA + 3`, slot = pos % RAW): a rejected position q
+     evicts q-131, which a later query at q' needs iff q >= q'+4 -> **safe for depth <= 4**; depth 5 needs RAW >= SWA+1+5
+     (one-line change in ds41_dense.cpp, bit-identical by construction - gather by position; do it when the fusion
+     slice is done with that file).  (b) the **ratio-2 compressor state ring is 2 slots by parity** (`i_sidx`/`i_sslot`,
+     ds41_dense.cpp ~1112): a pass writes only its LAST 2 tokens' states, so after a partial rejection the slot of the
+     last accepted position may hold a rejected token's state.  FIX (no engine change): if the pass would start at an
+     ODD position and the previous pass rejected anything, start it ONE position earlier, re-feeding the last accepted
+     token (its group's states then come from inside the pass, `row(q) = 2 + q - pos0`).
+  4. *Seeding the DSpark window*: the layer-major prefill gives no per-position states, so feed the prompt minus its
+     last min(128, L-1) tokens normally, open the VRAM cache, then run that tail through `pass_v` in chunks of <= 16
+     (set `Ds41DSparkConfig::max_append = 16`), appending the main_hidden rows (bonus -1), the last chunk drafting.
+  5. *Gate*: spec output vs plain greedy (`STRATA_DSPARK` unset) - identical up to batch-shape near-ties (report the
+     first divergence index + ppl); tokens/pass in-engine vs 4.27 offline; tok/s.
+  6. *Known speed ceiling of v1*: `pass_m` runs the tier PER TOKEN (~16 ms each) and `Ds41MoeTier::run_multi` falls back
+     token-by-token for per-expert-geometry models (ours), so a 5-token verify costs ~5x tier.  **D3 = a multi-token
+     tier path** (union of the pass's experts, each expert's weights read once for all its tokens - `native_expert_grouped`
+     already takes `ent_tok`; the prefill `run_chunk_dev` groups by expert but streams whole layers): that is what
+     decides 50 tok/s.  Union of 5 tokens' experts also raises misses: keep route bias on (it pulls the union into VRAM).
+- **Kernel fusion worker `v41-zoo-fusion`** (flash, packet `~/.quetza-data/conductor/packets/v41-zoo-fusion-task.md`,
+  report `~/.quetza-data/conductor/reports/v41-zoo-fusion.md`, done file `.done-v41-zoo-fusion`): IN FLIGHT at handoff.
+  Its uncommitted WIP: `tools/v41/engine/ds41_dense.cpp` (STRATA_DSV41_HC_MIX path), `v41_engine.cmake` (HC_MIX
+  option), `tools/v41/ggml/dsv41-fuse.patch` applied in third_party, `build-ds4-gpu` configured with HC_MIX=ON.
+  Verify its report/gates (forced-token 0-diff, test_ds41_hcmix, nsys node counts, A/B) before committing its files.
+- **Dense requant (forced A/B, 1 run each): q8 26.64 / q5_K 27.73 / q4_K 29.75 tok/s** (attn_router 17.11 / 14.87 /
+  13.52).  q4_K quality vs a same-arena q8 control: code ppl +1.7% (KL 0.026 vs floor 0.0095), agent KL 0.48 vs floor
+  0.25.  NOT adopted - Mal: quality benchmark first (§6 item 3).
+- **llama.cpp fixes to pull (queued slice, after fusion)**: #30103 (flash-attn tile race, our D=512 prompt attention;
+  maybe the cause of the prefill md5 drift) + #29953 (MMQ OOB reads) - our vendored ggml predates both.
+- Strata 0.1.41-0.1.43.1 scanned: its decode-collapse bug does not apply (no pinned thread / host callbacks in our
+  engine); useful later: `tools/strata_bench.py` speed suite, pinned ring for pageable H2D, CPU share for short prompts.
+- Cleanup done: 12 old worker worktrees removed (branches kept; wire leftovers = `git stash@{0}`), Strata-architectds
+  deleted.  Swap is not a lever (8+32 GB swap files on the SATA root SSD ~0.5 GB/s; zram = compressed RAM; the arena is
+  pinned).  Mal's mode: **the conductor writes the core code itself; the one flash worker is for research/legwork.**
+
 ## 6. Work queue (Mal's order; ONE flash worker at a time)
 1. **DSpark on OUR states: DONE - 4.27 tokens/pass, no retraining.**  => item 4 (engine draft+verify) is the top
    priority after the in-flight fusion slice.  50 tok/s needs a verify pass <= ~85 ms at depth 5 (or <= ~53 ms at depth 2).
@@ -148,7 +210,8 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   `/usr/bin/patch`, anaconda's is broken).
 - Measure before claiming; report ppl/KL for anything lossy; **Mal decides quality trades**; soft routing only
   (penalties, never masks).  Commits end with `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
-- Conductor mode: **ONE flash worker at a time** (Mal), no Agent-tool subagents; packets in
+- Conductor mode: **ONE flash worker at a time** (Mal), no Agent-tool subagents; **the conductor writes the core code
+  itself - the worker is for research/legwork** (Mal 2026-10-13); packets in
   `~/.quetza-data/conductor/packets/<slice>-task.md`, dispatch with `qc-dispatch <slice> --model flash --prompt "Read
   the full task packet at ...-task.md and follow it exactly ..."` (`--packet` stalls; `--prompt` overwrites
   `packets/<slice>.md`), arm `qc-await <slice>`.
