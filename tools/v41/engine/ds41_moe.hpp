@@ -437,6 +437,9 @@ public:
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
+    /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
+    /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
+    bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.

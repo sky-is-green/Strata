@@ -540,6 +540,7 @@ int main(int argc, char ** argv) {
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
     long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
+        static const bool no_tier_batch = std::getenv("STRATA_TIER_BATCH") == nullptr;   // D3 OPT-IN: default = per-token
         double tq = now_ms();
         auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
@@ -551,13 +552,25 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
             lap(0);
-            for (int t = 0; t < m; ++t) {
-                const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                        fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
-                                      : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
-                                                 fn + (size_t) t * n_embd, routed1.data());
-                if (!ok) { ferr = "tier.run failed"; return false; }
-                if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+            if (rdev1 && !no_tier_batch) {
+                // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
+                // once), not m run_to_dev calls.  Split at 4 = ds41_moe's kMaxTok (m = 1 + k <= 5 at depth 4).
+                for (int off = 0; off < m; off += 4) {
+                    const int chunk = std::min(4, m - off);
+                    if (!tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
+                                               fn + (size_t) off * n_embd, rdev1 + (size_t) off * n_embd)) {
+                        ferr = "tier.run_multi_to_dev failed"; return false;
+                    }
+                }
+            } else {
+                for (int t = 0; t < m; ++t) {
+                    const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                            fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
+                                          : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                     fn + (size_t) t * n_embd, routed1.data());
+                    if (!ok) { ferr = "tier.run failed"; return false; }
+                    if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+                }
             }
             lap(1);
             if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }

@@ -93,6 +93,43 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   the Engram placeholders `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt`.
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
+
+### Session 8 (2026-10-13 late evening) - D3 batched tier CODED but CRASHES; opt-in, default OFF
+- **D3 = `gpu_run_n_ex`** (`tools/v41/engine/ds41_moe.cpp`, right after `gpu_run_n`): the batched per-expert-class
+  verify tier - the same union sharing as `gpu_run_n` (each distinct expert read ONCE, a group with one entry per
+  token that routed to it) but split by the 9 format classes: one `native_expert_grouped` per (class, site) with
+  `gp.gll[cls]`, per-expert blob `im.bl[cls]` / fmt `im.fl[cls]`, CPU jobs with `jb.fmt=&im.fl[cls]` and a
+  per-(token,class) activation quant via a NEW buffer `im.nact_multi_n` + `nact_slot_n()`, and the per-token card
+  sum (`decode_rows_sum` per token - bit-identical to `run_to_dev`).  `Ds41MoeTier::run_multi_to_dev` (new) and
+  `run_multi`'s `per_expert()` branch route to it; `run_multi_to_dev`'s fallback is per-token `run_to_dev`
+  (NOT `gpu_run_n` - that was a bug).  `pass_v` (`ds41_generate.cpp` ~542) now calls `run_multi_to_dev` once per
+  layer, 4 tokens at a time (`kMaxTok`), instead of `tier.run_to_dev` per token.
+- **STATUS: BROKEN.** `STRATA_TIER_BATCH=1` -> the D3 arm SIGSEGVs (exit 139) in the CPU pool
+  (`native_gu_rows` -> `ggml_vec_dot_q3_K_q8_K`), at layer 0, nt=4, on the prompt tail.  A gdb run also showed
+  `ds4_moe: c_stage: out of memory` + SIGABRT (main thread) - likely two symptoms of ONE host OOB.  `[dbg_x] ENTER
+  gpu_run_n_ex` prints but the `nj`+per-job dump 2 lines below does NOT -> the fault is between ENTER and the CPU
+  job loop; prime suspect a bad `nact` pointer.  **Check first:** `im.nact_multi_n` is sized (init ~line 1197:
+  `kMaxTok * nact_multi_act.size() * kNativeActBytes`) and non-empty; `nact_slot_n`'s index
+  (`t*nfmt + nact_act_idx`) matches its stride (`kNativeActBytes`); and the PCIe staging `si` bound.
+- **OPT-IN now: `STRATA_TIER_BATCH=1`** (default = the per-token path, which WORKS).  Debug with `DS41_DBG_X=1`
+  (prints ENTER + `nact_multi_n`/`nfmt` sizes + a per-job blob/fmt/nact dump).  The old `STRATA_NO_TIER_BATCH`
+  was renamed/removed.
+- **A/B harness** `~/AI/v41-dev/d2/d3_test.sh` (bias OFF, depth 4, -n 64; bias off to match `plain_nb.tok`):
+  `d3_a`=batched, `tok_b`=per-token.  It still sets the OLD `STRATA_NO_TIER_BATCH` - update it.  Latest: `d3_a`
+  exit 139 (crash), `tok_b` exit 0 (64 clean tokens) -> the rest of the engine + the per-token tier are fine.
+  Correctness target: `d3_a.tok == tok_b.tok`.  Perf target: verify ms/pass from ~168 (MXFP4) / 212 (IQ3_XXS)
+  to <= ~100 -> 35-40 tok/s.
+- **MTP verdict (Mal asked; FINDINGS §13-22):** MTP's draft is cheap (6-9 ms warm; 6.1 ms with `--mtp-keep 2`;
+  63-68% depth-1 acceptance) but it LOSES - 18.9-20.6 tok/s vs 24.9 plain - for the SAME reason DSpark loses:
+  the multi-token verify pass reads ~2.2x the experts, `run_multi` has no VRAM LRU, and the verify margin costs
+  ~170 expert slots.  FINDINGS' own verdict: *"the road to 30 tok/s is a cheaper pass, not a deeper draft."*
+  So **D3 (the batched pass) is the lever for BOTH MTP and DSpark** - fix D3 and MTP (§22's `--mtp-keep 2` +
+  run_multi LRU) becomes worth re-measuring too.
+- **GPU sharing:** another live session `strata-dense` (relay name) builds/benches a Strata dense 27B and wants
+  the 4090 for short MTP benches.  My relay name is `strata-dspark`.  Their 11 GiB MTP model + our ~10-13 GB run
+  do NOT fit together -> SERIALIZE: ask first via `relay ask strata-dense ...`, yield for their bench, broadcast
+  `4090 free` when done.  This session left messages coordinating that.
+
 - **D2 CODED (opt-in, commit below), gate NOT yet passed.** `ds41_generate.cpp` one-shot: `STRATA_DSPARK=<sidecar>`
   `STRATA_DSPARK_DEPTH` (1..5, default 4), greedy.  Pieces: `pass_v` (pass_m + main_hidden via read_state after layers
   36/37/38 + all m rows of logits); DSpark init INSIDE `open_cache` after `release_pass` (cache sizes around it); prompt

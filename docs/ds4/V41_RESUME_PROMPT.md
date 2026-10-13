@@ -3,6 +3,38 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## UPDATE 2026-10-13 ~20:00 (session 8, conductor) - READ FIRST: D3 batched verify tier (opt-in, BROKEN)
+
+DSpark spec-decode is coded and runs (3.3-3.6 tokens/pass) but is SLOWER than plain (20.5 vs 27.4 tok/s): the verify
+pass (`pass_v`) is tier-dominated (~10x the dense half) because it calls `tier.run_to_dev` once PER pass token, so
+nothing is shared across the pass.  Mal's bar: verify <= ~100 ms/pass -> 35-40 tok/s (currently 168-212 ms).
+
+**D3 = the batched per-expert-class tier (builds, CRASHES).**  Full detail + leads in `V41_START_HERE.md` §5c
+"Session 8".  Short form:
+- New `gpu_run_n_ex` (`ds41_moe.cpp`, after `gpu_run_n`): union sharing + one `native_expert_grouped` per
+  (9 format class, site); new `Ds41MoeTier::run_multi_to_dev`; `pass_v` calls it once per layer (4 tokens at a time).
+  New activation buffer `im.nact_multi_n` + `nact_slot_n()`.
+- **OPT-IN: `STRATA_TIER_BATCH=1`** (default = the working per-token path).  Debug: `DS41_DBG_X=1`.
+- **Crash:** SIGSEGV in the CPU pool (`native_gu_rows` -> `ggml_vec_dot_q3_K_q8_K`) at layer 0, nt=4, on the prompt
+  tail; a gdb run also gave `ds4_moe: c_stage: out of memory` + SIGABRT - likely one host OOB.  `[dbg_x] ENTER
+  gpu_run_n_ex` prints, the `nj`/per-job dump does NOT -> a bad `nact` pointer between ENTER and the CPU job loop.
+  **First checks:** `im.nact_multi_n` sized + non-empty; `nact_slot_n`'s index (`t*nfmt + nact_act_idx`) vs its
+  stride (`kNativeActBytes`); the PCIe `si` bound.
+- A/B harness `~/AI/v41-dev/d2/d3_test.sh` (bias off, depth 4, -n 64): `d3_a` (batched) exit 139, `tok_b`
+  (per-token) exit 0 / 64 clean tokens.  Correctness target `d3_a.tok == tok_b.tok`; perf target verify <= ~100 ms.
+  Update the script's env (`STRATA_NO_TIER_BATCH` -> `STRATA_TIER_BATCH`).
+
+**Correctness bisect DONE** (prior session's `d2_queue.sh`): both arms diverge from plain (`bis_d0` token 8,
+`bis_noacc` token 11) -> the divergence is in `pass_v`'s core at m=1; drafting/rollback/rejection-residue cleared.
+
+**MTP (Mal asked):** explored (FINDINGS §13-22).  MTP's draft is cheap (6-9 ms; 6.1 ms `--mtp-keep 2`) but it LOSES
+(18.9-20.6 vs 24.9 plain) because the multi-token verify pass is the wall - the SAME wall as DSpark.  So D3 is the
+lever for both MTP and DSpark.
+
+**GPU sharing:** live relay peer `strata-dense` (Strata dense 27B, wants the 4090 for short MTP benches); this
+session's relay name is `strata-dspark`.  Runs do not fit together -> SERIALIZE (`relay ask strata-dense`, yield,
+broadcast `4090 free` when done).
+
 
 **Last updated:** 2026-10-13 ~03:20 by Claude (session 4, conductor). Decode bottleneck MEASURED (dense Q8_0 weight bandwidth); the earlier GPU-idle attribution was a TOOLING BUG; slice C / C' / spec-reads refuted; HF upload complete.
 **READ §UPDATE 2026-10-13 ~05:10 FIRST, then §UPDATE ~03:20, then §UPDATE 2026-10-12 ~20:45, then §UPDATE ~19:50, then §HANDOFF ~19:30**, then §UPDATE ~10:15, then ~08:00, then MORNING, then NIGHT-2, then 2026-10-11 NIGHT / EVENING / 13:10.

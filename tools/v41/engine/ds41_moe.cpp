@@ -461,6 +461,7 @@ struct Ds41MoeImpl {
     /// activation once per format instead of once per class.  The Q2_0-native classes share `actq`.
     std::vector<uint8_t> nact_multi;
     std::vector<int> nact_multi_act;
+    std::vector<uint8_t> nact_multi_n;   ///< run_multi per-expert: kMaxTok x nact_multi_act x kNativeActBytes
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     std::vector<float> parts;         ///< top_k * n_embd, one expert output per routing index
     std::vector<cpu::ExpertJobMulti> jobs;
@@ -786,6 +787,18 @@ uint8_t* nact_slot(Ds41MoeImpl& im, int gu_act) {
     for (size_t b = 0; b < im.nact_multi_act.size(); ++b)
         if (im.nact_multi_act[b] == gu_act) return im.nact_multi.data() + b * cpu::kNativeActBytes;
     return im.nact.data();
+}
+/// run_multi with per-expert classes: one slot per (token, distinct gate/up format).  `nact_slot` is shared
+/// across tokens because a single-token gpu_run quantizes one activation; a batched pass must hold every
+/// token's activation for every class its CPU experts use, so they cannot share.
+int nact_act_idx(const Ds41MoeImpl& im, int gu_act) {
+    for (size_t b = 0; b < im.nact_multi_act.size(); ++b) if (im.nact_multi_act[b] == gu_act) return (int) b;
+    return -1;
+}
+uint8_t* nact_slot_n(Ds41MoeImpl& im, int t, int gu_act) {
+    const int b = nact_act_idx(im, gu_act);
+    if (b < 0) return im.nact.data();
+    return im.nact_multi_n.data() + ((size_t) t * im.nact_multi_act.size() + (size_t) b) * cpu::kNativeActBytes;
 }
 
 // ================================ geometry ================================
@@ -1194,6 +1207,7 @@ bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds4
             im_->nact_multi_act.push_back(a);
     }
     im_->nact_multi.assign(im_->nact_multi_act.size() * cpu::kNativeActBytes, 0);
+    im_->nact_multi_n.assign((size_t) kMaxTok * im_->nact_multi_act.size() * cpu::kNativeActBytes, 0);
     im_->parts_n.assign((size_t) kMaxEnt * (size_t) geom.n_embd, 0.0f);
 
     if (cfg.cpu_only) {
@@ -2750,6 +2764,230 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
     im.pf_n = 0;
     return true;
 }
+
+/// D3: gpu_run_n for a PER-EXPERT model (DS4 = 9 gate/up format classes).  Same union sharing as gpu_run_n -
+/// each distinct expert is fetched/read ONCE, a group with one entry per token that routed to it - but the
+/// grouped kernel takes ONE layout per launch, so the groups are split by format class and one
+/// native_expert_grouped is launched per (class, site).  blob / fmt / layout are per expert's class.  A verify
+/// pass of nt tokens is ONE call per layer instead of nt run_to_dev calls, so the union's experts, the PCIe
+/// staging and the CPU pool are shared across the pass's tokens.
+/// `out_dev != nullptr` = the weighted sum on the card, per token (bit-identical to nt run_to_dev calls);
+/// `out_dev == nullptr` = the host sum into `out`.  Returns false for a Q2_0-native class (the caller falls
+/// back to per-token gpu_run) - none of DS4's 9 classes is one.
+bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w,
+                  const float* x_host, float* out, void* out_dev) {
+    Gpu& gp = *im.gpu;
+    const int64_t H = im.g.n_embd;
+    const int64_t K = im.g.top_k;
+    const int64_t B = im.blob;                        // staging stride
+    const int   NE = nt * (int) K;
+    const double t0 = now_ms();
+    Ds41MoeStats st;
+    if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER gpu_run_n_ex layer=%lld nt=%d nact_multi_n=%zu nfmt=%zu kNativeActBytes=%d\n",
+                                                  (long long) layer, nt, im.nact_multi_n.size(), im.nact_multi_act.size(), (int) cpu::kNativeActBytes);
+    auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
+
+    // ---- distinct experts, first-seen order (entries keep their routing index j = t*K + k) ----
+    int32_t ue[kMaxEnt], ent_u[kMaxEnt];
+    int nu = 0;
+    for (int j = 0; j < NE; ++j) {
+        int u = -1;
+        for (int i = 0; i < nu && u < 0; ++i)
+            if (ue[i] == ids[j]) u = i;
+        if (u < 0) { u = nu; ue[nu++] = ids[j]; }
+        ent_u[j] = u;
+        if (cpu::q2_native_kernels(im.fl[(size_t) im.g.cls(layer, ids[j])].gu_type)) return false;   // q2: not batched
+    }
+    // ---- classify: resident slot / prefetch staging / miss ----
+    enum { HIT = 0, PCIE = 1, CPU = 2 };
+    int cls[kMaxEnt];
+    unsigned long long dptr[kMaxEnt] = {};
+    int32_t miss[kMaxEnt];
+    int nmiss = 0, npf = 0;
+    for (int u = 0; u < nu; ++u) {
+        const int32_t e = ue[u];
+        const int32_t sl = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
+        int pf_at = -1;
+        for (int j = 0; j < im.pf_n && sl < 0; ++j)
+            if (im.pf_e[j] == e) pf_at = j;
+        if (sl >= 0) { cls[u] = HIT; dptr[u] = (unsigned long long) gp.cache->device_slot(sl); }
+        else if (pf_at >= 0) { cls[u] = HIT; dptr[u] = (unsigned long long) gp.d_pf + (size_t) pf_at * (size_t) B; ++npf; }
+        else { cls[u] = CPU; miss[nmiss++] = u; }
+    }
+    // ---- the PCIe share of the distinct misses (same budget rule as gpu_run) ----
+    int np = 0;
+    {
+        int eligible = 0;
+        for (int i = 0; i < nmiss; ++i)
+            if (gp.arena.ptr(layer, ue[miss[i]])) ++eligible;
+        int budget;
+        if (im.cfg.dither) {
+            const double want = (double) eligible * im.cfg.pcie_frac + im.pcie_carry;
+            budget = (int) std::floor(want);
+            im.pcie_carry = want - budget;
+        } else {
+            budget = (int) std::lround((double) eligible * im.cfg.pcie_frac);
+        }
+        budget = std::min(budget, kMaxParts);
+        for (int i = 0; i < nmiss && np < budget; ++i) {
+            const int u = miss[nmiss - 1 - i];
+            if (gp.arena.ptr(layer, ue[u])) { cls[u] = PCIE; ++np; }
+        }
+    }
+    // ---- activations: q8_1 rows for the card (one per token); the pool's per-class quant runs with its jobs ----
+    std::memcpy(gp.h_x, x_host, (size_t) nt * (size_t) H * 4);
+    ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
+    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+    if (npf > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
+    // ---- one grouped launch per (site, class); groups = distinct experts, entries = the tokens routing to them ----
+    auto launch_site = [&](int want) {
+        bool used[kMaxEnt] = {};
+        int left = 0;
+        for (int u = 0; u < nu; ++u) if (cls[u] == want) ++left;
+        int si = 0;   // the PCIe staging slot, shared across classes (they read disjoint regions of gp.d_stage)
+        while (left > 0) {
+            int c = -1;
+            for (int u = 0; u < nu && c < 0; ++u)
+                if (!used[u] && cls[u] == want) c = im.g.cls(layer, ue[u]);
+            if (c < 0) break;
+            std::vector<unsigned long long> ptr;
+            std::vector<int32_t> start, dst, tok;
+            for (int u = 0; u < nu; ++u) {
+                if (used[u] || cls[u] != want || im.g.cls(layer, ue[u]) != c) continue;
+                used[u] = true; --left;
+                if (want == PCIE) {
+                    ck(cudaMemcpyAsync((uint8_t*) gp.d_stage + (size_t) si * (size_t) B, gp.arena.ptr(layer, ue[u]),
+                                       (size_t) BLX(ue[u]), cudaMemcpyHostToDevice, gp.s), "pcie dma");
+                    dptr[u] = (unsigned long long) gp.d_stage + (size_t) si * (size_t) B;
+                    ++si;
+                }
+                ptr.push_back(dptr[u]);
+                start.push_back((int32_t) dst.size());
+                for (int j = 0; j < NE; ++j)
+                    if (ent_u[j] == u) { dst.push_back(j); tok.push_back(j / (int) K); }
+            }
+            const int ng = (int) ptr.size();
+            if (ng == 0) continue;
+            start.push_back((int32_t) dst.size());
+            const int32_t ngv = ng;
+            ck(cudaMemcpyAsync(gp.d_grp_ptr, ptr.data(), sizeof(unsigned long long) * (size_t) ng, cudaMemcpyHostToDevice, gp.s), "grp_ptr");
+            ck(cudaMemcpyAsync(gp.d_grp_start, start.data(), sizeof(int32_t) * (size_t) (ng + 1), cudaMemcpyHostToDevice, gp.s), "grp_start");
+            ck(cudaMemcpyAsync(gp.d_ngroups, &ngv, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "ngroups");
+            ck(cudaMemcpyAsync(gp.d_ent_dst, dst.data(), sizeof(int32_t) * dst.size(), cudaMemcpyHostToDevice, gp.s), "ent_dst");
+            ck(cudaMemcpyAsync(gp.d_ent_tok, tok.data(), sizeof(int32_t) * tok.size(), cudaMemcpyHostToDevice, gp.s), "ent_tok");
+            strata::kernels::native_expert_grouped(gp.gll[(size_t) c], (const unsigned long long*) gp.d_grp_ptr,
+                                                  (const int32_t*) gp.d_grp_start, (const int32_t*) gp.d_ngroups,
+                                                  (const int32_t*) gp.d_ent_dst, (const int32_t*) gp.d_ent_tok, ng,
+                                                  (int64_t) dst.size(), gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, ng);
+        }
+    };
+    launch_site(HIT);
+    launch_site(PCIE);
+    // ---- the pool on the CPU misses: one job per distinct expert, its class's fmt + per-(token,class) quant ----
+    int nj = 0;
+    if ((int) im.jobs.size() < nu) im.jobs.resize((size_t) nu);
+    std::vector<char> act_done(im.nact_multi_act.size() * (size_t) kMaxTok, 0);
+    for (int u = 0; u < nu; ++u) {
+        if (cls[u] != CPU) continue;
+        const cpu::NativeFmt& fc = im.fl[(size_t) im.g.cls(layer, ue[u])];
+        bool from_file = false;
+        cpu::ExpertJobMulti& jb = im.jobs[(size_t) nj];
+        jb.blob = acquire(im, layer, ue[u], nj, &from_file);
+        jb.nt = 0;
+        jb.fmt = &fc;
+        for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; jb.act[t] = nullptr; }
+        for (int j = 0; j < NE; ++j) {
+            if (ent_u[j] != u) continue;
+            const int tt = j / (int) K;
+            uint8_t* slot = nact_slot_n(im, tt, fc.gu_act);
+            const size_t ai = (size_t) tt * im.nact_multi_act.size() + (size_t) std::max(0, nact_act_idx(im, fc.gu_act));
+            if (!act_done[ai]) {
+                cpu::native_quant_act(fc, gp.h_x + (size_t) tt * H, slot);
+                act_done[ai] = 1;
+            }
+            jb.nact[jb.nt] = slot;
+            jb.out[jb.nt] = im.parts_n.data() + (size_t) j * (size_t) H;
+            ++jb.nt;
+        }
+        ++nj;
+    }
+    if (nj > 0 && std::getenv("DS41_DBG_X")) {
+        std::fprintf(stderr, "[dbg_x] nt=%d nu=%d nj=%d nact_multi_n=%zu nfmt=%zu\n", nt, nu, nj,
+                     im.nact_multi_n.size(), im.nact_multi_act.size());
+        for (int i = 0; i < nj; ++i) {
+            const cpu::ExpertJobMulti& j = im.jobs[(size_t) i];
+            std::fprintf(stderr, "[dbg_x] job%d blob=%p fmt=%p gu_act=%d gu_type=%d act_bytes=%d nt=%d nact0=%p out0=%p\n",
+                         i, (const void*) j.blob, (const void*) j.fmt, j.fmt ? j.fmt->gu_act : -9, j.fmt ? j.fmt->gu_type : -9,
+                         j.fmt ? j.fmt->act_bytes : -9, j.nt, j.nact[0], (void*) j.out[0]);
+        }
+    }
+    if (nj > 0) {
+        const double c0 = now_ms();
+        im.pool->run_split_multi_native(im.fl[(size_t) im.g.cls(layer, ue[0])], im.jobs.data(), nj);
+        st.cpu_ms = now_ms() - c0;
+    }
+    if (out_dev) {
+        // ---- the weighted sum on the card, per token (as run_to_dev): the pool's rows go up into their
+        // routing-index rows of d_parts, the pass's weights through the metadata block, and decode_rows_sum
+        // adds one token's K rows in double - the host loop, bit for bit. ----
+        for (int j = 0; j < NE; ++j) {
+            if (w[j] == 0.0f) continue;
+            if (cls[ent_u[j]] != CPU) continue;
+            float* hrow = (float*) gp.h_parts + (size_t) j * (size_t) H;
+            std::memcpy(hrow, im.parts_n.data() + (size_t) j * (size_t) H, (size_t) H * 4);
+            ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
+                               gp.s), "cpu row h2d");
+        }
+        const size_t o_w = 0;   // h_meta is unused by this path (its metadata goes through d_grp_* buffers)
+        std::memcpy(gp.h_meta + o_w, w, sizeof(float) * (size_t) NE);
+        ck(cudaMemcpyAsync((uint8_t*) gp.d_meta + o_w, gp.h_meta + o_w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice,
+                           gp.s), "sum weights");
+        for (int t = 0; t < nt; ++t)
+            strata::kernels::decode_rows_sum((const float*) gp.d_parts + (size_t) t * (size_t) K * (size_t) H,
+                                             (const float*) ((uint8_t*) gp.d_meta + o_w) + (size_t) t * (size_t) K,
+                                             (int) K, H, (float*) out_dev + (size_t) t * (size_t) H, gp.s);
+        ck(cudaStreamSynchronize(gp.s), "sum sync");
+    } else {
+        ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
+        ck(cudaStreamSynchronize(gp.s), "layer sync");
+        const float* gpu_parts = (const float*) gp.h_parts;
+        for (int t = 0; t < nt; ++t)
+            for (int64_t i = 0; i < H; ++i) {
+                double acc = 0;
+                for (int64_t k = 0; k < K; ++k) {
+                    const int j = t * (int) K + (int) k;
+                    const float* p = cls[ent_u[j]] == CPU ? im.parts_n.data() + (size_t) j * H : gpu_parts + (size_t) j * H;
+                    acc += (double) w[j] * (double) p[(size_t) i];
+                }
+                out[(size_t) t * H + i] = (float) acc;
+            }
+    }
+    // ---- admission of the distinct misses (as gpu_run) ----
+    if (gp.cache && !im.cfg.no_cache && !im.mixed_sizes) {
+        for (int u = 0; u < nu; ++u) {
+            if (cls[u] == HIT) continue;
+            const uint8_t* p = gp.arena.ptr(layer, ue[u]);
+            if (!p) continue;
+            const int32_t sl = gp.cache->admit(layer, ue[u]);
+            if (sl < 0) continue;
+            std::string e2;
+            if (!gp.cache->fill_slot_blocking(sl, p, e2, BLX(ue[u]))) {
+                std::fprintf(stderr, "ds4_moe: fill_slot: %s\n", e2.c_str());
+                std::abort();
+            }
+            ++im.admitted;
+        }
+    }
+    for (int j = 0; j < NE; ++j) {
+        const int c = cls[ent_u[j]];
+        if (c == HIT) ++st.hits; else if (c == PCIE) ++st.pcie; else ++st.cpu;
+    }
+    st.prefetched_useful = npf;
+    st.wall_ms = now_ms() - t0;
+    im.st.add(st);
+    im.pf_n = 0;
+    return true;
+}
 #endif  // DS4_MOE_CUDA
 
 
@@ -3555,7 +3793,8 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
         return true;
     }
 #if defined(DS4_MOE_CUDA)
-    if (im_->g.per_expert()) {   // per-expert formats: token by token (gpu_run handles mixed classes; gpu_run_n not yet)
+    if (im_->g.per_expert()) {   // D3: the batched per-class path; per-token only if it declines (a q2 class)
+        if (gpu_run_n_ex(*im_, layer, nt, ids, w, x, out, nullptr)) return true;
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
         for (int t = 0; t < nt; ++t)
             if (!gpu_run(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, nullptr, out + (size_t) t * H)) return false;
@@ -3565,6 +3804,33 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
 #else
     return false;
 #endif
+}
+
+bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+    if (!im_->inited || !im_->pool) return false;
+    if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
+    if (!im_->g.routed(layer)) return false;
+    if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER run_multi_to_dev layer=%lld nt=%d\n", (long long) layer, nt);
+#if defined(DS4_MOE_CUDA)
+    if (!im_->cfg.cpu_only) {
+        const int64_t K = im_->g.top_k, H = im_->g.n_embd;
+        if (im_->g.per_expert()) {
+            if (gpu_run_n_ex(*im_, layer, nt, ids, w, x, nullptr, out_dev)) return true;
+            for (int t = 0; t < nt; ++t)   // per-expert fallback (a q2 class): per-token run_to_dev, NOT gpu_run_n
+                if (!run_to_dev(layer, ids + t * K, w + t * K, x + (size_t) t * H,
+                                (uint8_t*) out_dev + (size_t) t * (size_t) H * 4)) return false;
+            return true;
+        }
+        std::vector<float> tmp((size_t) nt * H);
+        if (!gpu_run_n(*im_, layer, nt, ids, w, x, tmp.data())) return false;
+        ck(cudaMemcpyAsync(out_dev, tmp.data(), (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, im_->gpu->s), "multi h2d");
+        ck(cudaStreamSynchronize(im_->gpu->s), "multi sync");
+        return true;
+    }
+#else
+    (void) layer; (void) nt; (void) ids; (void) w; (void) x; (void) out_dev;
+#endif
+    return false;
 }
 
 bool Ds41MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
