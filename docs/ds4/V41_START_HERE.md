@@ -141,6 +141,10 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 - Profiling runs (bias ON, depth 4) at handoff: `~/AI/v41-dev/d2/prof_mx.log` (MXFP4) / `prof_q3.log`
   (`STRATA_DSPARK_EXP_TYPE=q3_K`): read the `pass_v split` line (dense / tier / taps / logits ms per pass - async GPU,
   so the dense/tier split is approximate, the total is exact) + VRAM hits + tokens/pass.
+- **DSpark shrink DONE (worker v41-dspark-shrink, `tools/v41/DSPARK_SHRINK.md`)**, test_ds41_dspark 378 steps, accepted/pass:
+  MXFP4 3.280 (8.61 GB on card) | Q3_K 3.246 (7.23 GB) | **Q2_K 3.233 (5.85 GB, -2.76 GB)** | **IQ3_XXS 3.280 (6.59 GB,
+  identical acceptance)**.  Use `STRATA_DSPARK_EXP_TYPE=iq3_xxs` (or q2_K for max VRAM) - on-load env path == file path
+  (cross-checked).  Files tool `tools/v41/v41_sidecar_requant.cpp`; `V41-MTP-Vision.{Q3_K,Q2_K}.gguf` on NVME1TB.
 - Mal's bar: DSpark is worth it at **35-40 tok/s** (needs verify <= ~100-115 ms/pass at ~4 tokens/pass).
 - **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
 
