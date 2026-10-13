@@ -92,6 +92,36 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 - Repo/GitHub/HF: everything committed + pushed at shutdown (see `git log -5`); HF card has the 4-step quick start and
   the Engram placeholders `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt`.
 
+## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
+- **D2 CODED (opt-in, commit below), gate NOT yet passed.** `ds41_generate.cpp` one-shot: `STRATA_DSPARK=<sidecar>`
+  `STRATA_DSPARK_DEPTH` (1..5, default 4), greedy.  Pieces: `pass_v` (pass_m + main_hidden via read_state after layers
+  36/37/38 + all m rows of logits); DSpark init INSIDE `open_cache` after `release_pass` (cache sizes around it); prompt
+  minus last min(128,L-1) via feed, then the tail through pass_v in chunks of 16 **with decode biases OFF** (bug found:
+  the tail routed with the decode route bias -> stream diverged at token 0), last chunk drafts; accept loop with the
+  odd-start re-feed after a rejection; stats line `DSpark: N verify passes, X accepted drafts/pass ...`.
+  `STRATA_DEC_MARGIN=1` + `STRATA_FORCE_IDS` (plain loop) prints argmax vs forced logit gap where they differ.
+- **5b's ring analysis was wrong for depth 4 with the re-feed** (a re-fed query at P+1 needs P-126 = the slot a
+  rejected P+5 overwrites).  FIX: `ds41_dense.cpp` `im.RAW = im.SWA + 16` (gather by position -> results unchanged by
+  construction; NOT yet re-verified with the forced-token 0-diff gate - do that).
+- DSpark is compiled INTO ds41_generate (`target_sources`), not linked as the lib: linking ds41_dspark reorders static
+  archives -> duplicate `ggml_cuda_error` (ggml-cuda.cu.o vs strata_mmq ggml_cuda_host.cu.o).
+- **Shared head**: `Ds41Dense::weight(name)` + `Ds41DSparkConfig::shared_head`; ds41_generate passes the trunk's
+  output.weight (-0.7 GB; `STRATA_DSPARK_OWN_HEAD=1` = old).  Built, NOT yet run.
+- Measured (p256 x 256, WITH decode biases): plain 27.38 tok/s (97.8% VRAM hits); DSpark depth 4 run 1 (tail-bias bug)
+  20.71 tok/s, 4.06 tokens/pass, verify 190 ms/pass, draft 3.5 ms, 87.4% hits; run 2 (fixed) 18.36 tok/s, 3.16
+  tokens/pass, first divergence token 9.  Forced margin run: the route bias depends on VRAM residency, which DSpark's
+  8.6 GB changes -> different routing -> logit gaps 1-4 = NOT a verify bug.  Also plain decode is not run-to-run
+  deterministic (near-tie gap 0.05 flipped at step 4) -> suspect the flash-attn race #30103.
+  **Correct gate = both arms with `--route-bias 0 --route-bias-file 0`** (script below; was queued at handoff).
+- Speed: v1 verify = ~5x a single step (tier per token) -> D3 (multi-token tier) is THE next speed item.
+- Upstream fixes PREPARED (not applied): `tools/v41/ggml/upstream-fixes.patch` (#30103 fattn-mma-f16.cuh 1 line,
+  #29953 mmq.cu/.cuh), `tools/v41/ggml/UPSTREAM_FIXES.md`; dry-run clean against the tree (with dsv41-fuse applied).
+- Worker `v41-dspark-shrink` (flash) in flight at handoff: requant DSpark's MXFP4 experts (Q3_K/Q2_K/IQ*), acceptance
+  per type via test_ds41_dspark; report `~/.quetza-data/conductor/reports/v41-dspark-shrink.md`, results
+  `tools/v41/DSPARK_SHRINK.md`, files `/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.<type>.gguf` (40 GB free).
+  Its requant tool needs ~12+ GB RAM: told to run RAM-heavy jobs under the GPU lock (it starved an engine run once).
+- **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
+
 ## 5b. Session 6 (2026-10-13 afternoon/evening) - READ THIS, it supersedes §5 where they differ
 - **DSpark on OUR states (fixed harness, 378 steps): 3.27 accepted/pass = 4.27 tokens/pass** (= FP8 teacher 3.24) ->
   no retraining.  Logs `~/AI/v41-dev/dspark/fixed_ours.log`, `fixed_teacher.log`.

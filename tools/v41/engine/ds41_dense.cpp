@@ -855,6 +855,7 @@ static ggml_cgraph * build_init(Ds41Dense::Impl & im, ggml_context * gc, int64_t
 Ds41Dense::Ds41Dense() : p_(new Impl()) {}
 Ds41Dense::~Ds41Dense() = default;
 const Ds41Geometry & Ds41Dense::geom() const { return p_->g; }
+ggml_tensor * Ds41Dense::weight(const std::string & name) const { return p_->w.get(name); }
 int64_t Ds41Dense::n_layer() const { return p_->nl; }
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
 const std::string & Ds41Dense::last_error() const { return p_->err; }
@@ -885,7 +886,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     if (const char * e = std::getenv("DS41_TEST_CAND_BLOCKS")) im.CB = std::atoi(e);
     im.S = std::max(1, cfg.max_pass);                       // the dense sub-batch size of the layer-major walk
     im.NC = std::max<int64_t>(im.S, std::max(1, cfg.prompt_batch));   // state columns: the whole prompt batch, or the pass
-    im.RAW = im.SWA + 3;
+    // the window ring: every row is gathered BY POSITION (slot = pos % RAW), so its size never changes results.  DSpark
+    // verify passes write up to k rejected draft positions; a rejected q evicts q - RAW, which a later query q' (>= the
+    // last accepted position, re-fed) needs iff q - RAW >= q' - SWA + 1  ->  safe for k <= RAW - SWA = 16 drafts.
+    im.RAW = im.SWA + 16;
     im.cmax[1] = cfg.ctx_max; im.cmax[2] = cfg.ctx_max / 2;
     if (im.ITOP > im.cmax[2] || im.CBS <= 0 || cfg.ctx_max % 256) { err = "ctx_max must be a multiple of 256 and >= 1024"; return false; }
 

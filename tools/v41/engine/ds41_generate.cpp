@@ -24,6 +24,9 @@
 // Load the real model only through tools/ds4/memguard.sh (RAM cap + the shared GPU lock).
 #include "ds41_dense.hpp"
 #include "ds41_moe.hpp"
+#if defined(DS41_HAVE_DSPARK)
+#include "ds41_dspark.hpp"
+#endif
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -39,6 +42,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <iostream>
 #include <mutex>
 #include <random>
@@ -369,7 +373,7 @@ int main(int argc, char ** argv) {
     std::vector<float> w1((size_t) top_k), routed1((size_t) n_embd), logits1((size_t) nv);
     // --serve's short-turn passes (STRATA_SERVE_PASS_M tokens per dense pass; 1 = single decode steps)
     const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 16);
-    std::vector<float> crouted_m((size_t) pass_max * n_embd);
+    std::vector<float> crouted_m((size_t) std::max(pass_max, 17) * n_embd);   // 17: pass_v's DSpark seeding / verify passes
     std::string ferr;
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
     static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
@@ -529,6 +533,43 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
+    // pass_m + DSpark's main_hidden: vh[t * 3D + j * D ..] = the HC-mean of the state leaving layer dm_layers[j] (=
+    // entering the DSpark target layer 37 + j) for pass token t (the STRATA_DUMP_MAIN math, token-major read_state);
+    // vlog = the pass's m rows of logits.
+    std::vector<float> vh, vlog, vx, vpre;
+    auto pass_v = [&](const int * toks, int m, int pos) -> bool {
+        mids.resize((size_t) m * top_k);
+        mw.resize((size_t) m * top_k);
+        vh.assign((size_t) m * 3 * n_embd, 0.0f);
+        if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
+        for (int l = 0; l < n_layer; ++l) {
+            const float * fn = nullptr;
+            if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            for (int t = 0; t < m; ++t) {
+                const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                        fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
+                                      : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
+                                                 fn + (size_t) t * n_embd, routed1.data());
+                if (!ok) { ferr = "tier.run failed"; return false; }
+                if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
+            }
+            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            for (int j = 0; j < 3; ++j) {
+                if (l != dm_layers[j]) continue;
+                if (!dense.read_state(vx, vpre)) { ferr = dense.last_error(); return false; }
+                const size_t HC = vx.size() / ((size_t) m * n_embd);
+                for (int t = 0; t < m; ++t)
+                    for (size_t h = 0; h < HC; ++h) {
+                        const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
+                        float * dst = vh.data() + (size_t) t * 3 * n_embd + (size_t) j * n_embd;
+                        for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                    }
+            }
+        }
+        vlog.resize((size_t) m * nv);
+        if (!dense.logits(0, m, vlog.data())) { ferr = dense.last_error(); return false; }
+        return true;
+    };
     const int NP = std::max(1, a.prefill_chunk);
     const int SB = std::max(1, S);                 // the dense sub-batch size
     std::vector<int> cids((size_t) NP * top_k);
@@ -548,8 +589,30 @@ int main(int argc, char ** argv) {
     // the deferred VRAM seed after a prompt: the prompt's buffers go back, the cache opens into the free space, and the
     // decode biases (route bias + file penalty) switch on.  Returns the free GiB measured (for the log).
     double seed_free = 0, seed_gib = 0, seed_s = 0;
+    // STRATA_DSPARK=<sidecar> (one-shot, greedy): DSpark speculative decoding - the checkpoint's mtp.0-2 draft stack
+    // (ds41_dspark) drafts STRATA_DSPARK_DEPTH (default 4, <= 5) tokens, one dense pass verifies them (pass_v).  The
+    // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
+    const char * dsp_path = a.serve ? nullptr : std::getenv("STRATA_DSPARK");
+#if defined(DS41_HAVE_DSPARK)
+    std::unique_ptr<Ds41DSpark> dsp;
+#endif
     auto open_cache = [&]() -> bool {
         dense.release_pass();
+#if defined(DS41_HAVE_DSPARK)
+        if (dsp_path && !dsp) {
+            Ds41DSparkConfig sc;
+            sc.backend = be;
+            sc.sidecar = dsp_path;
+            sc.main_gguf = a.model;
+            sc.max_append = 16;
+            if (!std::getenv("STRATA_DSPARK_OWN_HEAD")) sc.shared_head = dense.weight("output.weight");   // -0.7 GB
+            dsp = std::make_unique<Ds41DSpark>();
+            const double ti = now_ms();
+            if (!dsp->init(sc, err)) { err = "DSpark init: " + err; return false; }
+            std::fprintf(stderr, "\nDSpark: %s, %.2f GB of weights on the card (%.1f s)", dsp_path, dsp->weight_bytes() / 1e9,
+                         (now_ms() - ti) / 1000.0);
+        }
+#endif
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
         seed_free = fr / 1073741824.0;
@@ -916,7 +979,21 @@ int main(int argc, char ** argv) {
     const double tp0 = now_ms();
     std::vector<float> all;
     const int dm_tail = dump_main ? std::min<int>(128, (int) prompt.size() - 1) : 0;   // DSpark's window, as steps
-    const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail, 0, [&](int done) {
+    bool spec = dsp_path != nullptr;
+#if !defined(DS41_HAVE_DSPARK)
+    if (spec) { std::fprintf(stderr, "ds41_generate: STRATA_DSPARK: built without ds41_dspark\n"); return 2; }
+#endif
+    const int spec_depth = std::getenv("STRATA_DSPARK_DEPTH") ? std::atoi(std::getenv("STRATA_DSPARK_DEPTH")) : 4;
+    if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 1 || spec_depth > 5 || std::getenv("STRATA_FORCE_IDS"))) {
+        std::fprintf(stderr, "ds41_generate: STRATA_DSPARK needs the GPU layer-major prompt path (S >= 17), depth 1..5, and no "
+                             "STRATA_DUMP_MAIN / STRATA_FORCE_IDS\n");
+        return 2;
+    }
+    if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
+    // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
+    // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
+    const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
+    const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
@@ -926,8 +1003,36 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "ds41_generate: dump-main prompt step: %s\n", ferr.c_str());
             return 1;
         }
+#if defined(DS41_HAVE_DSPARK)
+    int sp_bonus = -1;   // the trunk's token for position L (argmax of the last prompt row) and DSpark's first drafts
+    int sp_ids[5] = {0}, sp_tmp[5];
+    float sp_conf[5];
+    if (spec) {
+        if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+        bias_now = false;   // the tail is PROMPT: it routes like the rest of the prompt (no decode biases), as plain decode
+        apply_bias();
+        std::vector<int> spos;
+        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
+            const int m = std::min<int>(16, (int) prompt.size() - i0);
+            if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: DSpark seed: %s\n", ferr.c_str()); return 1; }
+            spos.resize((size_t) m);
+            for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
+            const bool last = i0 + m == (int) prompt.size();
+            if (last) {
+                std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
+                sp_bonus = (int) (std::max_element(last_logits.begin(), last_logits.end()) - last_logits.begin());
+            }
+            if (!dsp->step(vh.data(), spos.data(), m, last ? sp_bonus : -1, last ? sp_ids : sp_tmp, sp_conf)) {
+                std::fprintf(stderr, "ds41_generate: DSpark seed step: %s\n", dsp->last_error().c_str());
+                return 1;
+            }
+        }
+        bias_now = true;    // decode: route bias + file penalty on (open_cache's state)
+        apply_bias();
+    }
+#endif
     const double prompt_ms = now_ms() - tp0;
-    if (defer_vram && dm_tail == 0) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
+    if (defer_vram && dm_tail == 0 && !spec) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      seed_free, seed_gib, (long long) tier.resident(), seed_s);
@@ -975,9 +1080,75 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "STRATA_FORCE_IDS: %zu forced tokens from %s\n", forced.size(), fp);
     }
-    for (; gen < a.n_predict; ++gen) {
+#if defined(DS41_HAVE_DSPARK)
+    // ---- DSpark: P = the last fed position, t = the trunk's token for P+1 (not fed yet), d = drafts for P+2..
+    // A pass verifies [t, d0..d(k-1)] at P+1..P+1+k; g_i = the argmax of row P+1+i (the trunk's token for P+2+i);
+    // a = #leading d_i == g_i; d0..d(a-1) + t' = g_a are emitted, DSpark appends the a+1 accepted rows and drafts
+    // after t'.  Every cache is position-indexed (rejected rows are overwritten when re-fed; the window ring is sized
+    // for it), except the ratio-2 compressor's 2-slot state ring: a pass writes its LAST 2 tokens' states, so after a
+    // rejection a pass that starts at an odd position re-feeds the last accepted token (its group's state then comes
+    // from inside the pass).
+    long sp_pass = 0, sp_acc = 0, sp_refeed = 0, sp_full = 0;
+    double sp_vms = 0, sp_dms = 0;
+    if (spec) {
+        int P = (int) prompt.size() - 1, t = sp_bonus, prev = prompt.back();
+        bool dirty = false;   // the last pass rejected something
+        std::vector<int> vt;
+        auto emit = [&](int tok) -> bool {   // false = stop here
+            std::printf("%d\n", tok);
+            std::fflush(stdout);
+            ++gen;
+            return !(std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos || gen >= a.n_predict);
+        };
+        while (emit(t)) {
+            const int k = std::min(spec_depth, a.n_predict - gen);   // drafts past the budget are never emitted
+            const bool refeed = dirty && ((P + 1) & 1);
+            vt.clear();
+            if (refeed) vt.push_back(prev);
+            vt.push_back(t);
+            for (int i = 0; i < k; ++i) vt.push_back(sp_ids[i]);
+            const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
+            const double tv = now_ms();
+            if (!pass_v(vt.data(), (int) vt.size(), p0)) { std::fprintf(stderr, "ds41_generate: verify: %s\n", ferr.c_str()); return 1; }
+            sp_vms += now_ms() - tv;
+            int g[6];
+            for (int i = 0; i <= k; ++i) {
+                const float * row = vlog.data() + (size_t) (r0 + i) * nv;
+                g[i] = (int) (std::max_element(row, row + nv) - row);
+            }
+            int acc = 0;
+            while (acc < k && sp_ids[acc] == g[acc]) ++acc;
+            ++sp_pass; sp_acc += acc; sp_refeed += refeed; sp_full += acc == k;
+            int spos[6];
+            for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
+            const int drafts[5] = { sp_ids[0], sp_ids[1], sp_ids[2], sp_ids[3], sp_ids[4] };
+            const double td = now_ms();
+            if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, g[acc], sp_ids, sp_conf)) {
+                std::fprintf(stderr, "ds41_generate: DSpark step: %s\n", dsp->last_error().c_str());
+                return 1;
+            }
+            sp_dms += now_ms() - td;
+            bool more = true;
+            for (int i = 0; i < acc && more; ++i) more = emit(drafts[i]);
+            if (!more) break;
+            prev = acc == 0 ? t : drafts[acc - 1];
+            dirty = acc < k;
+            P += 1 + acc;
+            t = g[acc];
+        }
+    }
+#endif
+    for (; !spec && gen < a.n_predict; ++gen) {
         int tok = sample_p(lg.data(), nv, a.temp, 0, 1.0f, 0.0f, rng);
-        if (gen < (int) forced.size()) tok = forced[(size_t) gen];
+        if (gen < (int) forced.size()) {
+            // STRATA_DEC_MARGIN=1 (gate tap, with STRATA_FORCE_IDS): per step the argmax, its logit and the forced
+            // token's logit - a forced stream that leaves the greedy path at a near-tie shows a tiny gap there
+            static const bool margin = std::getenv("STRATA_DEC_MARGIN") != nullptr;
+            if (margin && tok != forced[(size_t) gen])
+                std::fprintf(stderr, "margin: step %d argmax %d (%.4f) forced %d (%.4f) gap %.4f\n", gen, tok, lg[(size_t) tok],
+                             forced[(size_t) gen], lg[(size_t) forced[(size_t) gen]], lg[(size_t) tok] - lg[(size_t) forced[(size_t) gen]]);
+            tok = forced[(size_t) gen];
+        }
         std::printf("%d\n", tok);
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
@@ -995,6 +1166,11 @@ int main(int argc, char ** argv) {
                  100.0 * st.hits / std::max<int64_t>(1, st.lookups()), st.cpu_ms, st.file_ms,
                  (long long) st.spec_issued, (long long) st.spec_hits, (long long) st.prefetch_issued,
                  (long long) st.prefetch_dummy, (long long) st.prefetched_useful);
+    if (spec)
+        std::fprintf(stderr, "DSpark: %ld verify passes, %.3f accepted drafts/pass = %.3f tokens/pass, %.1f%% full, %ld re-fed; "
+                     "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),
+                     1.0 + (double) sp_acc / std::max(1L, sp_pass), 100.0 * sp_full / std::max(1L, sp_pass), sp_refeed,
+                     sp_vms / std::max(1L, sp_pass), sp_dms / std::max(1L, sp_pass), spec_depth);
     if (dump_main) std::fclose(dump_main);
     if (file_pred) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);

@@ -84,7 +84,7 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     const TensorInfo * te = main->find("token_embd.weight");
     if (!out || !te) { e = "the trunk GGUF lacks output.weight / token_embd.weight"; return false; }
     if (te->type != GGML_TYPE_F16) { e = "token_embd must be F16"; return false; }
-    src.push_back({ main.get(), out });
+    if (!cfg.shared_head) src.push_back({ main.get(), out });
     ggml_init_params ip = { (src.size() + 8) * ggml_tensor_overhead(), nullptr, true };
     wctx = ggml_init(ip);
     for (auto & s : src) {
@@ -103,6 +103,11 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         ggml_tensor * t = w[s.second->name];
         ggml_backend_tensor_set(t, m.shard(sh).tensor_data(*s.second), 0, ggml_nbytes(t));
         wbytes += ggml_nbytes(t);
+    }
+    if (cfg.shared_head) {
+        const ggml_tensor * h = cfg.shared_head;
+        if (h->ne[0] != (int64_t) out->shape[0] || h->ne[1] != (int64_t) out->shape[1]) { e = "shared_head: shape differs from output.weight"; return false; }
+        w["output.weight"] = cfg.shared_head;
     }
     size_t se = 0;
     main->find("token_embd.weight", &se);

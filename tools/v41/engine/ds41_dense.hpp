@@ -144,6 +144,8 @@ public:
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);
     /// The x state after begin (+ the Engram add of the layer `il`, when il is an Engram layer) - gate tap.
     const std::string & last_error() const;
+    /// A loaded weight on the backend (nullptr if absent) - for sharing the trunk head with the DSpark draft stack.
+    ggml_tensor * weight(const std::string & name) const;
 
 private:
     std::unique_ptr<Impl> p_;

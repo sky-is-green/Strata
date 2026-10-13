@@ -29,6 +29,9 @@ struct Ds41DSparkConfig {
     int noise_id = 128799;              ///< config dspark_noise_token_id
     int block = 5;                      ///< config dspark_block_size
     int max_append = 8;                 ///< main_hidden rows one draft call may append to the window (k <= this)
+    /// The trunk's output.weight already on `backend` (Ds41Dense::weight): shared instead of a second copy (-0.7 GB).
+    /// Any type (a requantized dense head only moves acceptance - drafts are verified).  nullptr = load from main_gguf.
+    ggml_tensor * shared_head = nullptr;
 };
 
 class Ds41DSpark {
