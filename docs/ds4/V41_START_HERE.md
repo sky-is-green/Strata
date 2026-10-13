@@ -94,6 +94,31 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 9b (2026-10-13 ~23:30) - DSpark BEATS PLAIN on every clean prompt: 31.7-39.5 tok/s (1.32-1.53x)
+- **Recommended DSpark config:** `STRATA_DSPARK=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.Q2_K.gguf`
+  `STRATA_DSPARK_DEPTH=4` - D3 is now the DEFAULT verify tier (`STRATA_TIER_BATCH=0` = old per-token path) and the
+  1-slot verify prefetch is the default (`STRATA_D3_PF=n`, 0 = off).
+- **4-prompt benchmark** (`~/AI/v41-dev/bench4/`: prompts prose/python/docs/code `.i32`, `bench4.sh`, `runs.py`,
+  `summarize.py`), bias ON, -n 256, tok/s:
+  | prompt | plain | DSpark D3 MXFP4 | + Q2_K sidecar | + 1-slot prefetch (final) | verify ms | final vs plain |
+  |---|---|---|---|---|---|---|
+  | docs | 29.85 | 35.73 | 39.00 | **39.51** | 91.2 | 1.32x |
+  | python | 20.63 | 27.32 | 31.27 | **31.66** | 128.2 | 1.53x |
+  | code | 26.72 | 22.00* | 35.47 | **35.63** | 101.4 | 1.33x |
+  | prose | 25.83 | 14.89 | - | 19.13 | 141.1 | 0.74x (BOTH LOOP, see below) |
+  *different text (residency-dependent routing).  Q2_K sidecar = +2.76 GB of expert slots -> ~+3 pt VRAM hits ->
+  verify -12..-17 ms; its acceptance cost is ~0 here (harness: -0.047).
+- **Depth sweep** (final config): docs depth 3/4/5 = 38.27/39.51/34.19 tok/s, python 30.42/31.66/30.61 -> keep 4.
+- **PCIe is the wall** (nsys, `STRATA_PROFILE_DECODE=1` + `nsys --capture-range=cudaProfilerApi`): ~100 expert DMAs
+  (9.6 MB avg, 23 GB/s) per verify pass = 1.4 s of a 4.2 s decode; kernels are cheap.  So: fewer misses (VRAM for
+  slots, LRU) beats cleverness; speculative prefetch only pays at 1 slot (precision 40%; 6 slots = -20 ms).
+- **QUALITY FLAG for Mal - the decode route bias causes repetition loops:** prose prompt, plain greedy: bias ON
+  loops ("in livres de fio, in livres de fio, ..." rep8 0.62), bias OFF clean to EOS (rep8 0.00); code prompt earlier:
+  plain bias ON rep8 0.54 vs OFF 0.00.  2/2 prompts.  (Known trade: --route-bias 1.0 = ~4x decode, ppl 2.38 -> 2.67.)
+  DSpark inherits it (its draft predicts the unbiased model, so looping text also lowers acceptance).
+- **Benchmark discipline:** bias-on text depends on VRAM residency (even nsys's 30 MB shifts it): never judge a change
+  by one prompt's tok/s; compare verify ms/pass on the SAME text (tokens/pass identical) and drop rep8 > 0.3 runs.
+
 ### Session 9 (2026-10-13 night) - D3 WORKS, correct, and faster than per-token; still opt-in (`STRATA_TIER_BATCH=1`)
 - **Crash fixed (6da95756):** `acquire()` grew `im.ftmp` mid-batch (slot index > top_k in a multi-token pass) ->
   every earlier job's blob pointer dangled -> SIGSEGV in the pool.  `reserve_ftmp()` sizes it first (also in `gpu_run_n`).

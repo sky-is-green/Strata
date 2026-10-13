@@ -542,7 +542,9 @@ int main(int argc, char ** argv) {
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
     long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
-        static const bool no_tier_batch = std::getenv("STRATA_TIER_BATCH") == nullptr;   // D3 OPT-IN: default = per-token
+        // D3 (the batched per-class verify tier) is the default: correct (bias-off verify-vs-prefill gate, near-ties
+        // only) and faster (verify 167.6 -> ~100 ms/pass).  STRATA_TIER_BATCH=0 = the per-token run_to_dev path.
+        static const bool no_tier_batch = [] { const char* v = std::getenv("STRATA_TIER_BATCH"); return v && v[0] == '0'; }();
         double tq = now_ms();
         auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
         ++pv_n; pv_tok += m;
