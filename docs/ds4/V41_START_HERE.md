@@ -138,11 +138,12 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
      tier path** (union of the pass's experts, each expert's weights read once for all its tokens - `native_expert_grouped`
      already takes `ent_tok`; the prefill `run_chunk_dev` groups by expert but streams whole layers): that is what
      decides 50 tok/s.  Union of 5 tokens' experts also raises misses: keep route bias on (it pulls the union into VRAM).
-- **Kernel fusion worker `v41-zoo-fusion`** (flash, packet `~/.quetza-data/conductor/packets/v41-zoo-fusion-task.md`,
-  report `~/.quetza-data/conductor/reports/v41-zoo-fusion.md`, done file `.done-v41-zoo-fusion`): IN FLIGHT at handoff.
-  Its uncommitted WIP: `tools/v41/engine/ds41_dense.cpp` (STRATA_DSV41_HC_MIX path), `v41_engine.cmake` (HC_MIX
-  option), `tools/v41/ggml/dsv41-fuse.patch` applied in third_party, `build-ds4-gpu` configured with HC_MIX=ON.
-  Verify its report/gates (forced-token 0-diff, test_ds41_hcmix, nsys node counts, A/B) before committing its files.
+- **Kernel fusion slice DONE + committed `86724531`** (worker closed): fused HC-mix op `GGML_OP_DSV41_HC_MIXES`
+  (`tools/v41/ggml/dsv41-fuse.patch`, APPLIED in the local third_party tree; opt-in `-DSTRATA_DSV41_HC_MIX=ON`, which
+  `build-ds4-gpu` is configured with).  Bit-exact (test_ds41_hcmix, forced tokens 0-diff, logits md5 equal); -546
+  kernels/token (-14.9% of the dense graph), ~0.5 ms/token - timed A/B within noise (26.42/25.89 vs 25.91).  Next-best
+  fusions it listed: router tail softplus/sqrt/+bias (~0.3 ms), the shared expert's clamps block ggml's
+  MUL_MAT+MUL_MAT+GLU fusion, F16 window ring to drop the f32->f16 cpy.  Prefill md5 with the op: not re-checked.
 - **Dense requant (forced A/B, 1 run each): q8 26.64 / q5_K 27.73 / q4_K 29.75 tok/s** (attn_router 17.11 / 14.87 /
   13.52).  q4_K quality vs a same-arena q8 control: code ppl +1.7% (KL 0.026 vs floor 0.0095), agent KL 0.48 vs floor
   0.25.  NOT adopted - Mal: quality benchmark first (§6 item 3).
