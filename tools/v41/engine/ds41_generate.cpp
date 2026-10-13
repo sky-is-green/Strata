@@ -994,7 +994,7 @@ int main(int argc, char ** argv) {
     if (spec) { std::fprintf(stderr, "ds41_generate: STRATA_DSPARK: built without ds41_dspark\n"); return 2; }
 #endif
     const int spec_depth = std::getenv("STRATA_DSPARK_DEPTH") ? std::atoi(std::getenv("STRATA_DSPARK_DEPTH")) : 4;
-    if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 1 || spec_depth > 5 || std::getenv("STRATA_FORCE_IDS"))) {
+    if (spec && (!defer_vram || S < 17 || dump_main || spec_depth < 0 || spec_depth > 5 || std::getenv("STRATA_FORCE_IDS"))) {
         std::fprintf(stderr, "ds41_generate: STRATA_DSPARK needs the GPU layer-major prompt path (S >= 17), depth 1..5, and no "
                              "STRATA_DUMP_MAIN / STRATA_FORCE_IDS\n");
         return 2;
@@ -1099,6 +1099,7 @@ int main(int argc, char ** argv) {
     // rejection a pass that starts at an odd position re-feeds the last accepted token (its group's state then comes
     // from inside the pass).
     long sp_pass = 0, sp_acc = 0, sp_refeed = 0, sp_full = 0;
+    const bool sp_noacc = std::getenv("STRATA_DSPARK_NOACC") != nullptr;
     double sp_vms = 0, sp_dms = 0;
     if (spec) {
         int P = (int) prompt.size() - 1, t = sp_bonus, prev = prompt.back();
@@ -1128,6 +1129,7 @@ int main(int argc, char ** argv) {
             }
             int acc = 0;
             while (acc < k && sp_ids[acc] == g[acc]) ++acc;
+            if (sp_noacc) acc = 0;   // bisect tap: every draft rejected (the stream must stay plain greedy)
             ++sp_pass; sp_acc += acc; sp_refeed += refeed; sp_full += acc == k;
             int spos[6];
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;

@@ -126,6 +126,21 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 - **On-load expert requant**: `STRATA_DSPARK_EXP_TYPE=<ggml type name>` (q4_K / q3_K / q2_K / iq4_xs ...; no imatrix
   types) in `ds41_dspark.cpp` load(): MXFP4 -> f32 -> type, all CPU threads, no files.  Works in test_ds41_dspark and
   ds41_generate.  `pass_v split` line (dense / tier / taps / logits ms per pass) printed with the DSpark stats.
+- **D2 CORRECTNESS BUG (open, top priority)**: bias-off DSpark stream vs plain: the verify pass is WRONG at some
+  tokens - arbitrated by an independent full-path prefill (`~/AI/v41-dev/d2/arb.logits`, prompt + DSpark stream,
+  `--dump-logits`): prefill == plain at all 5 disputed steps (8, 13, 127, 195, 198); DSpark's token is ~1 logit worse at
+  8/13/195/198 and **18 logits worse at 127** (position 383).  Ruled out: window ring (gathered by position, RAW+16),
+  ratio-2 state ring (re-feed covers it - re-check if bisect says "rejections"), candidate blocks (per-pass recompute),
+  Engram history (position-indexed, rewritable), tier h_x race (run_to_dev ends with `sum sync`).
+  **Bisect queued at handoff** (`~/AI/v41-dev/d2/bis_d0.*`, `bis_noacc.*`, compare vs `plain_nb.tok`):
+  `STRATA_DSPARK_DEPTH=0` (single-token pass_v passes; diverges -> pass_v machinery / read_state / logits rows) and
+  `STRATA_DSPARK_NOACC=1` (every draft rejected; diverges while d0 matches -> rejected-position residue in some
+  state).  Next suspects if d0 matches: multi-token pass shape (begin/attn_router/finish with m>1 after a decode -
+  serve's pass_m is the same code, so it may share the bug; compare one pass_m vs m steps' logits), pass_cap /
+  nvis per ratio, indexer selection over rows written by rejected tokens, the ratio-2 spare row.
+- Profiling runs (bias ON, depth 4) at handoff: `~/AI/v41-dev/d2/prof_mx.log` (MXFP4) / `prof_q3.log`
+  (`STRATA_DSPARK_EXP_TYPE=q3_K`): read the `pass_v split` line (dense / tier / taps / logits ms per pass - async GPU,
+  so the dense/tier split is approximate, the total is exact) + VRAM hits + tokens/pass.
 - Mal's bar: DSpark is worth it at **35-40 tok/s** (needs verify <= ~100-115 ms/pass at ~4 tokens/pass).
 - **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
 
