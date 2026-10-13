@@ -2198,7 +2198,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     };
     // admission filter (cache_sim: admit-all 61.6% hit at 144 swaps/token; "second miss within 4 tokens" 63.0% at
     // 24.6): an expert takes a slot only if it also missed in one of the layer's previous kLruWin calls
-    constexpr int64_t kLruWin = 4;
+    static const int64_t kLruWin = std::getenv("STRATA_LRU_WIN") ? std::atoll(std::getenv("STRATA_LRU_WIN")) : 4;   // admission window (calls)
     int64_t lc = 0;
     auto admit_ok = [&](int32_t e) {
         const int64_t m = im.vmiss[(size_t) (layer * NXL + e)];
@@ -2930,7 +2930,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // (DS41_PROF_X: sum+sync 1.44 -> 1.67 ms/call over 256 tokens). ----
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;
     const int64_t NXL = im.g.n_experts;
-    constexpr int64_t kLruWin = 4;
+    static const int64_t kLruWin = std::getenv("STRATA_LRU_WIN") ? std::atoll(std::getenv("STRATA_LRU_WIN")) : 4;   // admission window (calls)
     int64_t lc = 0;
     int32_t lru_new[kMaxEnt], lru_old[kMaxEnt], lru_dem[kMaxEnt];
     int n_lru = 0;

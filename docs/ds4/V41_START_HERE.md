@@ -127,6 +127,8 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   4.55 tokens/pass at s=0.5).  For Mal: speed-first = s=1 + DSpark (31.7-39.5 tok/s, 72% top-1); quality-first =
   s=0.25-0.5 (82-85% top-1, 10-20 tok/s).  Raising the hit rate at low s (more VRAM for experts, smarter admission)
   is the lever that moves this whole frontier.
+- LRU admission window `STRATA_LRU_WIN` (default 4 calls; now env-tunable in gpu_run + D3): plain s=0.5 sweep 1/2/4/8/16 ->
+  flat (docs 17.8-19.2, python 11.2-11.6 tok/s, hits unchanged) - not the lever.
 
 ### NEXT DESIGN ITEM (not started - needs Mal's go): DSpark in `--serve` (the speedup is one-shot only today)
 Why it matters: the Quetza wrappers talk to `ds41_generate --serve` (`tools/v41/serve/ds41-engine.sh`, binary
