@@ -108,6 +108,8 @@ def main():
     ap.add_argument("gen_txt")
     ap.add_argument("--threads", type=int, default=16)
     ap.add_argument("--max", type=int, default=0, help="score at most N decode steps")
+    ap.add_argument("--dump-drafts", default=None, metavar="FILE",
+                    help="one line per scored step: 'j pos d0..d4 c0..c4' (compare with test_ds41_dspark --dump)")
     ap.add_argument("--teacher", default=None, metavar="WORKDIR",
                     help="main_hidden from the FP8 teacher instead: v41_calib.py prep-ids/init/layer work dir "
                          "(h/L37-39.bin = the streams ENTERING the target layers, tokens.npy); the records cover the "
@@ -121,6 +123,7 @@ def main():
                          "whose module parameter is bf16 (model.py's wo_a).  Off by 1/scale (~512..2050x on the DSpark "
                          "blocks) -> the old 0.35-0.44 numbers.  Default = dequantize (correct).")
     a = ap.parse_args()
+    dump = open(a.dump_drafts, "w") if a.dump_drafts else None
     t1am = np.load(a.teacher_top1)[0] if a.teacher_top1 else None   # t1am[p] = teacher's argmax for token p+1
     torch.set_num_threads(a.threads)
     torch.set_default_dtype(torch.bfloat16)
@@ -213,6 +216,9 @@ def main():
             while k < len(truth) and draft[k] == truth[k]:
                 k += 1
             acc_len.append(k)
+            if dump:
+                cc = conf[0].float().tolist()
+                dump.write(f"{j} {pos} " + " ".join(str(int(d)) for d in draft) + " " + " ".join(f"{x:.4f}" for x in cc) + "\n")
             if t1am is not None and pos + 1 < len(t1am):   # the token at pos+2, as the teacher would pick it given ours up to pos+1
                 tt1 = int(t1am[pos + 1])
                 t1_rows.append((draft[0] == tt1, truth[0] == tt1, draft[0] == truth[0]))
