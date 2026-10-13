@@ -19,7 +19,7 @@ Q3_K = 2.25 bpw; dense Q8_0) on **one RTX 4090 24 GB + Ryzen 7 5700X + 90 GB DDR
 | Decode p256 x 256, forced tokens (identical work) | **26.4-27.5 tok/s = 37.5 ms/token** (28-29.5 on luckier token paths) |
 | Quality | 4096-tok code ppl 2.3790 exact routing; decode biases (defaults) cost code 2.38 -> 2.87 |
 | Head gate vs FP8 teacher (held-out) | ppl 5.645 vs 4.915, top-1 0.674 vs 0.701 |
-| DSpark (offline harness, FIXED 2026-10-13) | **2.58 accepted drafts/pass = 3.58 tokens/pass on teacher states** (96 steps; first draft 77%, confidence head calibrated 12/40/78/99%). Old 0.4 was a HARNESS weight-loading bug (`wo_a` FP8 block scale dropped). On OUR engine states: not yet measured with the fix |
+| DSpark (offline harness, fixed) | **OUR engine states: 3.27 accepted drafts/pass = 4.27 tokens/pass** (378 steps; 43% full 5-blocks; first draft 88.6%; confidence calibrated 23/61/91/99%); teacher states 3.24 / 4.24 - our 2-bit drift costs nothing. By verify depth 1..5: 1.89 / 2.65 / 3.29 / 3.83 / 4.27 tokens/pass |
 | Our hidden states vs teacher at layers 37-39 (exact routing, 639 tokens) | cosine **0.876-0.879** (large drift) |
 | Vision / DSpark in the engine | **NOT implemented** (weights exported in the sidecar only) |
 
@@ -62,7 +62,8 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   was dropped (~1000x too large).  Fixed in `tools/v41/dspark_accept.py` (default on; `--no-fp8-dequant` = old).
   Teacher states, 96 steps: **2.58 accepted (3.58 tokens/pass)**, accepted-length dist 0:23% 1:18% 2:10% 3:8% 4:8%
   5:32%, first draft 77% (78% vs teacher top-1).  The engine/GGUF never had the bug (our export dequantizes wo_a).
-  **First thing next session (CPU, ~15 min each, never beside an engine run):**
+  **DONE 2026-10-13 afternoon: ours 3.27 accepted (4.27 tokens/pass) = teacher 3.24 -> no retraining; go to engine
+  draft+verify.**  (Logs `~/AI/v41-dev/dspark/fixed_ours.log`, `fixed_teacher.log`; how they were run:)
   `python3 tools/v41/dspark_accept.py ~/AI/v41-dev/dspark/main_exact.bin ~/AI/v41-dev/dspark/gen_exact.txt
   --teacher-top1 /media/Crucial1TB/v41-teacher/stats/head_argmax_L40.npy` (OUR states - the number that sizes the
   engine work; our 37-39 states have cosine 0.876 to the teacher's) and the same with `--teacher
@@ -92,16 +93,22 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   the Engram placeholders `model-0004{7,8}-of-00048.safetensors.NEED-TO-DOWNLOAD-ENGRAM.txt`.
 
 ## 6. Work queue (Mal's order; ONE flash worker at a time)
-1. **DSpark on OUR states** (the two runs in §5, CPU).  If ours is close to the teacher's 2.58 -> go straight to item 4
-   (engine draft+verify), no retraining.  Only if ours << teacher: retrain `main_proj` (15360->5120) on our states.
+1. **DSpark on OUR states: DONE - 4.27 tokens/pass, no retraining.**  => item 4 (engine draft+verify) is the top
+   priority after the in-flight fusion slice.  50 tok/s needs a verify pass <= ~85 ms at depth 5 (or <= ~53 ms at depth 2).
 2. **Kernel fusion of the elementwise zoo** (packet ready: `~/.quetza-data/conductor/packets/v41-zoo-fusion-task.md`):
    ~3,300 tiny kernels/token = 5.45 ms; bit-exact fused ops (forced-token 0-diff is the gate); expect -1.5..-3 ms (+4-8%).
+2b. **ggml upstream fixes** (after fusion; it owns the ggml tree): our vendored ggml predates llama.cpp #30103 (race in
+   `flash_attn_ext_f16` tile combine: `fattn-mma-f16.cuh:1747` `if (np > 1)` -> `if (np > 1 || nbatch_combine != DKQ/2)`;
+   our prompt attention is D=512) and #29953 (MMQ out-of-bounds reads, `mmq.cu:129` fallback).  Ship as
+   `tools/v41/ggml/upstream-fixes.patch`; gate = forced decode 0-diff + does the 8K prefill `--dump-last` md5 become
+   reproducible across runs with different free VRAM (the FA race may be the real cause of today's md5 drift).
 3. **Quality benchmark baseline** (Mal: decide every lossy change against it): (a) DwarfStar's official V4.1 fixtures
    `~/AI/ds4-ref/gguf-tools/quality-testing/deepseek-v4.1-flash-20260919-router/` (112 prompts with official API
    continuations + top-20 logprobs; teacher-forced NLL / API top-1 agreement / top-20 recall; comparable to DwarfStar's
    Q2 = 90.1% top-1) - score exact routing AND the default decode biases (`--bias-prompt` decode-routing proxy);
    (b) Mal's agentic harness bench `~/AI/quetza-workspace/model-gauntlet/harness-bench/` (real QuetzaCodetl runs,
-   hidden-graded Scheme/JSON tasks; add a `strata-ds41` backend).  Note: the decode route bias (code ppl 2.38 -> 2.87)
+   hidden-graded Scheme/JSON tasks; add a `strata-ds41` backend); (c) speed side: Strata 0.1.43's
+   `tools/strata_bench.py` suite (short chat, 4K/16K prompts, five-turn agent session) against our server (port 8150).  Note: the decode route bias (code ppl 2.38 -> 2.87)
    is a bigger quality lever than any dense quant - benchmark the configs Mal would actually choose between.
 4. **DSpark engine draft + verify** (after 1): DSpark stack as a ggml graph (resident dense, experts resident/tiered),
    main_hidden in-graph, verify pass of 1+k tokens (dense `pass_m` + tier `run_multi`), KV rollback, depth adaptive by
