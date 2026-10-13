@@ -94,6 +94,49 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 9d (2026-10-14 03:00-06:05) - SMART route bias measured; --arena-adapt FIXED (exact routing +26-60%)
+**Read this block first.**  Code: `43cf3354` (smart bias), arena fix (commit below this block's date).
+- **Smart route bias** (opt-in env, `tools/v41/engine/ds41_dense.cpp` router, `build_attn`): `STRATA_RB_PROTECT=P` keeps
+  the model's exact top-P experts (+1e4) so the bias only competes for slots P+1..6; `STRATA_RB_MARGIN=d` applies the
+  bias only to experts whose exact score is within d of the 6th/7th cutoff (confident picks kept).  Weights stay
+  unbiased.  Unset = the old graph bit for bit.  Correctness: PROTECT=6 with the full bias, forced on bias-off reference
+  tokens (`STRATA_DEC_MARGIN=1`) -> ZERO argmax disagreements (free-running runs diverge at token ~13 = plain decode's
+  known run-to-run near-tie noise, not a bug).
+  | config (default bias 1.0/0.6 otherwise) | short-fixture API top-1 (102 cases) | plain decode tok/s docs / python / prose |
+  |---|---|---|
+  | exact (no bias) | 86.21% | 5.48 / 3.51 (96 tok) |
+  | PROTECT=3 | 84.56% (NLL 0.557) | 10.56 / 6.57 / 4.32 (prose: no loop) |
+  | PROTECT=2 | 83.14% (NLL 0.607) | not measured |
+  | flat bias x0.25 | 85.18% | 12.63 / 7.39 |
+  | flat bias x1.0 (default) | 72.13% | 29.85 / 20.63 / 25.83 (prose loops) |
+  Reading: PROTECT=3 keeps quality but the top-3 picks are the heavy I/O, so speed falls to ~bias-x0.25 level -
+  **flat x0.25 dominates PROTECT=3 on both axes**.  MARGIN=0.1 / 0.3 NOT yet measured (next: 34-case subset
+  `~/AI/v41-dev/quality/short34.jsonl`, ~7 min each, + 128-token speed on docs/python).
+- **`--arena-adapt` FIXED** (Mal's idea: the RAM arena tracks what is used - an NVMe-read expert replaces the layer's
+  least-recently-used arena expert).  It was BROKEN (garbage output, BOS spam) for two reasons, both in
+  `tools/v41/engine/ds41_moe.cpp` gpu_run's file-tier block:
+  1. **slot overrun:** arena slots are packed at each seeded expert's own blob size and DS4's 9 format classes differ
+     in size; the victim search ignored size -> a larger blob read into a smaller slot overran into the next slot.
+     Fix: a victim's slot capacity `off[s+1]-off[s]` must be >= the incoming blob.
+  2. **race:** the decode path skips its per-layer stream sync, so a vram_lru demotion (D2H into an arena slot) from
+     an earlier call could land AFTER the CPU threads read a file blob into the same slot.  Fix: sync gp.s (+ s_dc)
+     before the direct reads.  (1 bad swap in 2200 before this fix.)
+  Tools: `DS41_CHECK_ARENA=1` verifies every swap (the new expert AND the next slot's owner) against the file.
+  Verified after fix 1: forced-token margin check vs exact routing = ZERO disagreements (routing unchanged by design).
+  **After fix 2: `DS41_CHECK_ARENA=1` -> 3600 swaps checked, 0 bad** (python, exact routing, 128 tok; log
+  `~/AI/v41-dev/smartbias/fix2_chk.log`).  Fix 2 adds a stream sync only when arena-adapt reads - re-measure speed.
+  | exact routing (full quality) | fixed arena | `--arena-adapt` | NVMe reads |
+  |---|---|---|---|
+  | docs (96 tok) | 5.48 tok/s | **6.90** (+26%) | 4642 -> 2294 |
+  | python (96 tok) | 3.51 tok/s | **5.61** (+60%) | 8116 -> 2908 |
+  With the default bias it is neutral (docs 28.0, python 22.4 tok/s at 128 tok) - the bias already avoids NVMe.
+  NOT yet: arena-adapt in D3 (DSpark verify: FILEG path is used instead), default-on decision, bias-x0.25 + arena-adapt.
+- **Published 2026-10-14:** GitHub README (`131a0e3f`: DSpark results, quality baseline, bias cost).  Hugging Face
+  `IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored`: `V41-MTP-Vision.Q2_K.gguf` uploading (pid was 1548863, log
+  `/tmp/claude-1000/-home-mal/a3dd5f0a-*/scratchpad/hf_q2k_upload.log`); the updated model card is staged at
+  `.../scratchpad/hfcard/README.md` and auto-uploads when the file lands (watcher) - VERIFY on the Hub.
+- Mal's standing rule: keep tests small (34-case subset, 128 tokens) unless deciding.
+
 ### Session 9c (2026-10-14 ~01:15) - QUALITY BASELINE (item 3a) DONE: the decode route bias costs ~14 pt API top-1
 - Tools: `tools/v41/quality/build_cases.py` (DwarfStar's 112 official V4.1 fixtures, `--out ~/AI/v41-dev/quality`) +
   `score_official.py run|score` (one `--serve` process, `STRATA_SERVE_DUMP_TAIL` rows).  Results dirs

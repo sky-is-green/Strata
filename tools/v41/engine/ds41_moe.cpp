@@ -2356,12 +2356,26 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         if (!fi.empty()) {
             if (im.ftmp.size() < (size_t) nk * (size_t) im.blob) im.ftmp.resize((size_t) nk * (size_t) im.blob);
             if (direct && gp.s_pf) ck(cudaStreamSynchronize(gp.s_pf), "pf sync");   // no prefetch DMA reads a victim
+            // ... and no async copy from an EARLIER call touches a victim slot: the decode path skips its per-layer sync
+            // (layer_synced), so a vram_lru demotion (D2H into an arena slot) or a PCIe DMA (reading one) can still be in
+            // flight - and the reads below write arena memory from CPU threads, outside stream order.  Found by
+            // DS41_CHECK_ARENA: 1 bad swap in 2200 (the demoted expert's late D2H landing on the new one).
+            if (direct) {
+                ck(cudaStreamSynchronize(gp.s), "arena-adapt sync");
+                if (gp.s_dc) ck(cudaStreamSynchronize(gp.s_dc), "arena-adapt dc sync");
+            }
             for (size_t q = 0; q < fi.size(); ++q) {
                 fdst[q] = im.ftmp.data() + (size_t) fi[q] * (size_t) im.blob;
                 if (!direct) continue;
                 int64_t victim = -1, best = INT64_MAX;
+                // The victim's SLOT must hold the incoming blob: arena slots are packed at each seeded expert's own blob
+                // size, and DS4's 9 format classes differ in size - without this a larger blob read into a smaller slot
+                // ran over into the next slot and corrupted that expert (garbage output under --arena-adapt).
+                const uint64_t need = (uint64_t) BLX(ids6[cpu_keep[fi[q]]]);
                 for (int64_t v = 0; v < NX; ++v) {
-                    if (gp.arena.slot_of[(size_t) (layer * NX + v)] < 0) continue;
+                    const int32_t vs = gp.arena.slot_of[(size_t) (layer * NX + v)];
+                    if (vs < 0) continue;
+                    if (gp.arena.off[(size_t) vs + 1] - gp.arena.off[(size_t) vs] < need) continue;
                     const int64_t u = im.last_use[(size_t) (layer * NX + v)];
                     if (u >= im.tick) continue;   // routed now, or already this call's victim
                     bool taken = false;
@@ -2446,6 +2460,30 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             gp.arena.slot_of[(size_t) (layer * NX + fvic[q])] = -1;
             gp.arena.slot_of[(size_t) (layer * NX + e)] = slot;
             ++im.st.arena_swaps;
+            // DS41_CHECK_ARENA=1: the swapped-in expert's arena bytes AND the next slot's owner (what an overrun would
+            // corrupt) against the file, byte for byte
+            static const bool check_arena = std::getenv("DS41_CHECK_ARENA") != nullptr;
+            if (check_arena) {
+                static int64_t n_chk = 0, n_bad = 0;
+                std::vector<uint8_t> ref((size_t) im.blob);
+                im.blobs->read(layer, e, ref.data());
+                bool ok = std::memcmp((const uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot], ref.data(), (size_t) BLX(e)) == 0;
+                const int64_t total = (int64_t) gp.arena.slot_of.size();
+                for (int64_t k = 0; k < total; ++k) {
+                    if (gp.arena.slot_of[(size_t) k] != slot + 1) continue;
+                    const int64_t nl = k / NX, ne = k % NX;
+                    im.blobs->read(nl, ne, ref.data());
+                    const bool okn = std::memcmp((const uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot + 1], ref.data(),
+                                                 (size_t) im.bl[(size_t) im.g.cls(nl, ne)]) == 0;
+                    if (!okn) std::fprintf(stderr, "[arena-chk] L%lld e%d -> slot %d: NEIGHBOUR L%lld e%lld CORRUPT\n", (long long) layer, e, slot,
+                                           (long long) nl, (long long) ne);
+                    ok = ok && okn;
+                    break;
+                }
+                ++n_chk; n_bad += !ok;
+                if (!ok) std::fprintf(stderr, "[arena-chk] L%lld e%d slot %d BAD\n", (long long) layer, e, slot);
+                if (n_chk % 200 == 0) std::fprintf(stderr, "[arena-chk] %lld swaps checked, %lld bad\n", (long long) n_chk, (long long) n_bad);
+            }
         }
     }
 
