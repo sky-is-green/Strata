@@ -120,6 +120,13 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   per type via test_ds41_dspark; report `~/.quetza-data/conductor/reports/v41-dspark-shrink.md`, results
   `tools/v41/DSPARK_SHRINK.md`, files `/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.<type>.gguf` (40 GB free).
   Its requant tool needs ~12+ GB RAM: told to run RAM-heavy jobs under the GPU lock (it starved an engine run once).
+- **Bias-off gate (both arms `--route-bias 0 --route-bias-file 0`)**: plain 4.06 tok/s (57.9% hits - no bias = slow,
+  irrelevant for correctness), DSpark 3.49 tokens/pass, first divergence token 8 -> margin check
+  (`~/AI/v41-dev/d2/margin_nb.log`, plain forced on the DSpark stream + STRATA_DEC_MARGIN) decides near-tie vs bug.
+- **On-load expert requant**: `STRATA_DSPARK_EXP_TYPE=<ggml type name>` (q4_K / q3_K / q2_K / iq4_xs ...; no imatrix
+  types) in `ds41_dspark.cpp` load(): MXFP4 -> f32 -> type, all CPU threads, no files.  Works in test_ds41_dspark and
+  ds41_generate.  `pass_v split` line (dense / tier / taps / logits ms per pass) printed with the DSpark stats.
+- Mal's bar: DSpark is worth it at **35-40 tok/s** (needs verify <= ~100-115 ms/pass at ~4 tokens/pass).
 - **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
 
 ## 5b. Session 6 (2026-10-13 afternoon/evening) - READ THIS, it supersedes §5 where they differ

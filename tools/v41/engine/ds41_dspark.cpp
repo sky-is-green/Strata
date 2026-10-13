@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <thread>
 
 using namespace strata;
 using namespace strata::v41;
@@ -85,12 +86,28 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     if (!out || !te) { e = "the trunk GGUF lacks output.weight / token_embd.weight"; return false; }
     if (te->type != GGML_TYPE_F16) { e = "token_embd must be F16"; return false; }
     if (!cfg.shared_head) src.push_back({ main.get(), out });
+    // STRATA_DSPARK_EXP_TYPE=<ggml type name> (q4_K, q3_K, q2_K, iq4_xs, ...): the routed experts
+    // (mtp.*.ffn.experts.w1/w2/w3, MXFP4 in the sidecar) are requantized ON LOAD (dequantize -> quantize, CPU threads).
+    // A drafter's precision only moves acceptance - every draft is verified by the trunk.
+    ggml_type xt = GGML_TYPE_COUNT;
+    if (const char * x = std::getenv("STRATA_DSPARK_EXP_TYPE")) {
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const char * nm = ggml_type_name((ggml_type) i);
+            if (nm && std::strcmp(nm, x) == 0) xt = (ggml_type) i;
+        }
+        if (xt == GGML_TYPE_COUNT) { e = std::string("STRATA_DSPARK_EXP_TYPE: unknown type ") + x; return false; }
+        if (ggml_quantize_requires_imatrix(xt)) { e = std::string("STRATA_DSPARK_EXP_TYPE ") + x + " needs an imatrix"; return false; }
+        ggml_quantize_init(xt);
+    }
+    auto is_exp = [](const std::string & n) { return n.find(".ffn.experts.") != std::string::npos; };
     ggml_init_params ip = { (src.size() + 8) * ggml_tensor_overhead(), nullptr, true };
     wctx = ggml_init(ip);
     for (auto & s : src) {
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < s.second->shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) s.second->shape[d];
-        ggml_tensor * t = ggml_new_tensor(wctx, (ggml_type) s.second->type, (int) s.second->shape.size(), ne);
+        const ggml_type ty = (xt != GGML_TYPE_COUNT && is_exp(s.second->name)) ? xt : (ggml_type) s.second->type;
+        if (ty != (ggml_type) s.second->type && ne[0] % ggml_blck_size(ty)) { e = s.second->name + ": row not a multiple of the block"; return false; }
+        ggml_tensor * t = ggml_new_tensor(wctx, ty, (int) s.second->shape.size(), ne);
         ggml_set_name(t, s.second->name.c_str());
         w[s.second->name] = t;
     }
@@ -101,7 +118,33 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         size_t sh = 0;
         m.find(s.second->name, &sh);
         ggml_tensor * t = w[s.second->name];
-        ggml_backend_tensor_set(t, m.shard(sh).tensor_data(*s.second), 0, ggml_nbytes(t));
+        const void * data = m.shard(sh).tensor_data(*s.second);
+        if (t->type == (ggml_type) s.second->type) {
+            ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
+        } else {   // dequantize + requantize in row chunks over the CPU threads
+            const ggml_type st = (ggml_type) s.second->type;
+            const auto * tr = ggml_get_type_traits(st);
+            if (!tr->to_float) { e = s.second->name + ": no dequantizer for " + ggml_type_name(st); return false; }
+            const int64_t n0 = t->ne[0], rows = ggml_nrows(t);
+            const size_t srow = ggml_row_size(st, n0), drow = ggml_row_size(t->type, n0);
+            std::vector<uint8_t> out((size_t) rows * drow);
+            const int nth = std::max(1u, std::thread::hardware_concurrency());
+            const int64_t per = (rows + nth - 1) / nth;
+            std::vector<std::thread> th;
+            for (int i = 0; i < nth; ++i)
+                th.emplace_back([&, i]() {
+                    const int64_t r0 = i * per, r1 = std::min(rows, r0 + per);
+                    std::vector<float> f((size_t) 256 * n0);
+                    for (int64_t r = r0; r < r1; r += 256) {
+                        const int64_t nr = std::min<int64_t>(256, r1 - r);
+                        for (int64_t k = 0; k < nr; ++k)
+                            tr->to_float((const uint8_t *) data + (size_t) (r + k) * srow, f.data() + (size_t) k * n0, n0);
+                        ggml_quantize_chunk(t->type, f.data(), out.data() + (size_t) r * drow, 0, nr, n0, nullptr);
+                    }
+                });
+            for (auto & x : th) x.join();
+            ggml_backend_tensor_set(t, out.data(), 0, out.size());
+        }
         wbytes += ggml_nbytes(t);
     }
     if (cfg.shared_head) {

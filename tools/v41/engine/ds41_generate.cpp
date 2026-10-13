@@ -537,7 +537,12 @@ int main(int argc, char ** argv) {
     // entering the DSpark target layer 37 + j) for pass token t (the STRATA_DUMP_MAIN math, token-major read_state);
     // vlog = the pass's m rows of logits.
     std::vector<float> vh, vlog, vx, vpre;
+    double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
+    long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
+        double tq = now_ms();
+        auto lap = [&](int i) { const double t = now_ms(); pv_ms[i] += t - tq; tq = t; };
+        ++pv_n; pv_tok += m;
         mids.resize((size_t) m * top_k);
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
@@ -545,6 +550,7 @@ int main(int argc, char ** argv) {
         for (int l = 0; l < n_layer; ++l) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
+            lap(0);
             for (int t = 0; t < m; ++t) {
                 const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                         fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
@@ -553,7 +559,9 @@ int main(int argc, char ** argv) {
                 if (!ok) { ferr = "tier.run failed"; return false; }
                 if (!rdev1) std::copy(routed1.begin(), routed1.end(), crouted_m.begin() + (size_t) t * n_embd);
             }
+            lap(1);
             if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            lap(0);
             for (int j = 0; j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
                 if (!dense.read_state(vx, vpre)) { ferr = dense.last_error(); return false; }
@@ -564,10 +572,12 @@ int main(int argc, char ** argv) {
                         float * dst = vh.data() + (size_t) t * 3 * n_embd + (size_t) j * n_embd;
                         for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
                     }
+                lap(2);
             }
         }
         vlog.resize((size_t) m * nv);
         if (!dense.logits(0, m, vlog.data())) { ferr = dense.last_error(); return false; }
+        lap(3);
         return true;
     };
     const int NP = std::max(1, a.prefill_chunk);
@@ -1171,6 +1181,10 @@ int main(int argc, char ** argv) {
                      "verify %.1f ms/pass, draft %.2f ms/pass (depth %d)\n", sp_pass, (double) sp_acc / std::max(1L, sp_pass),
                      1.0 + (double) sp_acc / std::max(1L, sp_pass), 100.0 * sp_full / std::max(1L, sp_pass), sp_refeed,
                      sp_vms / std::max(1L, sp_pass), sp_dms / std::max(1L, sp_pass), spec_depth);
+    if (spec)
+        std::fprintf(stderr, "pass_v split (all %ld passes, %.2f tokens each): dense %.1f ms, tier %.1f ms, taps %.1f ms, "
+                     "logits %.1f ms per pass\n", pv_n, (double) pv_tok / std::max(1L, pv_n), pv_ms[0] / std::max(1L, pv_n),
+                     pv_ms[1] / std::max(1L, pv_n), pv_ms[2] / std::max(1L, pv_n), pv_ms[3] / std::max(1L, pv_n));
     if (dump_main) std::fclose(dump_main);
     if (file_pred) {
         std::fprintf(stderr, "file-pred: %lld file-tier routes", fp_miss[0]);
