@@ -94,6 +94,24 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### NEXT DESIGN ITEM (not started - needs Mal's go): DSpark in `--serve` (the speedup is one-shot only today)
+Why it matters: the Quetza wrappers talk to `ds41_generate --serve` (`tools/v41/serve/ds41-engine.sh`, binary
+`build-ds4-gpu`), so tonight's 1.3-1.5x is not reachable from Quetza yet.  Blocker: serve samples at **temperature 1.0,
+top_p 0.95** (`strata-ds41.json`) and the verify loop is greedy.  Plan:
+1. **Speculative sampling** (Leviathan/Chen): accept draft d_i with prob min(1, p(d_i)/q(d_i)); on reject sample from
+   norm(max(0, p - q)); all-accepted -> sample the bonus from p.  p = the trunk's row AFTER temperature/top_p/min_p
+   (the exact distribution serve samples today), q = DSpark's draft distribution at the same position - needs
+   `Ds41DSpark::step` to expose its draft probabilities (it already computes full-vocab logits through the shared head;
+   keep q after the same temperature).  Greedy (temp 0) stays the current exact-match rule.  Output distribution is then
+   identical to plain sampling (provably), so no quality question - only speed.
+2. **Serve state**: DSpark's window needs main_hidden for the last <= 128 positions; after a request's prompt (batch or
+   passes) re-seed with pass_v over min(128, L-1) tail tokens (rewrites those positions identically - every cache is
+   position-indexed); prefix reuse / snapshot-restore just re-seed.  DSpark weights stay resident (5.14 GB Q2_K) -
+   check the long-prompt layer-major path still fits its 3 GB chunk budget (else release DSpark VRAM around batches).
+3. Opt-in `STRATA_SERVE_DSPARK=<sidecar>`; the default serve path untouched; gate = (a) temp 0 serve == one-shot
+   tokens, (b) temp 1 token-frequency stats vs plain serve over many seeds (distribution test), (c) tok/s on the
+   bench4 prompts through the HTTP server.
+
 ### Session 9b (2026-10-13 ~23:30) - DSpark BEATS PLAIN on every clean prompt: 31.7-39.5 tok/s (1.32-1.53x)
 - **Recommended DSpark config:** `STRATA_DSPARK=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.Q2_K.gguf`
   `STRATA_DSPARK_DEPTH=4` - D3 is now the DEFAULT verify tier (`STRATA_TIER_BATCH=0` = old per-token path) and the
