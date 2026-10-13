@@ -513,6 +513,15 @@ const uint8_t* acquire(Ds41MoeImpl& im, int64_t layer, int64_t expert, int scrat
     return dst;
 }
 
+/// Sizes `ftmp` for `n` file-tier slots BEFORE a batch's first acquire().  acquire() grows `ftmp` on demand, and a
+/// grow reallocates - so in a batch whose slot index passes top_k (a multi-token pass: up to kMaxEnt distinct
+/// CPU misses) every earlier job's `blob` pointer into `ftmp` dangled, and the pool then read freed memory (the D3
+/// SIGSEGV in ggml_vec_dot_q3_K_q8_K).  Call it with the batch's CPU-miss count; acquire() then never grows.
+void reserve_ftmp(Ds41MoeImpl& im, int n) {
+    const size_t need = (size_t) std::max<int64_t>(im.g.top_k, n) * (size_t) im.blob;
+    if (im.ftmp.size() < need) im.ftmp.resize(need);
+}
+
 // ================================ prompt-prefill expert staging ================================
 //
 // The measured prompt (4096 tokens, chunk 2048) spends 52.9 s of its 85 s waiting on its own file-tier reads:
@@ -2699,6 +2708,7 @@ bool gpu_run_n(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const
 
     // ---- the pool on the CPU misses, while the card works: one job per distinct expert, one row per token ----
     int nj = 0;
+    { int nc = 0; for (int u = 0; u < nu; ++u) nc += cls[u] == CPU; reserve_ftmp(im, nc); }
     if ((int) im.jobs.size() < nu) im.jobs.resize((size_t) nu);
     for (int u = 0; u < nu; ++u) {
         if (cls[u] != CPU) continue;
@@ -2885,6 +2895,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     launch_site(PCIE);
     // ---- the pool on the CPU misses: one job per distinct expert, its class's fmt + per-(token,class) quant ----
     int nj = 0;
+    { int nc = 0; for (int u = 0; u < nu; ++u) nc += cls[u] == CPU; reserve_ftmp(im, nc); }
     if ((int) im.jobs.size() < nu) im.jobs.resize((size_t) nu);
     std::vector<char> act_done(im.nact_multi_act.size() * (size_t) kMaxTok, 0);
     for (int u = 0; u < nu; ++u) {

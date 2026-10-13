@@ -1135,6 +1135,17 @@ int main(int argc, char ** argv) {
             const double tv = now_ms();
             if (!pass_v(vt.data(), (int) vt.size(), p0)) { std::fprintf(stderr, "ds41_generate: verify: %s\n", ferr.c_str()); return 1; }
             sp_vms += now_ms() - tv;
+            // STRATA_DSPARK_DUMP=<file> (correctness tap): every verify row as {pos, m, row, refeed, nv floats} - row
+            // `pos` predicts the token at pos+1, so it lines up with row `pos` of a --dump-logits prefill of the stream
+            static FILE * sp_dump = std::getenv("STRATA_DSPARK_DUMP") ? std::fopen(std::getenv("STRATA_DSPARK_DUMP"), "wb") : nullptr;
+            if (sp_dump) {
+                for (int i = 0; i < (int) vt.size(); ++i) {
+                    const int32_t hdr[4] = { p0 + i, (int32_t) vt.size(), i, refeed ? 1 : 0 };
+                    std::fwrite(hdr, 4, 4, sp_dump);
+                    std::fwrite(vlog.data() + (size_t) i * nv, 4, (size_t) nv, sp_dump);
+                }
+                std::fflush(sp_dump);
+            }
             int g[6];
             for (int i = 0; i <= k; ++i) {
                 const float * row = vlog.data() + (size_t) (r0 + i) * nv;
