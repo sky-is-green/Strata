@@ -132,12 +132,17 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   8/13/195/198 and **18 logits worse at 127** (position 383).  Ruled out: window ring (gathered by position, RAW+16),
   ratio-2 state ring (re-feed covers it - re-check if bisect says "rejections"), candidate blocks (per-pass recompute),
   Engram history (position-indexed, rewritable), tier h_x race (run_to_dev ends with `sum sync`).
-  **Bisect queued at handoff** (`~/AI/v41-dev/d2/bis_d0.*`, `bis_noacc.*`, compare vs `plain_nb.tok`):
-  `STRATA_DSPARK_DEPTH=0` (single-token pass_v passes; diverges -> pass_v machinery / read_state / logits rows) and
-  `STRATA_DSPARK_NOACC=1` (every draft rejected; diverges while d0 matches -> rejected-position residue in some
-  state).  Next suspects if d0 matches: multi-token pass shape (begin/attn_router/finish with m>1 after a decode -
-  serve's pass_m is the same code, so it may share the bug; compare one pass_m vs m steps' logits), pass_cap /
-  nvis per ratio, indexer selection over rows written by rejected tokens, the ratio-2 spare row.
+  **BISECT DONE (2026-10-13 ~18:45, `~/AI/v41-dev/d2/queue.out` + `bis_d0.tok`/`bis_noacc.tok`)**: both arms diverge
+  from `plain_nb.tok` -> **`bis_d0` first divergence token 8** (`STRATA_DSPARK_DEPTH=0`, single-token pass_v passes,
+  0.000 accepted/pass) and **`bis_noacc` token 11** (`STRATA_DSPARK_NOACC=1`, every draft rejected).  Both-arms-diverge
+  => the bug is in **`pass_v` core with m=1** (read_state / logits rows / begin/attn_router/finish), NOT drafting,
+  rollback, or rejected-position residue.  Next: diff `pass_v` (m=1) vs the plain `feed` step for one token - the
+  first mismatch is the bug; the token-8 case is a near-tie (plain argmax 588 vs 769, logit gap 0.11), so also confirm
+  whether plain's own run-to-run non-determinism (#30103) is in play vs a real pass_v math error.
+  Ruled out earlier: window ring, ratio-2 state ring, candidate blocks, Engram history, tier h_x race.
+- Profiling arm `prof_iq3` (bias ON, depth 4, `STRATA_DSPARK_EXP_TYPE=iq3_xxs`) DONE but **timings unreliable** - it
+  ran while `strata-dense` was doing a CPU-heavy CUDA build: 3.312 tokens/pass, verify 212.5 ms/pass, 93.3% VRAM hits,
+  on-load IQ3_XXS requant alone took 735 s.  Re-run on an idle box before trusting the numbers.
 - Profiling runs (bias ON, depth 4) DONE (`~/AI/v41-dev/d2/prof_mx.log` MXFP4 / `prof_q3.log`
   `STRATA_DSPARK_EXP_TYPE=q3_K`).  `pass_v split` (async GPU - the total is exact, the dense/tier split approximate):
   | run  | tok/s | tokens/pass | verify ms/pass | VRAM hits | dense / tier ms per pass |
@@ -161,11 +166,10 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   ~130 ms for ~5 tokens (~25 ms/token, worse than plain's ~16 because pass_v has no prefetch).  D3 projection: a
   batched tier at ~2x one token's (~35 ms) -> verify ~70 ms -> ~45-50 tok/s at 3.5 tokens/pass; ~100 ms -> ~35.
   So DSpark clears Mal's 35-40 bar IF D3 lands.  TODO: split the seed passes out of the pass_v stats.
-- **Phase-2 queue ARMED: `tools/v41/d2_queue.sh`** (bis_d0, bis_noacc, compare vs `plain_nb.tok`, then
-  `prof_iq3` at `STRATA_DSPARK_EXP_TYPE=iq3_xxs`) - replaces the old `d2_bisect.sh`.  Auto-triggered by
-  `tools/v41/d2_queue_whenfree.sh` (armed detached, pid in `~/AI/v41-dev/d2/whenfree.pid`), which fires after
-  300 s of continuous GPU idle; logs `~/AI/v41-dev/d2/whenfree.log`, results in `~/AI/v41-dev/d2/{bis_d0,bis_noacc,prof_iq3}.*`.
-  Cancel: `touch ~/AI/v41-dev/d2/queue.CANCEL` (or kill the pid in `whenfree.pid`).  Run manually: `bash tools/v41/d2_queue.sh`.
+- **Phase-2 queue RAN (2026-10-13 ~18:33-19:00, `tools/v41/d2_queue.sh`)**: bis_d0, bis_noacc, compare vs
+  `plain_nb.tok`, and `prof_iq3` all completed (exit 0); see the BISECT DONE bullet above for verdicts.  Runner
+  `tools/v41/d2_queue_whenfree.sh` (idle-trigger) works but DISARM it before starting it by hand to avoid two runners:
+  `touch ~/AI/v41-dev/d2/queue.CANCEL` cancels between arms; results in `~/AI/v41-dev/d2/{bis_d0,bis_noacc,prof_iq3}.*`.
 - Mal's bar: DSpark is worth it at **35-40 tok/s** (needs verify <= ~100-115 ms/pass at ~4 tokens/pass).
 - **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
 
