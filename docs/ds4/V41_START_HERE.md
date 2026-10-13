@@ -138,9 +138,18 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   state).  Next suspects if d0 matches: multi-token pass shape (begin/attn_router/finish with m>1 after a decode -
   serve's pass_m is the same code, so it may share the bug; compare one pass_m vs m steps' logits), pass_cap /
   nvis per ratio, indexer selection over rows written by rejected tokens, the ratio-2 spare row.
-- Profiling runs (bias ON, depth 4) at handoff: `~/AI/v41-dev/d2/prof_mx.log` (MXFP4) / `prof_q3.log`
-  (`STRATA_DSPARK_EXP_TYPE=q3_K`): read the `pass_v split` line (dense / tier / taps / logits ms per pass - async GPU,
-  so the dense/tier split is approximate, the total is exact) + VRAM hits + tokens/pass.
+- Profiling runs (bias ON, depth 4) DONE (`~/AI/v41-dev/d2/prof_mx.log` MXFP4 / `prof_q3.log`
+  `STRATA_DSPARK_EXP_TYPE=q3_K`).  `pass_v split` (async GPU - the total is exact, the dense/tier split approximate):
+  | run  | tok/s | tokens/pass | verify ms/pass | VRAM hits | dense / tier ms per pass |
+  |------|-------|-------------|----------------|-----------|--------------------------|
+  | MXFP4 | 20.50 | 3.556 | 168.6 | 91.1% | 39.6 / 414.9 |
+  | q3_K  | 18.74 | 2.865 | 148.5 | 93.0% | 38.3 / 357.0 |
+  **Tier ~10x dense -> the expert tier IS the verify cost; D3 batching it is THE lever.**  Per token the tier
+  costs ~47 (mx) / ~52 (q3) ms vs plain's 36.5 ms -> v1 is ~30% slower than plain; D3 must drop a depth-4 pass
+  under ~100 ms to clear 35-40 tok/s.
+  **WATCH (single-run, trajectory-dependent): q3_K's engine acceptance 1.865/pass << MXFP4's 2.556, but
+  test_ds41_dspark said Q3_K ~= MXFP4 (3.246 vs 3.280).**  Need repeats to split format effect from trajectory;
+  profile with `IQ3_XXS` (the chosen format) next, not q3_K.
 - **DSpark shrink DONE (worker v41-dspark-shrink, `tools/v41/DSPARK_SHRINK.md`)**, test_ds41_dspark 378 steps, accepted/pass:
   MXFP4 3.280 (8.61 GB on card) | Q3_K 3.246 (7.23 GB) | **Q2_K 3.233 (5.85 GB, -2.76 GB)** | **IQ3_XXS 3.280 (6.59 GB,
   identical acceptance)**.  Use `STRATA_DSPARK_EXP_TYPE=iq3_xxs` (or q2_K for max VRAM) - on-load env path == file path
