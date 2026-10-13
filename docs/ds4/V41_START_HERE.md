@@ -161,7 +161,11 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   ~130 ms for ~5 tokens (~25 ms/token, worse than plain's ~16 because pass_v has no prefetch).  D3 projection: a
   batched tier at ~2x one token's (~35 ms) -> verify ~70 ms -> ~45-50 tok/s at 3.5 tokens/pass; ~100 ms -> ~35.
   So DSpark clears Mal's 35-40 bar IF D3 lands.  TODO: split the seed passes out of the pass_v stats.
-- Bisect runs restarted at handoff via `nohup bash tools/v41/d2_bisect.sh` -> `~/AI/v41-dev/d2/bisect.out`.
+- **Phase-2 queue ARMED: `tools/v41/d2_queue.sh`** (bis_d0, bis_noacc, compare vs `plain_nb.tok`, then
+  `prof_iq3` at `STRATA_DSPARK_EXP_TYPE=iq3_xxs`) - replaces the old `d2_bisect.sh`.  Auto-triggered by
+  `tools/v41/d2_queue_whenfree.sh` (armed detached, pid in `~/AI/v41-dev/d2/whenfree.pid`), which fires after
+  300 s of continuous GPU idle; logs `~/AI/v41-dev/d2/whenfree.log`, results in `~/AI/v41-dev/d2/{bis_d0,bis_noacc,prof_iq3}.*`.
+  Cancel: `touch ~/AI/v41-dev/d2/queue.CANCEL` (or kill the pid in `whenfree.pid`).  Run manually: `bash tools/v41/d2_queue.sh`.
 - Mal's bar: DSpark is worth it at **35-40 tok/s** (needs verify <= ~100-115 ms/pass at ~4 tokens/pass).
 - **Do NOT wrap memguard.sh in flock**: memguard takes `ds4-gpu.lock` itself -> self-deadlock.
 
