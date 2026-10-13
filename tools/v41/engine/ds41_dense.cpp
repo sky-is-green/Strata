@@ -645,7 +645,43 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     ggml_tensor * sc = ggml_sqrt(gc, ggml_softplus(gc, rl));                                  // [NE, n]
     // selection = score + exp_probs_b + the selection-only rbias (soft prune / cache bonus); the weights below come
     // from the unbiased scores, as model.py's Gate - all-zero rbias (the default) = the model's routing bit for bit
-    ggml_tensor * sel = ggml_add(gc, ggml_add(gc, sc, im.BL(il, "exp_probs_b.bias")), ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1));
+    ggml_tensor * s0 = ggml_add(gc, sc, im.BL(il, "exp_probs_b.bias"));                        // the model's own selection score
+    ggml_tensor * rb = ggml_reshape_2d(gc, im.ly[(size_t) il].rbias, im.NE, 1);
+    ggml_tensor * sel = nullptr;
+    // SMART route bias (opt-in; the flat bias changes ~every choice it can: -14 pt API top-1, repetition loops):
+    //   STRATA_RB_PROTECT=P  the exact top-P experts are always kept (+1e4); the bias only competes for the other slots
+    //   STRATA_RB_MARGIN=d   the bias only applies to experts whose exact score is within d of the cutoff (midpoint of the
+    //                        exact NU-th / NU+1-th scores); experts confidently above it (> cut + d) are always kept -
+    //                        only near-ties can flip
+    // Both may be set.  Weights still come from the unbiased scores.  Unset = the flat bias, bit for bit as before.
+    static const int rb_protect = std::getenv("STRATA_RB_PROTECT") ? std::atoi(std::getenv("STRATA_RB_PROTECT")) : 0;
+    static const float rb_margin = std::getenv("STRATA_RB_MARGIN") ? (float) std::atof(std::getenv("STRATA_RB_MARGIN")) : -1.0f;
+    if (rb_protect > 0 || rb_margin >= 0.0f) {
+        const int kt = (int) im.NU + 1;
+        ggml_tensor * ti = ggml_argsort_top_k(gc, s0, kt);                                         // [kt, n]
+        ggml_tensor * tv = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, s0, 1, im.NE, n), ti), kt, n);   // [kt, n] desc
+        auto row = [&](int r) { return ggml_view_2d(gc, tv, 1, n, tv->nb[1], (size_t) r * tv->nb[0]); };   // [1, n]
+        ggml_tensor * like = ggml_new_tensor_2d(gc, GGML_TYPE_F32, im.NE, n);
+        ggml_tensor * protect = nullptr;
+        if (rb_protect > 0) {   // s0 >= the P-th largest exact score
+            ggml_tensor * vp = ggml_repeat(gc, ggml_cont(gc, row(std::min(rb_protect, (int) im.NU) - 1)), like);
+            protect = ggml_step(gc, ggml_scale_bias(gc, ggml_sub(gc, s0, vp), 1.0f, 1e-6f));
+        }
+        ggml_tensor * gate = nullptr;
+        if (rb_margin >= 0.0f) {
+            ggml_tensor * cut = ggml_repeat(gc, ggml_scale(gc, ggml_add(gc, ggml_cont(gc, row((int) im.NU - 1)), ggml_cont(gc, row((int) im.NU))), 0.5f), like);
+            ggml_tensor * dv = ggml_sub(gc, s0, cut);                                              // [NE, n]
+            ggml_tensor * above = ggml_step(gc, ggml_scale_bias(gc, dv, 1.0f, -rb_margin));          // dv > d
+            ggml_tensor * below = ggml_step(gc, ggml_scale_bias(gc, dv, -1.0f, -rb_margin));         // dv < -d
+            protect = protect ? ggml_clamp(gc, ggml_add(gc, protect, above), 0.0f, 1.0f) : above;
+            gate = ggml_scale_bias(gc, ggml_clamp(gc, ggml_add(gc, above, below), 0.0f, 1.0f), -1.0f, 1.0f);   // in the band
+        }
+        ggml_tensor * unprot = ggml_scale_bias(gc, protect, -1.0f, 1.0f);
+        if (gate) unprot = ggml_mul(gc, unprot, gate);
+        sel = ggml_add(gc, ggml_add(gc, s0, ggml_mul(gc, ggml_repeat(gc, rb, like), unprot)), ggml_scale(gc, protect, 1e4f));
+    } else {
+        sel = ggml_add(gc, s0, rb);
+    }
     ggml_tensor * ids = ggml_argsort_top_k(gc, sel, (int) im.NU);   // [NU, n]
     ggml_tensor * wts = ggml_reshape_2d(gc, ggml_get_rows(gc, ggml_reshape_3d(gc, sc, 1, im.NE, n), ids), im.NU, n);
     if (G.norm_topk) wts = ggml_div(gc, wts, ggml_scale_bias(gc, ggml_sum_rows(gc, wts), 1.0f, 1e-20f));
