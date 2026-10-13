@@ -554,9 +554,10 @@ int main(int argc, char ** argv) {
             lap(0);
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
-                // once), not m run_to_dev calls.  Split at 4 = ds41_moe's kMaxTok (m = 1 + k <= 5 at depth 4).
-                for (int off = 0; off < m; off += 4) {
-                    const int chunk = std::min(4, m - off);
+                // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
+                constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                for (int off = 0; off < m; off += kMM) {
+                    const int chunk = std::min(kMM, m - off);
                     if (!tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
                                                fn + (size_t) off * n_embd, rdev1 + (size_t) off * n_embd)) {
                         ferr = "tier.run_multi_to_dev failed"; return false;

@@ -357,6 +357,10 @@ struct Ds41MoeImpl;
 /// holds one and calls `run` 43 times per token.
 class Ds41MoeTier {
 public:
+    /// The most tokens one run_multi / run_multi_to_dev call takes (a depth-4 verify pass is 5-6 tokens: ONE call
+    /// per layer at 8, two at 4).  The pool's per-job cap (cpu::MAXT) is 8 too.
+    static constexpr int kMaxMulti = 8;
+
     Ds41MoeTier();
     ~Ds41MoeTier();
     Ds41MoeTier(const Ds41MoeTier&) = delete;
