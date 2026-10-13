@@ -95,6 +95,100 @@ __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq,
     return d2 * d8 * sumi;
 }
 
+// PTQ1_0 (Scion type 143, the fork's vec_dot_ptq1_0_q8_1_multi in ggml-cuda/vecdotq.cuh, MIT): 128 ternary
+// values per block with one fp16 scale; one call consumes the whole block, i.e. the four q8_1 blocks at
+// bq8_1[iqs..iqs+4) of the pass base.  The packed bytes are multiplied by 3 stage by stage with the per-lane
+// truncation mod 256 (the & 0x00FF00FF after each multiply), then the high byte of each 16-bit lane minus one
+// is one trit in {-1, 0, 1} -- exactly the reference's `(uint8_t)(byte * 3^n) * 3 >> 8 - 1`.  Written over the
+// shared __byte_perm/__vsub4/__dp4a shims (dp4a.hpp, hip_compat), so one source serves CUDA and HIP.
+template <int ncols_dst>
+__device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void* __restrict__ vbq,
+                                                          const block_q8_1* __restrict__ bq8_1, const int& kbx,
+                                                          const int& iqs, const uint32_t stride_col_y,
+                                                          float* result) {
+    const block_ptq1_0* bq = (const block_ptq1_0*) vbq + kbx;
+    int sumi[ncols_dst][4] = {};
+
+    // Widen four bytes to 16-bit lanes so multiply-by-three cannot carry between bytes.
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+        uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int e = t * 16 + 4 * g;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs + 16, g);
+        uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+        uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+
+            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int e = 80 + t * 8 + 4 * g;
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + (e >> 5)].qs, (e & 31) >> 2);
+                sumi[j][e >> 5] = ggml_cuda_dp4a(q, u, sumi[j][e >> 5]);
+            }
+        }
+    }
+
+    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v * 3;
+        v = w0 & 0x00FF00FF;
+        const uint32_t w1 = v * 3;
+        v = w1 & 0x00FF00FF;
+
+        const int q = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
+            sumi[j][3] = ggml_cuda_dp4a(q, u, sumi[j][3]);
+        }
+    }
+
+    const float d = __half2float(bq->d);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) sumi[j][k];
+        result[j] = d * acc;
+    }
+}
+
+__device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                     const int& kbx, const int& iqs) {
+    float result;
+    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
+    return result;
+}
+
 __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                       const int& kbx, const int& iqs) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
@@ -621,6 +715,9 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+// PTQ1_0: one call per 128-value block (the dot consumes all four q8_1 blocks of the pass base)
+template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 1, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_ptq1_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -641,17 +738,17 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(143)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(143)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(143)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(143)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(143)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -1033,6 +1130,71 @@ template<> struct Split<40> {   // NVFP4: vec_dot_nvfp4_q8_1's two 16-value sub-
             sum += r.sc[i] * __low2float(bq8->ds) * (float) sumi;
         }
         return sum;
+    }
+};
+
+// PTQ1_0: the load decodes the whole 128-value block into 32 words of four trits each (element order), the
+// apply runs the same dp4a chains against the same activation bytes and the same float scale order as
+// vec_dot_ptq1_0_q8_1_multi<1>: the integer sums are exact, so a column is bitwise equal to the per-entry kernel.
+template<> inline constexpr bool kSplit<143> = true;
+template<> struct Split<143> {   // PTQ1_0
+    struct W { int q[32]; float dw; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        (void) iqs;   // the whole block decodes in one load
+        const block_ptq1_0* bq = (const block_ptq1_0*) vbq + kbx;
+        W r;
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            const uint32_t packed = get_int_b4(bq->qs, g);
+            uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+            uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w_lo = v_lo * 3;
+                const uint32_t w_hi = v_hi * 3;
+                v_lo = w_lo & 0x00FF00FF;
+                v_hi = w_hi & 0x00FF00FF;
+                r.q[t * 4 + g] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const uint32_t packed = get_int_b4(bq->qs + 16, g);
+            uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+            uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+            for (int t = 0; t < 5; ++t) {
+                const uint32_t w_lo = v_lo * 3;
+                const uint32_t w_hi = v_hi * 3;
+                v_lo = w_lo & 0x00FF00FF;
+                v_hi = w_hi & 0x00FF00FF;
+                r.q[20 + t * 2 + g] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            }
+        }
+        uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#pragma unroll
+        for (int t = 0; t < 4; t += 2) {
+            const uint32_t w0 = v * 3;
+            v = w0 & 0x00FF00FF;
+            const uint32_t w1 = v * 3;
+            v = w1 & 0x00FF00FF;
+            r.q[30 + t / 2] = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+        }
+        r.dw = __half2float(bq->d);
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                sumi[k] = ggml_cuda_dp4a(r.q[8 * k + j], get_int_b4(bq8_1[iqs + k].qs, j), sumi[k]);
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+        return r.dw * acc;
     }
 };
 
@@ -1866,6 +2028,28 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
     }
 }
+template<typename dst_t>
+__device__ void dq_ptq1_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    // one "superblock" = 256 values = 2 blocks of 128; thread tid writes 8 values of one block.
+    // The base-3 layout of element e: qs[e % 16] * 3^(e / 16) for e < 80, qs[16 + (e-80) % 8] * 3^((e-80)/8)
+    // for 80 <= e < 120, qh[(e-120) % 2] * 3^((e-120)/2) beyond; the uint8 truncation and the *3 >> 8 are the
+    // fork's dequantize_row_ptq1_0, value for value (the same decode the CPU kernel uses).
+    const block_ptq1_0* x = (const block_ptq1_0*) vx + ibs * 2;
+    const int b = tid / 16, part = tid % 16;
+    dst_t* y = yy + b * 128 + part * 8;
+    const float d = __half2float(x[b].d);
+    const uint8_t* qs = x[b].qs;
+    const uint8_t* qh = x[b].qh;
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int e = part * 8 + j;
+        const int n = e < 80 ? e / 16 : (e < 120 ? (e - 80) / 8 : (e - 120) / 2);
+        const uint8_t byte = e < 80 ? qs[e % 16] : (e < 120 ? qs[16 + (e - 80) % 8] : qh[(e - 120) % 2]);
+        const uint8_t v = (uint8_t) (byte * pow3[n]);
+        y[j] = cvt<dst_t>(d * (float) (((int) v * 3 >> 8) - 1));
+    }
+}
 
 // llama.cpp's dequantize_q4_K / dequantize_q5_K (dequantize.cuh; q5_K's 64 threads folded onto 32) and the 32-value
 // blocks of Q5_1 / Q8_0, 8 of them per 256-value "superblock" (thread tid writes 8 values of block tid % 8).
@@ -2041,6 +2225,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
+        case 143: dq_ptq1_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
 #ifdef STRATA_Q6K_EXPERTS
@@ -2094,9 +2279,9 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
-           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40;
+           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 143;
 #else
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 143;
 #endif
 }
 // values per block of the types the grouped expert kernels take (0 = none)
@@ -2890,6 +3075,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 143: return (size_t) (n / 128) * sizeof(block_ptq1_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);

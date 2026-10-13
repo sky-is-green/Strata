@@ -125,6 +125,51 @@ inline void dequantize_q5_1(const uint8_t* block, float* out) {
         out[j + 16] = (float)x1 * d + m;
     }
 }
+
+// ---- Q3X32: 32 elements from a 14-byte block. Nonuniform 8-level codebook
+// (index = 3-bit code) with one fp16 scale per block; x = level[c] * s.
+// Scion PLE tables, see scion/docs/PLE-TABLE-TYPES.md.
+inline void dequantize_q3x32(const uint8_t* block, float* out) {
+    static const float levels[8] = {
+        -5.17308617f, -3.14964318f, -1.84705281f, -0.830217063f,
+         0.371574461f, 1.65762842f, 3.0041852f, 5.05979347f,
+    };
+    const float d = fp16_to_fp32(read_u16(block));
+    const uint8_t* qs = block + 2;
+    const uint8_t* qh = block + 10;
+    for (int j = 0; j < 32; ++j) {
+        const int c = ((qs[j / 4] >> ((j % 4) * 2)) & 3) | (((qh[j / 8] >> (j % 8)) & 1) << 2);
+        out[j] = levels[c] * d;
+    }
+}
+
+// ---- Q2X32: 32 elements from a 10-byte block. Mid-rise 2-bit codes,
+// x = (2c-3)*s with s = fp16(amax/3).
+inline void dequantize_q2x32(const uint8_t* block, float* out) {
+    const float d = fp16_to_fp32(read_u16(block));
+    const uint8_t* qs = block + 2;
+    for (int j = 0; j < 32; ++j) {
+        const int c = (qs[j / 4] >> ((j % 4) * 2)) & 3;
+        out[j] = (float)(2 * c - 3) * d;
+    }
+}
+
+// ---- Q4X160: one 160-element row from an 82-byte block: fp16 scale + 80
+// bytes of 4-bit codebook indices (byte j = element j low, element j+80 high).
+inline void dequantize_q4x160(const uint8_t* block, float* out) {
+    static const float levels[16] = {
+        -0.830319583f, -0.56551832f, -0.395098478f, -0.278073937f,
+        -0.207071558f, -0.134492248f, -0.105560891f, -0.0803469718f,
+        8.09813901e-06f, 0.0911125243f, 0.129564166f, 0.206828877f,
+        0.278073341f, 0.395026445f, 0.564443111f, 0.827598035f,
+    };
+    const float d = fp16_to_fp32(read_u16(block));
+    const uint8_t* qs = block + 2;
+    for (int j = 0; j < 80; ++j) {
+        out[j]      = levels[qs[j] & 0x0F] * d;
+        out[j + 80] = levels[qs[j] >>   4] * d;
+    }
+}
 // ---- IQ4_NL: 32 elements from an 18-byte block. Non-linear 4-bit codebook, NOT a linear grid, so
 // the table must be exact. Copied verbatim from ggml-common.h `kvalues_iq4nl` at 3cf03257:
 //     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113

@@ -1664,11 +1664,13 @@ __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__
     q[i] = qf[t * 24 * 512 + h * 512 + d];
 }
 __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __restrict__ qf, uint16_t* __restrict__ o16,
-                                 int64_t T, int64_t ld16) {
+                                 float* __restrict__ o32, int64_t T, int64_t ld16) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * 24 * 256) return;
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-    o16[t * ld16 + h * 256 + d] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
+    const float g = a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d])));
+    if (o32 != nullptr) o32[i] = g;   // the correction branches read the f32 post-gate value
+    o16[t * ld16 + h * 256 + d] = hf(g);
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -2216,8 +2218,9 @@ void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
 }
-void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16) {
-    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,
+void gate_attn(const float* attn, const float* q_full, uint16_t* out16, float* out32, int64_t T, void* stream,
+               int64_t ld16) {
+    gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, out32, T,
                                                                                 ld16 > 0 ? ld16 : 24 * 256);
     check("gate_attn");
 }

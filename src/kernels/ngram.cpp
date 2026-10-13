@@ -162,6 +162,8 @@ void dequant_blocks(const uint8_t* row, float /*scale*/, float* out160) {
 void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_row(row, out160); }
 void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
+// Scion P5: one 160-element row of 4-bit codebook indices (no 32-block stride)
+void dequant_q4x160(const uint8_t* row, float, float* out160) { strata::dequantize_q4x160(row, out160); }
 
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
@@ -175,6 +177,11 @@ const PleFormatInfo kPleFormats[] = {
     // BF16 (#586): the checkpoint's own table at full precision, 320-byte rows; self-describing, so no scale and no
     // metadata to trust (tools/ple_fp8_pack.py writes the FP8 form of the same table)
     {PleFormat::BF16, "BF16", "BF16", PLE_ROW_BYTES_BF16, false, dequant_bf16},
+    // Scion P5 table types (scion/docs/PLE-TABLE-TYPES.md): 32-element 3-bit/2-bit block codebooks and one
+    // 160-value 4-bit codebook row - the release's local Q4X160 shrink and the candidate smaller forms
+    {PleFormat::Q3X32, "Q3X32", "Q3X32", (PLE_HEAD_DIM / 32) * 14, false, dequant_blocks<strata::dequantize_q3x32, 14>},
+    {PleFormat::Q2X32, "Q2X32", "Q2X32", (PLE_HEAD_DIM / 32) * 10, false, dequant_blocks<strata::dequantize_q2x32, 10>},
+    {PleFormat::Q4X160, "Q4X160", "Q4X160", (PLE_HEAD_DIM / 160) * 82, false, dequant_q4x160},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace
@@ -252,8 +259,9 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         return false;
     }
     // The table's type is looked up in the format list (ple_formats()): IQ4_NL (ISTA-DASLab's shard 2, the original's
-    // own GGUF), Q5_0 (#296: OrcaRouter's GGUF), or the FP8 table as shipped: I8 bytes marked strata.ple.format =
-    // f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
+    // own GGUF), Q5_0 (#296: OrcaRouter's GGUF), Q4_0/Q5_1/Q8_0/BF16 (ordinary quantized GGUFs), or the FP8 table as
+    // shipped: I8 bytes marked strata.ple.format = f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py).  The Scion
+    // P5 table types Q3X32/Q2X32/Q4X160 are entries here too (scion/docs/PLE-TABLE-TYPES.md).
     const PleFormatInfo* fmt = ple_format_for_type(t->type_name());
     if (fmt == nullptr) {
         err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not " + ple_format_list();

@@ -389,6 +389,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/lora_corr.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -487,7 +488,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
+    src/core/corrections.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1319,7 +1321,8 @@ if(STRATA_NATIVE_EXPERTS)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
-                                           src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp)
+                                           src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
+                                           src/kernels/cpu/ptq1_0.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
@@ -1659,12 +1662,58 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
     add_executable(ple_q5_parity src/kernels/ple_q5_parity.cpp)
     target_link_libraries(ple_q5_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
+    # Scion tables: Q4_0 PLE rows through PleTable (direct reader) vs ggml's reference
+    add_executable(ple_q4_parity src/kernels/ple_q4_parity.cpp)
+    target_link_libraries(ple_q4_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
+    # Scion P5 tables: Q3X32/Q2X32 PLE rows through PleTable vs the fork's decoder fixture
+    add_executable(ple_x32_parity src/kernels/ple_x32_parity.cpp)
+    target_link_libraries(ple_x32_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
+    # Scion experts: PTQ1_0 rows through native_fmt / native_gu_rows (CPU) and the device kernels
+    add_executable(ptq1_0_parity src/kernels/ptq1_0_parity.cpp)
+    target_include_directories(ptq1_0_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(ptq1_0_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # Scion corrections: every lora_a/b pair of the artifact against the bit-exact host reduction
+    add_executable(lora_corr_parity src/kernels/lora_corr_parity.cpp)
+    target_include_directories(lora_corr_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lora_corr_parity PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+    # Scion corrections: window-shape bench (rows 1..8, A/B breakdown) - measurement tool, not a test
+    add_executable(lora_corr_bench src/kernels/lora_corr_bench.cu)
+    target_include_directories(lora_corr_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lora_corr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # Scion corrections: hardware-vs-software f16 conversion bit check - measurement tool, not a test
+    add_executable(f16_hw_check src/kernels/f16_hw_check.cu)
+    target_include_directories(f16_hw_check PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(f16_hw_check PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_executable(q5_projection_parity src/kernels/q5_projection_parity.cpp)
     target_include_directories(q5_projection_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(q5_projection_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
     # #291: the FP8 PLE table (tools/ple_fp8_pack.py) through PleTable vs the checkpoint's own values
     add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
     target_link_libraries(ple_fp8_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
+  if(STRATA_ENABLE_HIP AND STRATA_BUILD_TESTS)
+    # Scion tables: Q4_0 PLE rows through PleTable (direct reader) vs ggml's reference
+    add_executable(ple_q4_parity src/kernels/ple_q4_parity.cpp)
+    target_link_libraries(ple_q4_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
+    # Scion P5 tables: Q3X32/Q2X32 PLE rows through PleTable vs the fork's decoder fixture
+    add_executable(ple_x32_parity src/kernels/ple_x32_parity.cpp)
+    target_link_libraries(ple_x32_parity PRIVATE strata_kernels strata_artifact ggml-base ${_strata_gpu_runtime_target})
+    # Scion experts: PTQ1_0 rows through native_fmt / native_gu_rows vs a float reference
+    add_executable(ptq1_0_parity src/kernels/ptq1_0_parity.cpp)
+    target_include_directories(ptq1_0_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(ptq1_0_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # Scion corrections: the runtime lora_a/b branch kernels on the real artifact
+    add_executable(lora_corr_parity src/kernels/lora_corr_parity.cpp)
+    target_include_directories(lora_corr_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lora_corr_parity PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
+    # Scion corrections: window-shape bench (rows 1..8, A/B breakdown) - measurement tool, not a test
+    add_executable(lora_corr_bench src/kernels/lora_corr_bench.cu)
+    target_include_directories(lora_corr_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lora_corr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # Scion corrections: hardware-vs-software f16 conversion bit check - measurement tool, not a test
+    add_executable(f16_hw_check src/kernels/f16_hw_check.cu)
+    target_include_directories(f16_hw_check PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(f16_hw_check PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
 endif()
 

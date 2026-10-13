@@ -49,6 +49,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/corrections.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -672,6 +673,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
+        corr_t16_ = b.take<uint16_t>(T * (uint64_t) strata::kernels::kLoraCorrMaxRank);
+        corr_x16_ = b.take<uint16_t>(std::min<uint64_t>(T, (uint64_t) strata::kernels::kLoraCorrRoundRows) *
+                                      (uint64_t) max_in);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
@@ -1215,6 +1219,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!g_qfuse() || batch_rec_) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                if (!corr_apply(*wt_, *g_, l, CorrSite::SsmOut, n, y_ + (size_t) tb * ZV, corr_x16_,
+                                corr_t16_ + (size_t) tb * strata::kernels::kLoraCorrMaxRank, bo_ + tb * N, cs, err))
+                    return false;
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1442,6 +1449,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 il_ready = false;
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
+                if (!corr_apply(*wt_, *g_, l, CorrSite::AttnOutput, n, attn32_ + tb * NH * HD, corr_x16_,
+                                corr_t16_ + (size_t) tb * strata::kernels::kLoraCorrMaxRank, bo_ + tb * N, cs, err))
+                    return false;
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -1707,6 +1717,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+        if (!corr_apply(*wt_, *g_, l, CorrSite::FfnMoeOut, n, mixed_ + (size_t) tb * N, corr_x16_,
+                        corr_t16_ + (size_t) tb * strata::kernels::kLoraCorrMaxRank, bo_ + tb * N, cs, err))
+            return false;
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {

@@ -34,6 +34,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/corrections.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
@@ -3163,6 +3164,17 @@ int main(int argc, char** argv) {
                          "skipped: served natively)\n",
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), load_s(), skip.size());
     mem_mark("the pack weights");
+    {
+        // The embedded adapter of a Scion release: every blk.N.<site>.weight.lora_{a,b} pair is checked here,
+        // before a token runs, and applied at the block outputs by the layer/prefill/verify paths.
+        int corr_branches = 0;
+        if (!strata::core::corr_validate(wt, strata::core::ModelGeometry{}, corr_branches, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        if (corr_branches > 0)
+            std::fprintf(stderr, "strata generate: %d embedded correction branches will be applied\n", corr_branches);
+    }
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
@@ -3597,6 +3609,13 @@ int main(int argc, char** argv) {
             const int64_t lb = stage_trim ? split_at[i] : 0;
             const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : 0;
             if (!load_stage_weights(st, lb, le, stage_trim)) return 1;
+        }
+        {
+            int corr_branches = 0;
+            if (!strata::core::corr_validate(st.wt, strata::core::ModelGeometry{}, corr_branches, err)) {
+                std::fprintf(stderr, "strata generate: layer split, CUDA%d corrections: %s\n", st.dev, err.c_str());
+                return 1;
+            }
         }
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
         // LAYER RANGE (the carve - every stage used to hold all 48 layers' state whatever it ran), so the

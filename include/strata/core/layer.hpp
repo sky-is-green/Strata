@@ -463,6 +463,13 @@ struct BlockBuffers {
     float* gr_rs = nullptr;                   ///< hc: the fused read's per-stream 1/rms
     uint8_t* head_q8k = nullptr;              ///< `q8k_bytes(n_embd)`: the head's Q8_K activation image
     strata::kernels::GrWorkspace gr;          ///< `gr_read`'s scratch
+    /// The runtime correction branches' rank-sized intermediate (`t16` of `out += B t16`), one row: the
+    /// branch input is one token's activation in the decode paths.  f16, because the A pass rounds its own
+    /// output and the B pass consumes it as f16.
+    uint16_t* corr_t16 = nullptr;
+    /// The correction branches' f16 rounding of one row of `x` (A's input operand).  One row, because the
+    /// decode paths call `corr_apply` with a single token; sized for the widest branch input.
+    uint16_t* corr_x16 = nullptr;
 
     /// THE HALF-LEVEL C1 ORACLE, and it is a HOST buffer of `(2 * n_embd + 2 * hc + n_head * head_dim)` floats
     /// PER LAYER: `[0, n_embd)` the attention half's `block_out`, `[n_embd, 2*n_embd)` the MoE half's, the two

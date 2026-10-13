@@ -29,6 +29,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/corrections.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -775,6 +776,8 @@ struct Prefill::Impl {
     bool f16_io = false;   // HIP, STRATA_HIP_PROMPT_F16=1: this stage's 16-bit GEMMs run FP16 in and out (set in init)
     uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;   // bf16x2(): the BF16 GEMMs' low parts
     float* bo = nullptr;
+    uint16_t* corr_t16 = nullptr;            // T * kLoraCorrMaxRank f16: the correction branches' rank scratch
+    uint16_t* corr_x16 = nullptr;            // min(T, kLoraCorrRoundRows) * max_in: the corrections' f16 x scratch
     // GDN
     float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *hbuf = nullptr, *y = nullptr;
     uint16_t* y_h = nullptr;
@@ -1254,6 +1257,12 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
+    m.corr_t16 = o.take<uint16_t>(T * (size_t) strata::kernels::kLoraCorrMaxRank, ok);
+    {
+        const uint64_t corr_in = std::max({(uint64_t) g.n_embd, (uint64_t) g.ssm_value_dim,
+                                           (uint64_t) g.n_head * (uint64_t) g.head_dim});
+        m.corr_x16 = o.take<uint16_t>(std::min<uint64_t>(T, (uint64_t) strata::kernels::kLoraCorrRoundRows) * corr_in, ok);
+    }
     if (bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(m.f16_io)) m.mixed_bf_lo = o.take<uint16_t>(T * N, ok);
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -1888,10 +1897,11 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint8_t>(GEMM_WS, ok);
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     // `carve`'s order, buffer for buffer: emb, R, xn, grs, xn16, lo, lo16, gated, inj, mixed, mixed_bf, mixed_h,
-    // bo aliases emb. This counted `xn` unconditionally (carve takes it only under STRATA_GR_UNFUSED) and never counted
-    // `grs`.  Net over-count T*(D-HC)*4 bytes: 42 MB at a 1024-token chunk, 252 MB (48 Q8_0 slots) at 6144 - the
-    // prompt path was told it had less room than it did.  Safe - the direction is over-estimating, and `take`
-    // still bounds-checks - but it under-sizes every loan, so every chunk the scan picks is one step smaller.
+    // bo aliases emb, then the corrections' t16/x16. This counted `xn` unconditionally (carve takes it only under
+    // STRATA_GR_UNFUSED) and never counted `grs`.  Net over-count T*(D-HC)*4 bytes: 42 MB at a 1024-token chunk,
+    // 252 MB (48 Q8_0 slots) at 6144 - the prompt path was told it had less room than it did.  Safe - the
+    // direction is over-estimating, and `take` still bounds-checks - but it under-sizes every loan, so every
+    // chunk the scan picks is one step smaller.
     if (ring_bytes_on()) {
         f(T * N); f(T * D);
         if (gr_unfused()) f(T * D);
@@ -1902,6 +1912,12 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
     if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
+    o.take<uint16_t>(T * (size_t) strata::kernels::kLoraCorrMaxRank, ok);
+    {
+        const uint64_t corr_in = std::max({(uint64_t) g.n_embd, (uint64_t) g.ssm_value_dim,
+                                           (uint64_t) g.n_head * (uint64_t) g.head_dim});
+        o.take<uint16_t>(std::min<uint64_t>(T, (uint64_t) strata::kernels::kLoraCorrRoundRows) * corr_in, ok);
+    }
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
     if (bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(f16_io)) o.take<uint16_t>(T * N, ok);
@@ -2702,6 +2718,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                    ld_y);
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                    if (!core::corr_apply(*m.wt, g, l, core::CorrSite::SsmOut, T, m.y, m.corr_x16, m.corr_t16, m.bo, m.cs, err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -2930,8 +2947,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
+                    gate_attn(m.attn, m.Qf, m.attn_h, m.attn, T, m.cs, ld_a);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    if (!core::corr_apply(*m.wt, g, l, core::CorrSite::AttnOutput, T, m.attn, m.corr_x16, m.corr_t16, m.bo, m.cs, err)) return false;
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
@@ -4054,6 +4072,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
                                     use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                    if (!core::corr_apply(*m.wt, g, l, core::CorrSite::FfnMoeOut, T, m.mixed, m.corr_x16, m.corr_t16, m.bo, m.cs, err)) return false;
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
