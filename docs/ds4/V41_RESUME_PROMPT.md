@@ -3,6 +3,66 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-14 ~06:10 (end of session 9) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4 deepseek4:main
+- pushing is OK'd; GitHub = Indras-Mirror/Strata-DSV4.1).  HEAD at handoff: 834728b0 (plus a docs commit).
+
+READ FIRST, in order, and nothing else until a question needs it: docs/ds4/V41_START_HERE.md section 5c blocks
+"Session 9d" -> "Session 9c" -> "NEXT DESIGN ITEM" -> "Session 9b" -> "Session 9" (newest first).
+
+STATE (all measured, RTX 4090 + 90 GB RAM, bias ON unless noted):
+- DSpark speculative decoding WORKS (one-shot ds41_generate, greedy): Q2_K sidecar + D3 batched verify (default) +
+  1-slot verify prefetch (default) -> docs 39.5 / python 31.7 / code 35.6 tok/s vs plain 29.9 / 20.6 / 26.7
+  (1.32-1.53x).  Config: STRATA_DSPARK=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.Q2_K.gguf STRATA_DSPARK_DEPTH=4.
+  Verify core correct (bias-off vs independent prefill: near-ties only).  PCIe is the wall (nsys).
+- Quality baseline (DwarfStar 112 official API fixtures, tools/v41/quality/): exact routing 86.21% API top-1 (short
+  group); DEFAULT decode route bias (1.0 / 0.6) = 72.13% (-14 pt) + repetition loops; bias x0.25 = 85.18% at
+  12.6 / 7.4 tok/s; x0.5 = 81.66%.  Our GSQ weights are 3.7 pt below DwarfStar's IQ2_XXS-Q2_K on short prompts.
+- Smart bias (opt-in env STRATA_RB_PROTECT=P / STRATA_RB_MARGIN=d, ds41_dense.cpp router): PROTECT=3 84.56% but only
+  10.6 / 6.6 tok/s (flat x0.25 dominates it); PROTECT=2 83.14%; MARGIN variants NOT yet measured.
+- --arena-adapt (adaptive RAM arena, Mal's idea) FIXED (slot-capacity check + stream sync; DS41_CHECK_ARENA: 3600
+  swaps, 0 bad; zero routing change): exact routing docs 5.48 -> 6.90, python 3.51 -> 5.61 tok/s (+26-60%).
+- ggml upstream fixes #30103/#29953 applied (vendored third_party is gitignored: re-apply tools/v41/ggml/
+  upstream-fixes.patch with /usr/bin/patch on a fresh checkout; companion fix in src/prefill/moe_mmq.cu J_best).
+- Production serve (tools/v41/serve/ds41-engine.sh, binary build-ds4-gpu, temp 1.0) is UNTOUCHED: all work is in
+  build-ds4-dspark.  DSpark is NOT in --serve (needs speculative SAMPLING - design in START_HERE 5c, not started).
+
+FIRST: check ~/AI/v41-dev/hf/publish.log - "CARD PUBLISHED" = the HF Q2_K sidecar upload + model card update
+(IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored) finished; otherwise finish them (card staged at
+~/AI/v41-dev/hf/model-card-README.md; upload: hf upload <repo> <file> <path>).
+
+NEXT (Mal's call where marked):
+1. MARGIN variants on the 34-case subset (~/AI/v41-dev/quality/short34.jsonl, ~7 min each) + 128-token speed on
+   docs/python: STRATA_RB_MARGIN=0.1 / 0.3 (score: tools/v41/quality/score_official.py run|score; quality runs use
+   STRATA_SERVE_PASS_BIAS=1 so the bias applies).  Compare against the curve; full 102 only for the winner.
+2. Re-measure arena-adapt speed after the sync fix; test arena-adapt + bias x0.25 (quality-first speed) and with
+   DSpark (D3 uses its FILEG path, not arena-adapt - wire it in if it helps); decide default-on.
+3. MAL DECIDES the route-bias level (speed-first default vs quality-first x0.25 / smart variant) - present the table.
+4. Then (Mal's go) speculative sampling for DSpark in --serve (opt-in STRATA_SERVE_DSPARK).
+
+TOOLS: ~/AI/v41-dev/bench4/ (prompts prose/python/docs/code .i32, runs.py <tags> = tok/s, tokens/pass, verify ms,
+hits, prefetch, rep8 loop score; bench4.sh/q2pf.sh templates); ~/AI/v41-dev/quality/ (cases.jsonl, short.jsonl,
+short34.jsonl, q_* results); ~/AI/v41-dev/smartbias/ (run2.sh, arena_verify.sh, logs); tools/v41/vdump_cmp.py +
+d3_nb_gate.sh (verify-vs-prefill gate); ~/AI/v41-dev/d2/det_pair.sh (prefill determinism md5).  Engine taps:
+DS41_PROF_X (D3 phases), DS41_CHECK_LRU, DS41_CHECK_ARENA, STRATA_DSPARK_DUMP, STRATA_PROFILE_DECODE (+ nsys
+--capture-range=cudaProfilerApi), STRATA_DEC_MARGIN + STRATA_FORCE_IDS (forced-token equivalence check).
+
+RULES: one-shot model runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes ds4-gpu.lock itself - never wrap
+it in flock); --serve runs must NOT go through memguard (it backgrounds the command -> stdin /dev/null): launch like
+ds41-engine.sh / score_official.py (flock + systemd-run scope, exec'd).  Need >= 75 GB MemAvailable.  Kill by exact
+PID only; NEVER pkill/pgrep -f a pattern that also appears in your own command line (it kills your shell - happened
+twice).  Keep tests small (34-case subset, 128 tokens) unless deciding.  Bias-on text depends on VRAM residency:
+compare verify ms / tokens-per-pass on identical text, filter rep8 > 0.3, timing noise +-5%.  Build:
+nice -n19 ninja -C build-ds4-dspark ds41_generate.  anaconda's `patch` binary is corrupt: use /usr/bin/patch.
+GPU SHARING: relay peer `voice-duplex` (Quetza, strata-dense 27B voice work) relay-asks and WAITS for an explicit 'go'
+before any GPU use (DS4 has priority, Mal).  Claim your relay name with `relay up strata-dspark`; wake on messages
+with `relay wait --timeout 14400` as a background task, re-armed after every wake; reply with the FULL ask id.
+Relay system notes: memory quetza-relay-unified.md; QuetzaCodetl relay/REPL changes are built but UNCOMMITTED
+(main.tsx holds another session's voice work).
+```
+
 ## UPDATE 2026-10-13 ~20:00 (session 8, conductor) - READ FIRST: D3 batched verify tier (opt-in, BROKEN)
 
 DSpark spec-decode is coded and runs (3.3-3.6 tokens/pass) but is SLOWER than plain (20.5 vs 27.4 tok/s): the verify
