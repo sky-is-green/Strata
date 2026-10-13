@@ -689,6 +689,19 @@ int main(int argc, char ** argv) {
         std::ofstream f(std::string(dump_dir) + "/" + name, std::ios::binary);
         f.write((const char *) p, (std::streamsize) bytes);
     };
+    // tail capture (STRATA_SERVE_DUMP_TAIL, the quality scorer): the last `tail_keep` rows of a feed's logits into
+    // tail_logits (row n - tail_keep first) - a teacher-forced continuation's rows without the whole prompt's (a 23K-token
+    // prompt's full logits would be 12 GB).  0 = off.
+    int tail_keep = 0;
+    std::vector<float> tail_logits;
+    auto capture_tail = [&](int n, int row0, int nrows, int dense_row0) -> bool {   // rows [row0, row0+nrows) of this feed
+        if (tail_keep <= 0) return true;
+        const int t0 = n - tail_keep, lo = std::max(row0, t0), hi = row0 + nrows;
+        if (lo >= hi) return true;
+        if (tail_logits.size() != (size_t) tail_keep * (size_t) nv) tail_logits.assign((size_t) tail_keep * (size_t) nv, 0.0f);
+        if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
+        return true;
+    };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
@@ -758,6 +771,8 @@ int main(int argc, char ** argv) {
                     }
                     if (c0 + B == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
                 } else if (c0 + B == n && !dense.logits(B - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                for (int s = 0; tail_keep > 0 && s < B; s += SB)   // one sub-batch at a time, as above
+                    if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
                 c0 += B;
             } else {
@@ -799,6 +814,7 @@ int main(int argc, char ** argv) {
                     if (!dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
                     if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
                 } else if (c0 + m == n && !dense.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                if (!capture_tail(n, c0, m, 0)) return false;
                 fd_logits += now_ms() - tl;
                 c0 += m;
             }
@@ -939,6 +955,7 @@ int main(int argc, char ** argv) {
                 for (int i = 0; i < delta; ) {
                     const int m = std::min(pass_max, delta - i);
                     if (!(m == 1 ? step(ids[(size_t) (reused + i)], reused + i) : pass_m(ids.data() + reused + i, m, reused + i))) return false;
+                    if (!capture_tail(delta, i, m, 0)) return false;   // this pass's rows, before the next pass replaces them
                     const int before = i;
                     i += m;
                     last_rows = m;
@@ -948,7 +965,19 @@ int main(int argc, char ** argv) {
                 pp(delta);
                 return true;
             };
+            static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
+            tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
+            tail_logits.clear();
             const bool ok = total == reused || (by_step ? feed_steps() : feed(ids.data() + reused, delta, reused, pp, nullptr));
+            if (tail_keep > 0 && ok) {   // the quality scorer's rows: req%03d.tail.f32, [tail_keep x n_vocab], last prompt row last
+                if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {
+                    char nb[40];
+                    std::snprintf(nb, sizeof(nb), "/req%03d.tail.f32", n_req);
+                    std::ofstream f(std::string(dd) + nb, std::ios::binary);
+                    f.write((const char *) tail_logits.data(), (std::streamsize) (tail_logits.size() * 4));
+                }
+            }
+            tail_keep = 0;
             if (!ok) {
                 std::printf("ERR prefill failed: %s\n", ferr.c_str());
                 std::fflush(stdout);
