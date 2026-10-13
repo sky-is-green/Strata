@@ -252,12 +252,19 @@ int main(int argc, char** argv) {
             const auto d = row_dequant_ref(blob.data() + 2 * F * gu_row + (size_t) r * d_row, F);
             std::memcpy(D.data() + (size_t) r * F, d.data(), (size_t) F * 4);
         }
-        // the scratch layout: gate (0), up (fa), h (2fa), hq (3fa) -- read h (swiglu out, pre-quantization)
-        // and hq (what the down kernel reads) back
+        // the scratch layout: gate (0), up (fa), h (2fa), hq (3fa).  The default path fuses SwiGLU + q8_1
+        // (swiglu_q8_1_entries_kernel writes hq only), so the f32 h image only exists on the v1 path: run
+        // that once for the h comparison, then the default once for the quantized h the down kernel read.
         const size_t fa = ((size_t) NT * F * 4 + 255) & ~(size_t) 255;
         std::vector<float> hdev((size_t) NT * F);
-        cudaMemcpy(hdev.data(), (const uint8_t*) dscr + 2 * fa, hdev.size() * 4, cudaMemcpyDeviceToHost);
         std::vector<uint8_t> hdevq((size_t) NT * (F / 32) * 36);
+        sk::native_grouped_set_v1(true);
+        sk::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        cudaStreamSynchronize(s);
+        cudaMemcpy(hdev.data(), (const uint8_t*) dscr + 2 * fa, hdev.size() * 4, cudaMemcpyDeviceToHost);
+        sk::native_grouped_set_v1(false);
+        sk::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
+        cudaStreamSynchronize(s);
         cudaMemcpy(hdevq.data(), (const uint8_t*) dscr + 3 * fa, hdevq.size(), cudaMemcpyDeviceToHost);
         std::vector<float> want_h((size_t) NT * F), want((size_t) NT * H);
         for (int k = 0; k < NT; ++k) {
