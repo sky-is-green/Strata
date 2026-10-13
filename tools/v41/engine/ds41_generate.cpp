@@ -537,6 +537,8 @@ int main(int argc, char ** argv) {
     // entering the DSpark target layer 37 + j) for pass token t (the STRATA_DUMP_MAIN math, token-major read_state);
     // vlog = the pass's m rows of logits.
     std::vector<float> vh, vlog, vx, vpre;
+    std::vector<int> pv_pred, pv_rank;                 // D3 prefetch: per-token predictions, the ranked union
+    std::vector<std::pair<int, int>> pv_score;
     double pv_ms[4] = {0, 0, 0, 0};   // pass_v split: dense (begin/attn_router/finish), tier, taps (read_state), logits
     long pv_n = 0, pv_tok = 0;
     auto pass_v = [&](const int * toks, int m, int pos) -> bool {
@@ -548,7 +550,31 @@ int main(int argc, char ** argv) {
         mw.resize((size_t) m * top_k);
         vh.assign((size_t) m * 3 * n_embd, 0.0f);
         if (!dense.begin(toks, m, pos)) { ferr = dense.last_error(); return false; }
+        // D3 prefetch (STRATA_D3_PF = slots per layer, default 1, 0 = off): before each layer's attention, predict
+        // every pass token's routing (predict_multi), rank the union (score 16 - rank, summed over tokens) and DMA the
+        // likely misses into the prefetch slots on the prefetch stream - they land under the attention.  PCIe is the
+        // wall (nsys: ~100 expert DMAs per verify pass, 1.4 s of a 4.2 s decode), so a wrong guess costs a full blob:
+        // docs prompt, same text: slots 0/1/2/3/6 -> verify 104.4/101.7/104.5/111.1/124.1 ms (precision 40% at 1).
+        static const int d3_pf = std::getenv("STRATA_D3_PF") ? std::atoi(std::getenv("STRATA_D3_PF")) : 1;
+        const bool pf_now = rdev1 && !no_tier_batch && d3_pf > 0 && m <= Ds41MoeTier::kMaxMulti;
         for (int l = 0; l < n_layer; ++l) {
+            if (pf_now) {
+                pv_pred.resize((size_t) m * 16);
+                if (dense.predict_multi(l, pv_pred.data())) {
+                    pv_score.clear();
+                    for (int t = 0; t < m; ++t)
+                        for (int i = 0; i < 16; ++i) {
+                            const int e = pv_pred[(size_t) t * 16 + i];
+                            if (e < 0) continue;
+                            auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & p) { return p.first == e; });
+                            if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
+                        }
+                    std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
+                    pv_rank.clear();
+                    for (const auto & p : pv_score) pv_rank.push_back(p.first);
+                    tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
+                }
+            }
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
             lap(0);
@@ -1088,6 +1114,9 @@ int main(int argc, char ** argv) {
         f.write((const char *) last_logits.data(), (std::streamsize) (last_logits.size() * 4));
     }
     tier.reset_stats();
+    // STRATA_PROFILE_DECODE=1: nsys --capture-range=cudaProfilerApi captures exactly the decode
+    static const bool prof_decode = std::getenv("STRATA_PROFILE_DECODE") != nullptr;
+    if (prof_decode) Ds41MoeTier::profiler(true);
     const double td0 = now_ms();
     std::vector<float> lg = last_logits;
     int pos = (int) prompt.size(), gen = 0;
@@ -1194,6 +1223,7 @@ int main(int argc, char ** argv) {
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
+    if (prof_decode) Ds41MoeTier::profiler(false);
     const Ds41MoeStats st = tier.stats();
     std::fprintf(stderr, "decode: %d tokens in %.2f s = %.2f tok/s; experts %lld hit / %lld cpu / %lld pcie / %lld file "
                  "(%.1f%% VRAM hits), cpu %.0f ms, file %.0f ms; spec reads %lld issued / %lld used; prefetch %lld issued / "

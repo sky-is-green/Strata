@@ -94,6 +94,34 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 9 (2026-10-13 night) - D3 WORKS, correct, and faster than per-token; still opt-in (`STRATA_TIER_BATCH=1`)
+- **Crash fixed (6da95756):** `acquire()` grew `im.ftmp` mid-batch (slot index > top_k in a multi-token pass) ->
+  every earlier job's blob pointer dangled -> SIGSEGV in the pool.  `reserve_ftmp()` sizes it first (also in `gpu_run_n`).
+- **Speed (291ee6b0), bias ON, depth 4, p256 x 256, MXFP4 sidecar** (per-token baseline 19.80 tok/s, verify 167.6 ms):
+  | step | tok/s | verify ms/pass |
+  |---|---|---|
+  | crash fix only | 19.01 | 191.4 |
+  | + D3's own PCIe share (`STRATA_TIER_BATCH_PCIE`, default 1) + file tier read in parallel and run on the card | 24.28 | 148.9 |
+  | + `Ds41MoeTier::kMaxMulti` = 8 (one call/layer), d_stage waves, packed pinned metadata | 25.82 | 138.1 |
+  | + Q2_0 classes batch (they silently fell back to per-token) | 22.52* | 134.5 |
+  | + vram_lru ported (D3 never admitted: mixed blob sizes) | see d3c_a | |
+  *acceptance 2.20 vs 2.70 that run = trajectory variance (text differs), see correctness.
+  Why it was slow: `gpu_run_n_ex` was cloned from the old uniform `gpu_run_n` and had none of `gpu_run`'s work
+  (serial file reads on the critical path, 5 pageable copies per launch, CPU pool ~2 ms/expert, no LRU).
+  `DS41_PROF_X=1` prints per-phase ms/call every 640 calls (diff consecutive lines for steady state).
+- **Correctness CLOSED for the verify core:** `STRATA_DSPARK_DUMP=<file>` (every verify row) +
+  `~/AI/v41-dev/d2/vdump_cmp.py <vdump> <arb.logits>` vs an independent prefill of the stream (`arb_run.sh`).
+  **Bias OFF** (`nb_gate.sh`): per-token 96.0% argmax agree, D3 95.4%, EVERY disagreement a near-tie (prefill top-1
+  gap < 0.6); rows 1..5 no worse than row 0 -> no multi-token structural bug.  **Bias ON comparisons are meaningless**
+  (decode route bias depends on VRAM residency -> different routing than the prefill: per-token itself shows 91% /
+  max|d| median 6.6).  The old "18 logits worse at 127" was a bias-on artefact.  D3 is ~25% noisier on mean|d|
+  (more experts on GPU kernels instead of the CPU's) - legit rounding.
+- `DS41_CHECK_LRU=1` (D3 path): slot + demoted arena copy vs the file after every swap - 3200 swaps, 0 bad.
+- **Remaining gap:** verify ~135 ms vs the ~100 ms bar (plain decode 27.4 tok/s still beats D3's ~25.8).  Per layer
+  call ~2.1-2.8 ms, of it ~1.5 ms GPU wait (DMAs + hit kernels + per-token sums) - nsys capture `d3c_nsys.nsys-rep`
+  in ~/AI/v41-dev/d2 to split it.  Ideas: DMAs on a copy stream overlapping the hit kernels; fewer launches per class.
+- Relay/GPU sharing: voice-duplex (Quetza) asks per run and waits for an explicit 'go' (Mal: DS4 has priority).
+
 ### Session 8 (2026-10-13 late evening) - D3 batched tier CODED but CRASHES; opt-in, default OFF
 - **D3 = `gpu_run_n_ex`** (`tools/v41/engine/ds41_moe.cpp`, right after `gpu_run_n`): the batched per-expert-class
   verify tier - the same union sharing as `gpu_run_n` (each distinct expert read ONCE, a group with one entry per

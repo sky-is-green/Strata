@@ -202,6 +202,7 @@ struct Ds41Dense::Impl {
     std::map<GKey, ggml_cgraph *> graphs;
     std::map<int, ggml_tensor *> logits_out;   // decode head graph output, by nrows
     std::map<int, ggml_tensor *> predict_out;  // predict graph output, by layer
+    std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
     std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
@@ -761,11 +762,11 @@ static ggml_cgraph * build_attn_kv_only(Ds41Dense::Impl & im, ggml_context * gc,
 }
 
 // predict: router(rms_norm(hc_pre(state, pre)) * ffn_norm) + bias, top 16 of token 0
-static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor ** out) {
+static ggml_cgraph * build_predict(Ds41Dense::Impl & im, ggml_context * gc, int il, ggml_tensor ** out, int64_t n = 1) {
     B b { &im, gc, &im.g };
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     const int64_t D = im.D, HC = im.HC;
-    ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, 1), b.cols2(im.pre_state, HC, 1));
+    ggml_tensor * x = ggml_dsv4_hc_pre(gc, b.cols3(im.x_state, D, HC, n), b.cols2(im.pre_state, HC, n));
     ggml_tensor * rl = ggml_mul_mat(gc, im.BLpred(il), b.rms_w(x, im.BL(il, "ffn_norm.weight")));
     ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
     ggml_tensor * sc = ggml_add(gc, ggml_add(gc, ggml_sqrt(gc, ggml_softplus(gc, rl)), im.BL(il, "exp_probs_b.bias")),
@@ -1363,6 +1364,25 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     int32_t buf[16];
     ggml_backend_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
+    return true;
+}
+
+bool Ds41Dense::predict_multi(int il, int * top_ids) {
+    Impl & im = *p_;
+    const int64_t n = im.n;
+    if (n < 1) return false;
+    if (n == 1) return predict(il, top_ids, 16);
+    const Impl::GKey key { il, 3, 0, (int) n };   // one graph per (layer, pass width): verify passes reuse a few widths
+    auto it = im.graphs.find(key);
+    ggml_tensor * o = nullptr;
+    if (it == im.graphs.end()) {
+        ggml_cgraph * gf = build_predict(im, im.gctx, il, &o, n);
+        it = im.graphs.emplace(key, gf).first;
+        im.predict_out_n[{ il, (int) n }] = o;
+    }
+    o = im.predict_out_n[{ il, (int) n }];
+    if (!im.compute(it->second, true)) return false;
+    ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
     return true;
 }
 

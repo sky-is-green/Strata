@@ -402,6 +402,11 @@ public:
     /// work; `run(layer, ...)` consumes what it staged and clears the staging.  No-op in `cpu_only` and when
     /// `pf_b <= 0`.  `n` may be smaller than the caller's list; never larger than kPredW.
     void prefetch(int64_t layer, const int32_t* top16, int n = Ds41MoeConfig::kPredW);
+    /// The multi-token verify pass's prefetch (call before attn_router(layer), so the DMAs run under its attention):
+    /// `ids` = ranked candidate experts (best first, may repeat), the first `max_slots` (<= kMaxPf) that are neither
+    /// VRAM-resident nor outside the arena are DMA'd into the prefetch slots on the prefetch stream; run_multi_to_dev
+    /// computes a routed one from its slot (a hit).  Independent of pf_b.  A hint only: results do not depend on it.
+    void prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots);
     /// Decode file-tier readahead: for the predicted experts of `layer` that are neither VRAM-resident nor in the RAM
     /// arena, ask the kernel to read their bytes into the page cache now (posix_fadvise WILLNEED), so the tier's
     /// buffered read later is a page-cache copy.  The SSD is otherwise idle in decode, so a wrong guess costs ~nothing.
@@ -444,6 +449,8 @@ public:
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
+    static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.

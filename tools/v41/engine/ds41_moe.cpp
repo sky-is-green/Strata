@@ -42,6 +42,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #if defined(DS4_MOE_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
 #endif
@@ -1641,6 +1642,34 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n) {
 #endif
 }
 
+void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots) {
+    im_->pf_n = 0;
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
+    if (!ids || n <= 0 || max_slots <= 0 || !im_->g.routed(layer)) return;
+    Gpu& gp = *im_->gpu;
+    if (!gp.s_pf || !gp.d_pf) return;   // allocated with pf_b > 0 (the decode default)
+    const int nb = std::min(max_slots, (int) Ds41MoeConfig::kMaxPf);
+    for (int i = 0; i < n && im_->pf_n < nb; ++i) {
+        const int32_t e = ids[i];
+        if (e < 0 || e >= im_->g.n_experts) continue;
+        if (gp.cache->slot_of(layer, e) >= 0) continue;
+        bool dup = false;
+        for (int j = 0; j < im_->pf_n; ++j) dup = dup || im_->pf_e[j] == e;
+        if (dup) continue;
+        const uint8_t* src = gp.arena.ptr(layer, e);
+        if (!src) continue;   // file tier: no DMA source; the pass reads it on demand
+        ck(cudaMemcpyAsync((uint8_t*) gp.d_pf + (size_t) im_->pf_n * (size_t) im_->blob, src,
+                           (size_t) im_->bl[(size_t) im_->g.cls(layer, e)], cudaMemcpyHostToDevice, gp.s_pf), "prefetch dma");
+        im_->pf_e[im_->pf_n++] = e;
+    }
+    if (im_->pf_n > 0) ck(cudaEventRecord(gp.ev_pf, gp.s_pf), "record prefetch");
+    im_->st.prefetch_issued += im_->pf_n;
+#else
+    (void) layer; (void) ids; (void) n; (void) max_slots;
+#endif
+}
+
 void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
@@ -2819,6 +2848,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // ---- classify: resident slot / prefetch staging / miss ----
     enum { HIT = 0, PCIE = 1, CPU = 2, FILEG = 3 };   // FILEG: a file-tier miss read to pinned staging, run on the card
     int cls[kMaxEnt];
+    bool from_pf[kMaxEnt] = {};   // a hit served out of a prefetch slot (prefetch_multi) - LRU-admitted below
     unsigned long long dptr[kMaxEnt] = {};
     int32_t miss[kMaxEnt];
     int nmiss = 0, npf = 0;
@@ -2829,7 +2859,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         for (int j = 0; j < im.pf_n && sl < 0; ++j)
             if (im.pf_e[j] == e) pf_at = j;
         if (sl >= 0) { cls[u] = HIT; dptr[u] = (unsigned long long) gp.cache->device_slot(sl); }
-        else if (pf_at >= 0) { cls[u] = HIT; dptr[u] = (unsigned long long) gp.d_pf + (size_t) pf_at * (size_t) B; ++npf; }
+        else if (pf_at >= 0) { cls[u] = HIT; from_pf[u] = true; dptr[u] = (unsigned long long) gp.d_pf + (size_t) pf_at * (size_t) B; ++npf; }
         else { cls[u] = CPU; miss[nmiss++] = u; }
     }
     // ---- the PCIe share of the distinct misses (same budget rule as gpu_run) ----
@@ -3032,6 +3062,27 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     };
     launch_site(HIT);
+    // vram_lru, as gpu_run: a prefetched expert the pass used is copied device-to-device into a victim slot (the
+    // hits kernel above read the staging copy; this copy only reads it too, and the next prefetch waits for the sync)
+    if (lru && npf > 0) {
+        for (int u = 0; u < nu; ++u) {
+            if (!from_pf[u] || !admit_ok(ue[u])) continue;
+            const int32_t e = ue[u], v = lru_victim(e);
+            if (v < 0) continue;
+            const int32_t sl = gp.cache->slot_of(layer, v);
+            int32_t dem = -1;
+            if (arena_slot(v) < 0) {   // demote the victim into the arena slot the prefetched expert came from
+                dem = arena_slot(e);
+                if (dem < 0) continue;
+                ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) dem], gp.cache->device_slot(sl),
+                                   (size_t) BLX(v), cudaMemcpyDeviceToHost, gp.s), "lru demote");
+            }
+            ck(cudaMemcpyAsync(gp.cache->device_slot(sl), (const void*) dptr[u], (size_t) BLX(e), cudaMemcpyDeviceToDevice, gp.s),
+               "lru pf copy");
+            im.vlast[(size_t) (layer * NXL + v)] = im.tick;
+            lru_old[n_lru] = v; lru_dem[n_lru] = dem; lru_new[n_lru++] = e;
+        }
+    }
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
         for (auto& t : frd) t.join();
         im.st.file_tier += nfg;
@@ -3132,7 +3183,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // ---- vram_lru bookkeeping (the stream is synced above: every copy is home) ----
     if (lru) {
         for (int u = 0; u < nu; ++u)   // every lookup that was not a VRAM hit is a miss for the admission filter
-            if (cls[u] != HIT) im.vmiss[(size_t) (layer * NXL + ue[u])] = lc;
+            if (cls[u] != HIT || from_pf[u]) im.vmiss[(size_t) (layer * NXL + ue[u])] = lc;
         for (int i = 0; i < n_lru; ++i) {   // the slots now hold the new experts
             gp.cache->replace(layer, lru_old[i], lru_new[i]);
             if (lru_dem[i] >= 0) {   // the arena slot changed hands: the demoted expert in, the promoted one out
@@ -4012,6 +4063,14 @@ bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const flo
     return gpu_run_n(*im_, layer, nt, ids, w, x, out);
 #else
     return false;
+#endif
+}
+
+void Ds41MoeTier::profiler(bool on) {
+#if defined(DS4_MOE_CUDA)
+    if (on) cudaProfilerStart(); else cudaProfilerStop();
+#else
+    (void) on;
 #endif
 }
 

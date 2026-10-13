@@ -117,6 +117,9 @@ public:
     /// rms_norm(hc_pre(state, pre)) * ffn_norm.weight, + the selection bias, ranked; top_ids gets n_top (<= 16).
     /// A hint only: the result does not depend on it.
     bool predict(int il, int * top_ids, int n_top);
+    /// predict() for EVERY column of the current pass (call before attn_router(il)): top_ids[t * 16 + i] = token t's
+    /// i-th predicted expert of layer il (16 per token).  For the multi-token verify pass's expert prefetch; a hint only.
+    bool predict_multi(int il, int * top_ids);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
     bool finish(int il, const float * routed_sum);
     /// Decode (n == 1) fusion: finish(il) and predict(next_il) in ONE cached graph - the router prediction for the next
