@@ -108,6 +108,12 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   | prose | 25.83 | 14.89 | - | 19.13 | 141.1 | 0.74x (BOTH LOOP, see below) |
   *different text (residency-dependent routing).  Q2_K sidecar = +2.76 GB of expert slots -> ~+3 pt VRAM hits ->
   verify -12..-17 ms; its acceptance cost is ~0 here (harness: -0.047).
+- **Upstream ggml fixes APPLIED** (`tools/v41/ggml/upstream-fixes.patch`: #30103 flash-attn tile race, #29953 MMQ
+  OOB reads).  #29953 changed `mmq_args`' last field (ncols_opt -> J_best): Strata's positional init in
+  `src/prefill/moe_mmq.cu` passed max_rows there -> GGML_ABORT "J_best=75"; fixed (J_best computed as ggml's host code)
+  + identity id buffers padded 128 ints.  Verified: 512-token prefill logits md5 IDENTICAL pre/post patch and run to
+  run (`~/AI/v41-dev/d2/det_pair.sh`), DSpark decode 256 tokens identical.  The prefill was already deterministic;
+  plain decode's near-tie flips are not explained by #30103.  Timing noise on identical work: ~+-5% tok/s.
 - **Depth sweep** (final config): docs depth 3/4/5 = 38.27/39.51/34.19 tok/s, python 30.42/31.66/30.61 -> keep 4.
 - **PCIe is the wall** (nsys, `STRATA_PROFILE_DECODE=1` + `nsys --capture-range=cudaProfilerApi`): ~100 expert DMAs
   (9.6 MB avg, 23 GB/s) per verify pass = 1.4 s of a 4.2 s decode; kernels are cheap.  So: fewer misses (VRAM for

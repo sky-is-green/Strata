@@ -7,7 +7,9 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 #include <cstdlib>
 
 namespace strata::prefill::mmq {
@@ -207,11 +209,30 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
+    // The tile width J_best, chosen as ggml's mmq.cu host code does since upstream #29953 (mmq_args' last field was
+    // ncols_opt - the per-expert row count - and is now J_best: passing max_rows there launched an invalid tile,
+    // GGML_ABORT "J_best=75").  Smallest tile count over J = 8..128 among the configs that fit shared memory.  The
+    // kernels read up to J_best - 1 columns / ids past the end: xq carries 128 blocks of slack (q8_1_bytes) and the
+    // identity id buffers 128 ints (prefill.cpp).
+    int64_t J_best = 0;
+    {
+        const int dev = ggml_cuda_get_device(), cc = ggml_cuda_info().devices[dev].cc;
+        const size_t smpbo = ggml_cuda_info().devices[dev].smpbo;
+        const bool fallback = ggml_cuda_mmq_needs_fallback(p.w_rows);
+        int64_t ntiles_best = INT64_MAX;
+        for (int J = 8; J <= 128 && ntiles_best > 1; J += 8) {
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(t, J, fallback, cc);
+            if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) continue;
+            const int64_t nt = (p.max_rows + config.J - 1) / config.J;
+            if (nt < ntiles_best) { J_best = J; ntiles_best = nt; }
+        }
+        if (J_best <= 0) throw std::runtime_error("moe_mmq: no MMQ tile fits");
+    }
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows, J_best};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {
