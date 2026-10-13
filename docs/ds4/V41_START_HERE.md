@@ -94,6 +94,25 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 9c (2026-10-14 ~01:15) - QUALITY BASELINE (item 3a) DONE: the decode route bias costs ~14 pt API top-1
+- Tools: `tools/v41/quality/build_cases.py` (DwarfStar's 112 official V4.1 fixtures, `--out ~/AI/v41-dev/quality`) +
+  `score_official.py run|score` (one `--serve` process, `STRATA_SERVE_DUMP_TAIL` rows).  Results dirs
+  `~/AI/v41-dev/quality/q_exact`, `q_bias`.  Teacher-forced over the API's sampled continuations (6,922 positions).
+  | config | NLL | API top-1 | top-20 overlap (lower bound) |
+  |---|---|---|---|
+  | ours, exact routing (`STRATA_SERVE_PASS_BIAS=0`), all 112 | 0.4899 | 86.94% | 0.8724 |
+  | ours, **decode route bias on** the short turns (`PASS_BIAS=1`), all | **1.0303** | **74.14%** | 0.7287 |
+  |  short group (102): exact / bias | 0.5161 / 1.1111 | 86.21% / **72.13%** | 0.8654 / 0.7072 |
+  |  long group (10, batch path = exact in both: the control) | 0.2322 / 0.2372 | 94.06% / 93.91% | 0.9410 / 0.9402 |
+  | DwarfStar IQ2_XXS-Q2_K (their results/base-default.tsv) all / short / long | 0.3968 / 0.4184 / 0.1851 | 90.35% / 89.87% / 95.00% | 0.9076 (all) |
+  **The route bias (--route-bias 1.0, file penalty 0.6) halves per-token agreement quality**: top-1 -14 pt, NLL x2.15
+  on the tokens it routes.  The earlier "ppl 2.38 -> 2.67" understated it.  Plus the repetition loops (9b).  This is
+  the decode speed/quality trade Mal chose on 2026-10-11 - re-decide with these numbers (DSpark makes exact-ish routing
+  cheaper: verify passes can run bias-off at some speed cost - not yet measured).
+- Ours vs DwarfStar Q2, exact: long -0.9 pt, short -3.7 pt.  NOT the serving path: the short cases through the
+  layer-major batch (`q_batch_short`) = 86.15% vs passes 86.21% (paired -0.06 pt, 95% CI [-0.35, +0.23]).  So the gap
+  is our weights (GSQ) / numerics vs DwarfStar's IQ2_XXS-Q2_K - a baseline for the dense/expert quant decisions.
+
 ### NEXT DESIGN ITEM (not started - needs Mal's go): DSpark in `--serve` (the speedup is one-shot only today)
 Why it matters: the Quetza wrappers talk to `ds41_generate --serve` (`tools/v41/serve/ds41-engine.sh`, binary
 `build-ds4-gpu`), so tonight's 1.3-1.5x is not reachable from Quetza yet.  Blocker: serve samples at **temperature 1.0,
