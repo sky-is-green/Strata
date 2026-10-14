@@ -217,6 +217,28 @@ inline std::vector<TensorWant> layer_tensors(const ModelGeometry& g, int64_t lay
     return t;
 }
 
+/// Tensors a layer MAY carry: present in the Scion container (embedded correction branches), absent in the
+/// base qwen35moe files.  They are shape-checked and named when present, never required.
+inline std::vector<TensorWant> optional_layer_tensors(const ModelGeometry& g, int64_t layer) {
+    if (g.family != strata::ModelFamily::Qwen35Moe) return {};
+    const int64_t N = g.n_embd, NE = g.n_expert, R = 512, RR = 256;   // the release's correction ranks
+    std::vector<TensorWant> t;
+    auto add = [&](const char* s, std::vector<int64_t> shape) { t.push_back({s, std::move(shape)}); };
+    add("ffn_moe_out.weight.lora_a", {N, R});
+    add("ffn_moe_out.weight.lora_b", {R, N});
+    add("ffn_gate_inp.weight.lora_a", {N, RR});
+    add("ffn_gate_inp.weight.lora_b", {RR, NE});
+    const LayerKind kind = layer_kind(g, layer);
+    if (kind == LayerKind::Gdn) {
+        add("ssm_out.weight.lora_a", {g.ssm_value_dim, R});
+        add("ssm_out.weight.lora_b", {R, N});
+    } else if (kind == LayerKind::Attention) {
+        add("attn_output.weight.lora_a", {g.n_head * g.head_dim, R});
+        add("attn_output.weight.lora_b", {R, N});
+    }
+    return t;
+}
+
 /// The tensors outside the layers, by family.  (Flash-Next's output_norm, PLE and n-gram tables are not listed:
 /// the published files place them differently, and their loaders check them.)
 inline std::vector<TensorWant> global_tensors(const ModelGeometry& g) {
@@ -270,6 +292,13 @@ inline bool check_gguf_layout(const strata::GgufModel& m, const ModelGeometry& g
     for (int64_t l = 0; l < g.n_layers + g.n_mtp_layers; ++l)
         for (const TensorWant& w : layer_tensors(g, l))
             if (!check("blk." + std::to_string(l) + "." + w.name, w.shape)) return false;
+    // the optional corrections: checked and named when the file carries them, not required otherwise
+    for (int64_t l = 0; l < g.n_layers + g.n_mtp_layers; ++l)
+        for (const TensorWant& w : optional_layer_tensors(g, l)) {
+            const std::string name = "blk." + std::to_string(l) + "." + w.name;
+            if (m.find(name) == nullptr) continue;
+            if (!check(name, w.shape)) return false;
+        }
     if (layout_table_complete(g)) {
         for (size_t s = 0; s < m.size(); ++s)
             for (const strata::TensorInfo& t : m.shard(s).tensors())

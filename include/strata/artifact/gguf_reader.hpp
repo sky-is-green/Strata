@@ -115,6 +115,10 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 43:
+        return "Q1_0_g128";   // the Scion corrections' g128 2-bit container (34 B / 128), same block as PQ2_0
+    case 142:
+        return "PQ2_0";
     case 143:
         return "PTQ1_0";
     case 144:
@@ -148,6 +152,14 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 143:
         elems = 128;
         bytes = 28;
+        return true;
+    case 142:   // PQ2_0: Q2_0's 2-bit codec at group size 128 (the Scion 35B's experts)
+        elems = 128;
+        bytes = 34;
+        return true;
+    case 43:    // Q1_0_g128: the Scion corrections' g128 2-bit container (the same 34-byte block as PQ2_0)
+        elems = 128;
+        bytes = 34;
         return true;
     case 144:
         elems = 32;
@@ -627,7 +639,7 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
         "qwen35moe.expert_count", "qwen35moe.expert_used_count", "qwen35moe.expert_feed_forward_length",
         "qwen35moe.expert_shared_feed_forward_length", "qwen35moe.ssm.conv_kernel", "qwen35moe.ssm.state_size",
         "qwen35moe.ssm.group_count", "qwen35moe.ssm.time_step_rank", "qwen35moe.ssm.inner_size",
-        "qwen35moe.full_attention_interval", "qwen35moe.nextn_predict_layers",
+        "qwen35moe.full_attention_interval",
     };
     for (const char* k : keys) {
         const MetaValue* v = g.get(k);
@@ -635,8 +647,10 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
         if (!v->is_num()) return std::string(k) + " is not a number";
     }
     const MetaValue* nl = g.get("qwen35moe.block_count");
+    // nextn_predict_layers is optional: a file without an in-file MTP block (a sidecar-drafter release,
+    // e.g. Scion 35B-A3B) simply carries no nextn tensors and the block count is the trunk.
     const MetaValue* mtp = g.get("qwen35moe.nextn_predict_layers");
-    if (mtp->u >= nl->u) return "qwen35moe.nextn_predict_layers is not smaller than qwen35moe.block_count";
+    if (mtp != nullptr && mtp->u >= nl->u) return "qwen35moe.nextn_predict_layers is not smaller than qwen35moe.block_count";
     if (g.get("qwen35moe.full_attention_interval")->u < 2)
         return "qwen35moe.full_attention_interval must be at least 2 (the GDN / attention pattern)";
     return {};

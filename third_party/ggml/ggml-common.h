@@ -194,6 +194,16 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// PQ2_0 (ggml type 142): Q2_0's 2-bit codec at group size 128 (one fp16 scale per 128 weights) - the
+// Scion 35B's expert container.  Distinct from the group-64 Q2_0 (type 42); the layout is the fork's
+// ggml-common.h block_pq2_0, and the row/kernel semantics are vec_dot_pq2_0_q8_1's below.
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                 // delta (scale)
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
 // PTQ1_0 (Scion type 143): ternary at group size 128 with one fp16 scale per block, 'qs' and 'qh' carrying
 // five / four trits per byte in base 3 (the TQ1_0 packing; the fork's ggml-common.h, commit 01fd9521c).
 #define QK_PTQ1_0 128

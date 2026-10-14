@@ -1867,9 +1867,14 @@ struct Engine {
         const auto t0 = Clock::now();
         warming = true;
         const int32_t filler = 198;   // a newline: any token works
-        std::vector<int32_t> toks((size_t) tmax, filler);
-        process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
-        if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
+        // the warm-up's three passes together never write past the context: the per-layer K/V caches (and the
+        // FP16 prompt copies) hold `ctx` cells, so with a --max-context below the prompt chunk the first pass is
+        // min(tmax, ctx - (kGemmT + 1) - 1) tokens and the two smaller passes fit after it.
+        const int64_t room = std::max<int64_t>(1, ctx - (kGemmT + 1) - 1);
+        const int64_t wn = std::min<int64_t>(tmax, room);
+        std::vector<int32_t> toks((size_t) wn, filler);
+        process(toks.data(), wn, [](int64_t) {});
+        if (wn > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
         if (mtp_d > 0) {
             std::vector<int32_t> fix, drafts;

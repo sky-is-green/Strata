@@ -95,6 +95,36 @@ __device__ __forceinline__ float vec_dot_q2_0_q8_1(const void* __restrict__ vbq,
     return d2 * d8 * sumi;
 }
 
+// PQ2_0 (Scion 35B type 142): Q2_0's 2-bit codec at group size 128 - one fp16 scale per 128 weights, so one
+// call consumes the whole block against the four q8_1 blocks at the pass base.  Chunk for chunk the fork's
+// vec_dot_pq2_0_q8_1 (ggml-cuda/vecdotq.cuh), summed in the same order.
+__device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_pq2_0* bq = (const block_pq2_0*) vbq + kbx;
+    const float d2 = bq->d;
+    float acc = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const int16_t* qs = (const int16_t*) bq->qs + chunk * 4;
+        const block_q8_1* q8 = bq8_1 + chunk;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q = qs[j];
+            const int u = get_int_b4(q8->qs, j * 2 + 0);
+            const int v = get_int_b4(q8->qs, j * 2 + 1);
+            const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+            const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+            const int qx = __byte_perm(qe, qo, 0x5140);
+            const int qy = __byte_perm(qe, qo, 0x7362);
+            sumi = ggml_cuda_dp4a(u, qx, sumi);
+            sumi = ggml_cuda_dp4a(v, qy, sumi);
+        }
+        acc += d2 * __low2float(q8->ds) * (float) sumi;
+    }
+    return acc;
+}
+
 // PTQ1_0 (Scion type 143, the fork's vec_dot_ptq1_0_q8_1_multi in ggml-cuda/vecdotq.cuh, MIT): 128 ternary
 // values per block with one fp16 scale; one call consumes the whole block, i.e. the four q8_1 blocks at
 // bq8_1[iqs..iqs+4) of the pass base.  The packed bytes are multiplied by 3 stage by stage with the per-lane
@@ -715,6 +745,10 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+// PQ2_0 (Scion 35B type 142): as PTQ1_0, one call per 128-value block (the dot consumes the four q8_1 blocks
+// of the pass base).
+template<> struct Fmt<142> { static constexpr int qk = 128, ipb = 1, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_pq2_0_q8_1(v, y, kbx, iqs); } };
 // PTQ1_0: one call per 128-value block (the dot consumes all four q8_1 blocks of the pass base)
 template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 1, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_ptq1_0_q8_1(v, y, kbx, iqs); } };
@@ -738,15 +772,15 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(143)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(142) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(143)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(143)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(142) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(143)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(143)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(142) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(143)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(143)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(142) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(143)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(143)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
@@ -799,9 +833,9 @@ template<int TY> struct Split;
 // time, so the multi kernels are never instantiated for a type without a Split).
 template<int TY> inline constexpr bool kSplit = false;
 // The sub-16-lane kernels walk the activation as 80/20 q8_1 blocks (the IQ formats' 256-value blocks).
-// PTQ1_0's split consumes four q8_1 blocks per call (qk 128, ipb 1), so that mapping does not apply and
-// it stays on the 32-lane multi kernels (whose k < nb * ipb loop is the same order, bitwise equal).
-template<int TY> inline constexpr bool kSub16 = (TY != 143);
+// PTQ1_0's and PQ2_0's splits consume four q8_1 blocks per call (qk 128, ipb 1), so that mapping does not
+// apply and they stay on the 32-lane multi kernels (whose k < nb * ipb loop is the same order, bitwise equal).
+template<int TY> inline constexpr bool kSub16 = (TY != 143 && TY != 142);
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 22 || TY == 29);
 
 template<> inline constexpr bool kSplit<16> = true;
@@ -1199,6 +1233,40 @@ template<> struct Split<143> {   // PTQ1_0
 #pragma unroll
         for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
         return r.dw * acc;
+    }
+};
+
+template<> inline constexpr bool kSplit<142> = true;
+template<> struct Split<142> {   // PQ2_0 (Scion 35B): Q2_0's 2-bit codec at group size 128
+    struct W { int q[32]; float d2; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        (void) iqs;   // the whole block decodes in one load
+        const block_pq2_0* bq = (const block_pq2_0*) vbq + kbx;
+        W r;
+        r.d2 = __half2float(bq->d);
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {   // 32 bytes = 4 codes each = 128
+            const int b = bq->qs[j];
+            uint32_t v = 0;
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+                v |= (uint32_t) ((((b >> (2 * t)) & 3) - 1) & 0xFF) << (8 * t);   // codes 0..3 -> -1,0,1,2
+            r.q[j] = (int) v;
+        }
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                sumi[k] = ggml_cuda_dp4a(r.q[8 * k + j], get_int_b4(bq8_1[iqs + k].qs, j), sumi[k]);
+        float acc = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc += r.d2 * __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+        return acc;
     }
 };
 
@@ -2055,6 +2123,31 @@ __device__ void dq_ptq1_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 
+// PQ2_0 (Scion 35B type 142): the fork's dequantize_row_pq2_0 code for code - Q2_0's 2-bit codec at group
+// size 128, one fp16 scale per block, value d * (code - 1).  One "superblock" = 256 values = 2 blocks of 128;
+// thread tid writes 8 values of one block (the same shape as dq_q2_0/dq_ptq1_0).
+template<typename dst_t>
+__device__ void dq_pq2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_pq2_0* x = (const block_pq2_0*) vx + ibs * 2;
+    const int b = tid / 16, part = tid % 16;
+    const float d = __half2float(x[b].d);
+    for (int j = 0; j < 8; ++j) {
+        const int i = part * 8 + j;
+        const int code = (x[b].qs[i / 4] >> ((i % 4) * 2)) & 3;
+#if defined(__HIPCC__) && ((defined(__gfx1012__) && HIP_VERSION_MAJOR < 7) || defined(__gfx1151__) || \
+    defined(__gfx1200__) || defined(__gfx1201__))
+        // the same half-path sign preservation as dq_q2_0: code 1 is a stored zero, the scale's sign must survive
+        if constexpr (std::is_same_v<dst_t, __half>) {
+            if (code == 1) {
+                yy[b * 128 + i] = __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
+                continue;
+            }
+        }
+#endif
+        yy[b * 128 + i] = cvt<dst_t>(d * (float) (code - 1));
+    }
+}
+
 // llama.cpp's dequantize_q4_K / dequantize_q5_K (dequantize.cuh; q5_K's 64 threads folded onto 32) and the 32-value
 // blocks of Q5_1 / Q8_0, 8 of them per 256-value "superblock" (thread tid writes 8 values of block tid % 8).
 __device__ __forceinline__ void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
@@ -2229,6 +2322,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
+        case 142: dq_pq2_0(vx, ibs, y, tid); break;
         case 143: dq_ptq1_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
@@ -2281,7 +2375,8 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 142 ||
+           t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 143;
 #else
@@ -3090,6 +3185,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 143: return (size_t) (n / 128) * sizeof(block_ptq1_0);
+        case 142: return (size_t) (n / 128) * sizeof(block_pq2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
