@@ -58,6 +58,8 @@ namespace {
 
 struct Args {
     std::string model, ids_csv, ids_file, rank, dump_logits, dump_last;
+    std::string build_mirror;      // --build-mirror F [--mirror-gib N]: write the blob mirror (coldest experts by --rank) and exit
+    double mirror_gib = 85.0;
     std::string prune;            // --prune F: "layer expert" lines (coldest first - v41_prune_list.py), soft or hard pruned
     float prune_penalty = 0.0f;   // --prune-penalty X: selection bias -X on the listed experts (0 = masked out of routing)
     float route_bias_file = 0.6f;    // --route-bias-file X: selection penalty -X on file-tier experts (neither VRAM nor RAM arena);
@@ -108,6 +110,9 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
         else if (k == "--arena-gib") a.arena_gib = std::atof(next().c_str());
         else if (k == "--rank") a.rank = next();
+        else if (k == "--build-mirror") a.build_mirror = next();
+        else if (k == "--check-mirror") { a.build_mirror = next(); a.mirror_gib = -1; }
+        else if (k == "--mirror-gib") a.mirror_gib = std::atof(next().c_str());
         else if (k == "--vram-lru") a.vram_lru = true;
         else if (k == "--no-vram-lru") a.vram_lru = false;
         else if (k == "--arena-adapt") a.arena_adapt = true;
@@ -146,7 +151,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--enc-replay") a.enc_replay = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); return false; }
     }
-    return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty());
+    return !a.model.empty() && (a.serve || !a.ids_csv.empty() || !a.ids_file.empty() || !a.build_mirror.empty());
 }
 
 double now_ms() {
@@ -239,6 +244,27 @@ int main(int argc, char ** argv) {
     if (!parse(argc, argv, a)) {
         std::fprintf(stderr, "usage: see tools/v41/engine/ds41_generate.cpp\n");
         return 2;
+    }
+    if (!a.build_mirror.empty()) {   // the second-drive blob mirror (STRATA_BLOB_MIRROR): coldest experts first
+        std::string err;
+        if (a.mirror_gib < 0) {   // --check-mirror F: open it with every blob compared against the model file
+            setenv("STRATA_BLOB_MIRROR", a.build_mirror.c_str(), 1);
+            setenv("STRATA_BLOB_MIRROR_CHECK", "0", 1);
+            Ds41FileBlobs chk(a.model);
+            if (!chk.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
+            return chk.mirrored() > 0 ? 0 : 1;
+        }
+        Ds41FileBlobs src(a.model);
+        if (!src.open(err)) { std::fprintf(stderr, "ds41_generate: experts: %s\n", err.c_str()); return 1; }
+        if (a.rank.empty()) { std::fprintf(stderr, "ds41_generate: --build-mirror needs --rank\n"); return 2; }
+        std::vector<std::pair<int32_t, int32_t>> order = ds41_read_ranked(a.rank, err);
+        if (order.empty()) { std::fprintf(stderr, "ds41_generate: --rank: %s\n", err.c_str()); return 1; }
+        std::reverse(order.begin(), order.end());
+        if (!src.build_mirror(a.build_mirror, order, (uint64_t) (a.mirror_gib * 1073741824.0), err)) {
+            std::fprintf(stderr, "ds41_generate: build-mirror: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
     }
     std::vector<int> prompt = a.ids_csv.empty() ? std::vector<int>() : parse_csv(a.ids_csv);
     if (!a.ids_file.empty()) {

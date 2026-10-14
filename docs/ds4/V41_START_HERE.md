@@ -44,7 +44,10 @@ tier metadata packing / tier CUDA graph `STRATA_TIER_GRAPH` / demand-copy overla
 bit-identical, all neutral: host calls under a busy device) · `--pf-b` other than 1.43 · bigger arena (62/65 GiB:
 neutral) · speculative NVMe reads as implemented (`STRATA_SPEC_TOP`: tier -1.4 ms but its extra predict graph +1.4 and
 decode-thread issuing +1.2 ate it) · attention-level levers (KV quant, window, MLA absorb, split-K: <= 0.7 ms total) ·
-quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft penalties only - Mal).
+quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft penalties only - Mal) · **striping the
+file tier over a SECOND drive** (`STRATA_BLOB_MIRROR`: an 84 GiB mirror of the coldest experts on NVME1TB, the share
+of a blob's parts read from it - the pattern does +33% in the microbench and NOTHING in the engine at arena 64 AND
+at arena 32; the file tier is not bandwidth-bound. Session 12 block, 2026-10-15).
 
 ## 5. State at shutdown (2026-10-13 ~06:00, session 5) - nothing is running; resume from here
 - **DSpark teacher test: DONE.**  Teacher (FP8) states 0.437 accepted/pass vs ours 0.405 (`~/AI/v41-dev/dspark/
@@ -179,6 +182,56 @@ ee2845ca (+ serve defaults / docs).
   ~3-5 days.
 - Relay: the overnight chronos wake works (cron 17 * * * * ds4-overnight-nudge.sh -> `relay wait` background task,
   re-armed after every wake; nudge fired from cron/systemd-run, never from the target window).
+
+### Session 12 (2026-10-15 05:00-06:00) - second-drive mirror: MEASURED DEAD END (+ why); warm reseed; wave queue depth
+Logs / scripts: `~/AI/v41-dev/s12/` (run1 mirror A/B, run2 serve turns + controls, run3 wave depth, run4 arena 32
+mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
+- **Read this first: the 512K turn bench's run-to-run spread is 1.5-4.3%.**  The SAME config re-run back to back
+  (`w0` vs `w0b`, identical env): fresh 8000 31.51 -> 31.98 s, +61 8.07 -> 8.42, +273 10.75 -> 11.12, +1001 16.65 ->
+  17.06, and the short decodes swing 2.76 -> 3.09 s (+12%).  A single run pair cannot resolve anything smaller; the
+  second run of a session is systematically slower.  Use >= 3 alternations, and quote both baselines.
+- **Second-drive blob mirror - built, verified, and it does NOT pay** (`--build-mirror F [--mirror-gib G]`,
+  `--check-mirror F`; runtime `STRATA_BLOB_MIRROR=<file>` + `STRATA_BLOB_MIRROR_SHARE` per mille of a mirrored blob's
+  parts, default 0.28).  NVME1TB had 91 GB free, so 84.0 GiB of the 8817 coldest (layer, expert) - the whole 8241
+  file tier + the coldest arena experts - were packed there in 81 s at 1.1 GB/s by the engine's own reader;
+  `--check-mirror` re-reads every mirrored blob and compares it byte for byte (8817/8817 identical).  `read_part`
+  sends the share's parts (at 8 parts, 0.28 = parts 2 and 5) to it, so both drives serve one blob at once.
+  - **The pattern itself is fine** (rb2 = the engine's wave-reader pattern, 6.75 MiB blobs, 8 parts, 32 workers,
+    random 4K offsets): model drive alone **6.22 GB/s**, mirror alone 3.26, both with 2/8 parts on the mirror
+    **8.29 GB/s (+33%)**; 3/8 -> 7.95, 4/8 -> 6.19 (the mirror's own ceiling is the binding term above 3/8).
+  - **In the engine: nothing.**  512K turns (mirror / no mirror / the re-run): fresh 8000 32.15 / 31.51 / 31.98,
+    +273 11.23 / 10.75 / 11.12, +1001 17.14 / 16.65 / 17.06 - the mirror sits inside the spread.  One-shot 4096,
+    bit-identical stream (code prompt: same 14586/191/46663/4721 expert counts): decode 9.89 vs 9.74 s (+1.5%), with
+    the mirror drive demonstrably serving ~19 GB in the run (block counters on nvme1n1).  Positive control at
+    `--arena-gib 32` (11647 file experts, the 271-token prompt reads 10234 blobs = 69 GB, 2x the production load):
+    prompt 51.64 / 52.76 s, decode 11.54 / 12.03 s - still inside the spread.
+  - **Why** (the useful part): the file tier is not bandwidth-bound in this engine.  The +273 turn reads 3161 file
+    blobs (21.3 GB) inside a 7.45 s experts phase whose remainder is the arena experts' PCIe DMA + kernels + syncs;
+    the wave reader's own rate is ~5.3-6.2 GB/s (rb2).  Splitting a blob across two drives adds a straggler (the
+    mirror's per-part service time is ~2x the PM9A1's) and buys throughput the pipeline does not want.  A second
+    drive only pays if the file tier must move 2x the bytes - and even arena 32 (2x the file-tier traffic) did not.
+  - The 84 GiB mirror file is still at `/media/mal/NVME1TB/Models/V41-Mirror/V41-GSQ.experts.mirror` (the drive is
+    ~97% full).  Rebuildable in 81 s; delete it if the space is wanted.
+- **warm_reseed** (`release_cache` remembers the (layer, expert) that held VRAM slots, most-recently-used first; the
+  next seed fills the first `STRATA_WARM_SHARE` per mille (default 500) of the slots from that list instead of the
+  global rank): coded, measured, and **default OFF** (`STRATA_WARM_RESEED=1` to try it).  512K: +273 10.48 vs
+  10.75 / 11.12, +1001 16.88 vs 16.65 / 17.06, decode right after a batch 3.12 s / 192 file reads vs 2.76 / 144 -
+  inside the spread, and the seed reads 48 MORE file-tier blobs, because the LRU set at release is largely the
+  experts that just missed.  Do not build on it without a >= 3-run measurement.
+- **Wave-reader queue depth is the one lever that moved** (`STRATA_WAVE_THREADS` / `STRATA_WAVE_PARTS`): 64 x 16
+  (one run, vs the two baselines above) gave **fresh 8000-token batch 29.56 s (dense 10.15 + experts 19.33) vs
+  31.51 / 31.98 (experts 20.38 / 20.71)** = -7%/-8%, with +61 / +273 / +1001 unchanged inside the spread.  The
+  microbench agrees on the direction: rb (one blob at a time) 8 outstanding reads 4.72 GB/s, 16 -> 5.22; rb2
+  (32 workers x 8 parts = 256 outstanding) 6.22 GB/s.  `ds41-engine.sh` (the serve wrapper) now sets 64 x 16; the
+  code default stays 32 x 8.  **Re-measure with repeats before trusting it for the small turns.**
+- **O_DIRECT bounce + memcpy tax: 3%**, not worth a direct-read path (rb `bounce` 0/1: 4.72 / 4.58 GB/s at P=8,
+  5.22 / 5.09 at P=16 - `read_direct` reads into a bounce buffer and memcpys because a blob's spans are only
+  4K-aligned at the ends).
+- **One-shot prompt accounting caveat** (for anyone reading the one-shot bench's prompt numbers): the prompt wall
+  includes the DSpark seed tail - the last `min(128, L-1)` prompt tokens run through `pass_v` as 16-token passes
+  AFTER the batch, and their tier time is not in `fd_dense` / `fd_tier`.  A 271-token python prompt: 30.32 s wall =
+  10.4 s of feed (dense 3.4 + experts 6.9 + logits 0.1) + the ~20 s tail (+ the deferred VRAM seed).  In `--serve`
+  a batch turn takes that tail from the batch itself, so the serve numbers are not comparable.
 
 ### Session 10b (2026-10-14 19:40-21:10) - DSpark IN --serve (speculative SAMPLING), crash fix UNTESTED; research
 **Read this block first.**  Mal's go 2026-10-14: (1) default x0.5 + arena-adapt + draft K=64 + arena 64 GiB, (2) DSpark

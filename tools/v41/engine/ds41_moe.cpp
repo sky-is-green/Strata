@@ -32,6 +32,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "strata/artifact/ds4_geometry.hpp"
 #include "ds41_geometry.hpp"
@@ -548,6 +549,10 @@ struct Ds41MoeImpl {
     std::vector<int64_t> vlast;       ///< vram_lru: (layer, expert) -> the run() call that last used its VRAM copy
     std::vector<int64_t> vmiss;       ///< vram_lru: (layer, expert) -> the layer's call count at its last miss
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
+    /// warm_reseed: (layer, expert) that held a VRAM slot when the cache was last released, most recently used
+    /// first.  A seed consumes it: those experts fill the first STRATA_WARM_SHARE (default 500) per mille of the
+    /// slots, the global rank the rest.  Empty = off.
+    std::vector<std::pair<int32_t, int32_t>> warm;
 #if defined(DS4_MOE_CUDA)
     std::unique_ptr<ChunkStage> cstage;   ///< chunk_prefetch: the two pinned slabs
 #endif
@@ -1538,6 +1543,40 @@ std::vector<std::pair<int32_t, int32_t>> drop_excluded(const Ds41MoeImpl& im, co
     return kept;
 }
 
+/// warm_reseed: the order a seed fills the VRAM cache in, after a released cache.  The first `share` per mille of
+/// `want` slots go to the experts released with a slot, most recently used first - those are the ones this
+/// conversation routes to.  The rest, and everything when there is nothing warm, come from the global rank.
+/// Consumes `im.warm` (a release always writes a fresh list).
+std::vector<std::pair<int32_t, int32_t>> warm_first(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t want) {
+    if (im.warm.empty() || want <= 0) return ranked;
+    const char* ws = std::getenv("STRATA_WARM_SHARE");
+    const int64_t share = ws ? std::max(0, std::min(1000, std::atoi(ws))) : 500;
+    if (share <= 0) { im.warm.clear(); return ranked; }
+    const int64_t take = std::max<int64_t>(1, (want * share) / 1000);
+    std::vector<char> seen((size_t) (im.g.n_layers * im.g.n_experts), 0);
+    std::vector<std::pair<int32_t, int32_t>> out;
+    out.reserve(ranked.size() + im.warm.size());
+    int64_t n = 0;
+    for (const auto& le : im.warm) {
+        if (n >= take) break;
+        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        char& sn = seen[(size_t) (le.first * im.g.n_experts + le.second)];
+        if (sn) continue;
+        sn = 1;
+        out.push_back(le);
+        ++n;
+    }
+    im.warm.clear();
+    for (const auto& le : ranked) {
+        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        char& sn = seen[(size_t) (le.first * im.g.n_experts + le.second)];
+        if (sn) continue;
+        sn = 1;
+        out.push_back(le);
+    }
+    return out;
+}
+
 bool Ds41MoeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;
     return build_arena(arena_order(*im_, drop_excluded(*im_, ranked_all)), err);
@@ -1588,14 +1627,17 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
     const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
+    // the order the slots fill in.  A per-layer-sized cache (MiMo) keeps the rank: its sizes list above pairs slot
+    // i with ranked[i].  Everywhere else a preceding release_cache() supplies the warm set.
+    const std::vector<std::pair<int32_t, int32_t>> fill_order = im_->mixed_sizes ? ranked : warm_first(*im_, ranked, want);
     int64_t filled = 0;
-    // vram_lru: the LRU's starting order = the profile's rank: the coldest seeded expert goes first
+    // vram_lru: the LRU's starting order = the fill order: the last-seeded expert goes out first
     auto lru_seed_order = [&](int64_t n_seeded) {
         if (!im_->cfg.vram_lru) return;
         const int64_t NX = im_->g.n_experts;
         im_->vlast.assign((size_t) (im_->g.n_layers * NX), -1);
         int64_t r = 0;
-        for (const auto& le : ranked) {
+        for (const auto& le : fill_order) {
             if (r >= n_seeded) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= NX) continue;
             int64_t& v = im_->vlast[(size_t) (le.first * NX + le.second)];
@@ -1610,7 +1652,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         // ~7 s for ~1850 experts after a prompt).  Same slots, same bytes.
         strata::core::ExpertCache& cache = *im_->gpu->cache;
         std::vector<std::array<int64_t, 3>> fjobs;   // slot, layer, expert
-        for (const auto& le : ranked) {
+        for (const auto& le : fill_order) {
             if (filled >= want) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
             if (cache.slot_of(le.first, le.second) >= 0) continue;
@@ -1664,7 +1706,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         im_->admitted = filled;
         return true;
     }
-    for (const auto& le : ranked) {
+    for (const auto& le : fill_order) {
         if (filled >= want) break;
         if (im_->mixed_sizes) {   // keep slot i == the i-th distinct routed entry (the sizes list above)
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
@@ -4348,6 +4390,30 @@ void Ds41MoeTier::release_cache() {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->cache) return;
     cudaDeviceSynchronize();   // no copy or kernel may still read a slot
+    // warm_reseed (STRATA_WARM_RESEED=1 = on; OFF by default until it shows an effect): before the slots go, record
+    // what held them and when it was last used.  The seed after this release puts those experts back first, so a
+    // decode that follows a prompt turn starts from the set this conversation routes to instead of the global rank
+    // (the batch path needs the VRAM, so the slots themselves cannot stay).  Measured 512K, 4 turns: inside the
+    // bench's 1.5-4.3% run-to-run spread, and the seed reads MORE file-tier blobs (144 -> 192) - the LRU set at
+    // release is largely the experts that just missed.
+    im_->warm.clear();
+    if (std::getenv("STRATA_WARM_RESEED") ? std::atoi(std::getenv("STRATA_WARM_RESEED")) != 0 : false) {
+        const int64_t NX = im_->g.n_experts;
+        std::vector<std::pair<int64_t, int64_t>> ord;   // (last use, layer * NX + expert)
+        ord.reserve(2048);
+        for (int64_t l = 0; l < im_->g.n_layers; ++l) {
+            for (int64_t e = 0; e < NX; ++e) {
+                if (im_->gpu->cache->slot_of(l, e) < 0) continue;
+                const int64_t u = im_->vlast.size() ? im_->vlast[(size_t) (l * NX + e)] : -1;
+                ord.emplace_back(u, l * NX + e);
+            }
+        }
+        std::sort(ord.begin(), ord.end(), [](const std::pair<int64_t, int64_t>& a, const std::pair<int64_t, int64_t>& b) {
+            return a.first > b.first;   // most recently used first (vlast = the tick of its last use)
+        });
+        im_->warm.reserve(ord.size());
+        for (const auto& p : ord) im_->warm.emplace_back((int32_t) (p.second / NX), (int32_t) (p.second % NX));
+    }
     im_->gpu->cache.reset();
     im_->admitted = 0;
     im_->pf_n = 0;             // staged prefetches are keyed by expert, not slot - but they belong to the old decode
@@ -4604,6 +4670,7 @@ Ds41FileBlobs::Ds41FileBlobs(std::string gguf) : path_(std::move(gguf)) {}
 Ds41FileBlobs::~Ds41FileBlobs() {
     if (fd_ >= 0) ::close(fd_);
     if (dfd_ >= 0) ::close(dfd_);
+    if (mfd_ >= 0) ::close(mfd_);
     for (uint8_t* p : ball_) std::free(p);
 }
 
@@ -4703,18 +4770,194 @@ bool Ds41FileBlobs::open(std::string& err) {
         smax = std::max<uint64_t>(smax, (uint64_t) d_rb_[c] * (uint64_t) g_.n_embd);
     }
     scratch_ = (size_t) smax + 8192;   // the largest role span + the 4096-rounding a pread adds on both ends
+    const char* mp = std::getenv("STRATA_BLOB_MIRROR");
+    if (mp && mp[0] && part_direct_ && dfd_ >= 0) {
+        std::string merr;
+        if (!open_mirror(mp, merr)) std::fprintf(stderr, "blob mirror: NOT used (%s)\n", merr.c_str());
+    }
     return true;
 }
 
-bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const {
-    if (dfd_ < 0 || !scratch || !n) return false;
+// The mirror file: a 4096-byte-aligned header, then the blobs, each [gate | up | down] padded to 4096.
+//   header: "S41MIRR1", u64 source file size, u64 n, u64 data start; then n x {i32 layer, i32 expert, u64 offset}
+namespace {
+struct MirrorHead { char magic[8]; uint64_t src_size, n, data; };
+struct MirrorEnt { int32_t l, e; uint64_t off; };
+}
+
+bool Ds41FileBlobs::open_mirror(const char* path, std::string& err) {
+    const int fd = ::open(path, O_RDONLY | O_DIRECT);
+    if (fd < 0) { err = std::string("cannot open ") + path + " O_DIRECT"; return false; }
+    auto fail = [&](const std::string& m) { ::close(fd); err = m; return false; };
+    struct stat st{}, ss{};
+    if (::fstat(fd, &st) != 0 || ::fstat(fd_, &ss) != 0) return fail("fstat");
+    uint8_t* h = (uint8_t*) std::aligned_alloc(4096, 4096);
+    std::unique_ptr<uint8_t, void (*)(void*)> hg(h, std::free);
+    if (::pread(fd, h, 4096, 0) != 4096) return fail("short header");
+    MirrorHead H;
+    std::memcpy(&H, h, sizeof H);
+    if (std::memcmp(H.magic, "S41MIRR1", 8) != 0) return fail("bad magic");
+    if (H.src_size != (uint64_t) ss.st_size) return fail("built from a different model file (size)");
+    const uint64_t NE = (uint64_t) (g_.n_layers * g_.n_experts);
+    if (H.n == 0 || H.n > NE || H.data < sizeof H + H.n * sizeof(MirrorEnt) || (H.data & 4095)) return fail("bad header");
+    const size_t tb = (size_t) H.data;
+    uint8_t* t = (uint8_t*) std::aligned_alloc(4096, tb);
+    std::unique_ptr<uint8_t, void (*)(void*)> tg(t, std::free);
+    for (size_t got = 0; got < tb;) {
+        const ssize_t k = ::pread(fd, t + got, tb - got, (off_t) got);
+        if (k <= 0) return fail("short index");
+        got += (size_t) k;
+    }
+    std::vector<uint64_t> mo(NE, ~0ull);
+    uint64_t end = H.data;
+    for (uint64_t i = 0; i < H.n; ++i) {
+        MirrorEnt x;
+        std::memcpy(&x, t + sizeof H + i * sizeof x, sizeof x);
+        if (x.l < 0 || x.l >= g_.n_layers || x.e < 0 || x.e >= g_.n_experts || (x.off & 4095) || x.off < H.data)
+            return fail("bad index entry");
+        mo[(size_t) (x.l * g_.n_experts + x.e)] = x.off;
+        end = std::max<uint64_t>(end, x.off + ((expert_bytes(x.l, x.e) + 4095) & ~(uint64_t) 4095));
+    }
+    if (end > (uint64_t) st.st_size) return fail("truncated (" + std::to_string(st.st_size) + " of " + std::to_string(end) + " bytes)");
+    // spot check: 8 blobs spread over the index (STRATA_BLOB_MIRROR_CHECK=N: N, 0 = all), whole, against the model file
+    const char* ck = std::getenv("STRATA_BLOB_MIRROR_CHECK");
+    uint64_t nchk = ck ? (uint64_t) std::max(0, std::atoi(ck)) : 8;
+    if (nchk == 0 || nchk > H.n) nchk = H.n;
+    std::vector<uint8_t> a(max_);
+    for (uint64_t k = 0; k < nchk; ++k) {
+        MirrorEnt x;
+        std::memcpy(&x, t + sizeof H + (nchk > 1 ? k * (H.n - 1) / (nchk - 1) : 0) * sizeof x, sizeof x);
+        const size_t n = expert_bytes(x.l, x.e);
+        read(x.l, x.e, a.data());
+        const size_t span = (n + 4095) & ~(size_t) 4095;
+        uint8_t* m = (uint8_t*) std::aligned_alloc(4096, span);
+        std::unique_ptr<uint8_t, void (*)(void*)> mg(m, std::free);
+        size_t got = 0;
+        while (got < span) {
+            const ssize_t r = ::pread(fd, m + got, span - got, (off_t) (x.off + got));
+            if (r <= 0) break;
+            got += (size_t) r;
+        }
+        if (got < n || std::memcmp(a.data(), m, n) != 0)
+            return fail("blob (" + std::to_string(x.l) + ", " + std::to_string(x.e) + ") differs from the model file");
+    }
+    const char* sh = std::getenv("STRATA_BLOB_MIRROR_SHARE");
+    if (sh && sh[0]) mshare_ = std::max(0, std::min(1000, (int) std::lround(std::atof(sh) * 1000.0)));
+    moff_.swap(mo);
+    mirrored_ = (int64_t) H.n;
+    mfd_ = fd;
+    std::fprintf(stderr, "blob mirror: %s - %lld experts (%.1f GiB), share %.3f of each mirrored blob's parts\n", path,
+                 (long long) H.n, (double) (end - H.data) / 1073741824.0, mshare_ / 1000.0);
+    return true;
+}
+
+bool Ds41FileBlobs::build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order,
+                                 uint64_t budget, std::string& err) const {
+    if (fd_ < 0) { err = "source not open"; return false; }
+    struct stat ss{};
+    ::fstat(fd_, &ss);
+    std::vector<MirrorEnt> ent;
+    std::vector<uint8_t> seen((size_t) (g_.n_layers * g_.n_experts), 0);
+    uint64_t bytes = 0;
+    for (const auto& le : order) {
+        if (le.first < 0 || le.first >= g_.n_layers || le.second < 0 || le.second >= g_.n_experts) continue;
+        uint8_t& sn = seen[(size_t) (le.first * g_.n_experts + le.second)];
+        if (sn) continue;
+        sn = 1;
+        const uint64_t b = (expert_bytes(le.first, le.second) + 4095) & ~(uint64_t) 4095;
+        if (bytes + b > budget) break;
+        ent.push_back({le.first, le.second, 0});
+        bytes += b;
+    }
+    const uint64_t data = (sizeof(MirrorHead) + ent.size() * sizeof(MirrorEnt) + 4095) & ~(uint64_t) 4095;
+    uint64_t at = data;
+    for (MirrorEnt& x : ent) {
+        x.off = at;
+        at += (expert_bytes(x.l, x.e) + 4095) & ~(uint64_t) 4095;
+    }
+    const int fd = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    if (fd < 0) { err = "cannot create " + out + " (O_DIRECT)"; return false; }
+    auto wr = [&](const uint8_t* p, uint64_t n, uint64_t off) {
+        while (n) {
+            const ssize_t k = ::pwrite(fd, p, (size_t) std::min<uint64_t>(n, 1u << 30), (off_t) off);
+            if (k <= 0) return false;
+            p += k;
+            off += (uint64_t) k;
+            n -= (uint64_t) k;
+        }
+        return true;
+    };
+    {   // header + index
+        uint8_t* h = (uint8_t*) std::aligned_alloc(4096, (size_t) data);
+        std::memset(h, 0, (size_t) data);
+        MirrorHead H;
+        std::memcpy(H.magic, "S41MIRR1", 8);
+        H.src_size = (uint64_t) ss.st_size;
+        H.n = ent.size();
+        H.data = data;
+        std::memcpy(h, &H, sizeof H);
+        std::memcpy(h + sizeof H, ent.data(), ent.size() * sizeof(MirrorEnt));
+        const bool ok = wr(h, data, 0);
+        std::free(h);
+        if (!ok) { ::close(fd); err = "header write failed"; return false; }
+    }
+    // batches of kB blobs: 16 threads read the next batch (read_part, O_DIRECT) while this thread writes the last
+    constexpr size_t kB = 48;
+    const size_t stride = (max_ + 4095) & ~(size_t) 4095;
+    uint8_t* buf[2] = {(uint8_t*) std::aligned_alloc(4096, kB * stride), (uint8_t*) std::aligned_alloc(4096, kB * stride)};
+    auto fill = [&](size_t b0, uint8_t* dst) {
+        const size_t n = std::min(kB, ent.size() - b0);
+        constexpr int P = 8;
+        std::atomic<size_t> nx{0};
+        std::vector<std::thread> th;
+        for (int t = 0; t < 16; ++t)
+            th.emplace_back([&]() {
+                for (size_t q; (q = nx.fetch_add(1)) < n * P;) {
+                    const MirrorEnt& x = ent[b0 + q / P];
+                    uint8_t* d = dst + (q / P) * stride;
+                    if (q % P == 0) std::memset(d + expert_bytes(x.l, x.e), 0, stride - expert_bytes(x.l, x.e));
+                    read_part(x.l, x.e, (int) (q % P), P, d);
+                }
+            });
+        for (auto& t : th) t.join();
+    };
+    const double t0 = now_ms();
+    bool ok = true;
+    if (!ent.empty()) fill(0, buf[0]);
+    for (size_t b0 = 0, k = 0; b0 < ent.size() && ok; b0 += kB, ++k) {
+        std::thread next;
+        if (b0 + kB < ent.size()) next = std::thread(fill, b0 + kB, buf[(k + 1) & 1]);
+        const size_t n = std::min(kB, ent.size() - b0);
+        for (size_t i = 0; i < n && ok; ++i) {   // blobs are consecutive in the file: one write per run
+            const MirrorEnt& x = ent[b0 + i];
+            ok = wr(buf[k & 1] + i * stride, (expert_bytes(x.l, x.e) + 4095) & ~(uint64_t) 4095, x.off);
+        }
+        if (next.joinable()) next.join();
+        if ((k % 40) == 0)
+            std::fprintf(stderr, "\rbuild-mirror: %zu / %zu experts, %.1f GB/s   ", b0 + n, ent.size(),
+                         (double) (ent[b0 + n - 1].off + expert_bytes(ent[b0 + n - 1].l, ent[b0 + n - 1].e) - data) /
+                             ((now_ms() - t0) * 1e6));
+    }
+    std::free(buf[0]);
+    std::free(buf[1]);
+    if (ok) ok = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok) { err = "write failed (disk full?)"; return false; }
+    std::fprintf(stderr, "\nbuild-mirror: %s - %zu experts, %.2f GiB in %.1f s\n", out.c_str(), ent.size(),
+                 (double) (at - data) / 1073741824.0, (now_ms() - t0) / 1000.0);
+    return true;
+}
+
+bool Ds41FileBlobs::read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd) const {
+    if (fd < 0) fd = dfd_;
+    if (fd < 0 || !scratch || !n) return false;
     constexpr uint64_t A = 4096;
     const uint64_t a0 = off & ~(A - 1), a1 = (off + n + A - 1) & ~(A - 1);
     const size_t span = (size_t) (a1 - a0);
     if (span > scratch_bytes) return false;
     size_t got = 0;
     while (got < span) {
-        const ssize_t k = ::pread(dfd_, scratch + got, span - got, (off_t) (a0 + got));
+        const ssize_t k = ::pread(fd, scratch + got, span - got, (off_t) (a0 + got));
         if (k <= 0) return false;
         got += (size_t) k;
     }
@@ -4801,6 +5044,21 @@ void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int npart
     else hi = total;
     uint64_t at = 0;
     uint8_t* bb = part_direct_ && dfd_ >= 0 ? take_bounce() : nullptr;
+    // the mirror's share of the parts: part p goes there when floor((p+1)*share) > floor(p*share) - spread evenly,
+    // and a 1-part read stays on the model file.  The mirror blob is contiguous: [lo, hi) is one aligned span there.
+    if (mfd_ >= 0 && bb && nparts > 1 && ((part + 1) * mshare_) / 1000 != (part * mshare_) / 1000) {
+        const uint64_t mo = moff_[(size_t) (layer * g_.n_experts + expert)];
+        if (mo != ~0ull) {
+            const uint64_t step = (uint64_t) (scratch_ - 8192) & ~(uint64_t) 4095;
+            bool ok = true;
+            for (uint64_t a = lo; a < hi && ok; a += step)
+                ok = read_direct(mo + a, (size_t) std::min<uint64_t>(step, hi - a), dst + a, bb, scratch_, mfd_);
+            if (ok) {
+                give_bounce(bb);
+                return;
+            }
+        }
+    }
     for (const Span& x : s) {
         const uint64_t a = std::max(lo, at), b = std::min(hi, at + x.bytes);
         if (a < b && !(bb && read_direct(x.off + (a - at), (size_t) (b - a), dst + a, bb, scratch_)))

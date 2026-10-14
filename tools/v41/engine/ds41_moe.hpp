@@ -226,13 +226,28 @@ public:
     const Ds41MoeGeom& geom() const { return g_; }
     /// bytes of expert e of layer l (its class's blob)
     size_t expert_bytes(int64_t l, int64_t e) const;
+    /// The mirror (STRATA_BLOB_MIRROR=<file>, written by `ds41_generate --build-mirror`): packed copies of the coldest
+    /// experts on a SECOND drive.  read_part then reads a share of each mirrored blob's parts from it
+    /// (STRATA_BLOB_MIRROR_SHARE, default 0.28), so both drives serve one blob at once.  Experts mirrored, 0 = none.
+    /// 0.28 = 2 of 8 parts: the rb2 microbench (6.75 MiB blobs, 8 parts, 32 threads) gives the model drive 6.22 GB/s,
+    /// the mirror 3.26, and the pair 8.29 at 2/8 vs 7.95 at 3/8 - the mirror's own ceiling, so a larger share only
+    /// unloads the faster drive (8.13 at 1/4 with independent offsets; 3/8's 2% is inside the engine's noise).
+    int64_t mirrored() const { return mirrored_; }
+    /// Writes the mirror: `order` coldest first, until `budget` bytes.  Returns false with `err` on failure.
+    bool build_mirror(const std::string& out, const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget,
+                      std::string& err) const;
 
 private:
     struct Span { uint64_t off = 0, bytes = 0; };
     void spans(int64_t l, int64_t e, Span s[3]) const;
     /// One 4096-aligned `pread` of [off, off+n) through the O_DIRECT twin fd, sliced out of `scratch`.  False when
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
-    bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes) const;
+    bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
+    bool open_mirror(const char* path, std::string& err);
+    int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
+    std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
+    int64_t mirrored_ = 0;
+    int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
     /// read_part's aligned bounces (one per concurrent part, kept for the next call)
     uint8_t* take_bounce() const;
     void give_bounce(uint8_t* p) const;
