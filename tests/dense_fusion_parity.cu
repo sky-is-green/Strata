@@ -1,0 +1,126 @@
+// Bit-parity of the dense decode pass's fused kernels against the launches they replace:
+//   dense_split_q + rms_norm_weighted(qcur)  vs  dense_split_q_rms
+//   dense_rms_norm (+ add) + dense_fwht_quantize_rows  vs  dense_rms_fwht_quant_rows
+// Both write their outputs to separate device buffers and compare all bytes on the host.  Run with no arguments;
+// exits nonzero on the first mismatch.
+#include "strata/kernels/dense_kernels.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <vector>
+
+namespace {
+int g_fail = 0;
+
+void check(const char* what, const std::vector<float>& a, const std::vector<float>& b) {
+    size_t nd = 0, first = a.size();
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::memcmp(&a[i], &b[i], 4) != 0) { if (first == a.size()) first = i; ++nd; }
+    if (nd) {
+        std::printf("FAIL %s: %zu of %zu differ, first at %zu: %a vs %a\n", what, nd, a.size(), first,
+                    (double) a[first], (double) b[first]);
+        ++g_fail;
+    } else {
+        std::printf("ok   %s (%zu values)\n", what, a.size());
+    }
+}
+
+void check_bytes(const char* what, const std::vector<unsigned char>& a, const std::vector<unsigned char>& b) {
+    size_t nd = 0, first = a.size();
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i] != b[i]) { if (first == a.size()) first = i; ++nd; }
+    if (nd) {
+        std::printf("FAIL %s: %zu of %zu bytes differ, first at %zu\n", what, nd, a.size(), first);
+        ++g_fail;
+    } else {
+        std::printf("ok   %s (%zu bytes)\n", what, a.size());
+    }
+}
+
+void qrms_case(int rows, int D, std::mt19937& rng) {
+    std::uniform_real_distribution<float> d(-2.0f, 2.0f);
+    std::vector<float> h((size_t) rows * 2 * D), w(D);
+    for (float& v : h) v = d(rng);
+    for (float& v : w) v = d(rng);
+    float *qf = nullptr, *qc1 = nullptr, *qc2 = nullptr, *wf = nullptr;
+    cudaMalloc(&qf, h.size() * 4);
+    cudaMalloc(&qc1, (size_t) rows * D * 4);
+    cudaMalloc(&qc2, (size_t) rows * D * 4);
+    cudaMalloc(&wf, (size_t) D * 4);
+    cudaMemcpy(qf, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(wf, w.data(), (size_t) D * 4, cudaMemcpyHostToDevice);
+    strata::kernels::dense_split_q(qf, qc1, rows, D, nullptr);
+    strata::kernels::rms_norm_weighted(qc1, wf, rows, D, 1e-6f, nullptr);
+    strata::kernels::dense_split_q_rms(qf, wf, qc2, rows, D, 1e-6f, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> a((size_t) rows * D), b((size_t) rows * D);
+    cudaMemcpy(a.data(), qc1, a.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.data(), qc2, b.size() * 4, cudaMemcpyDeviceToHost);
+    char what[96];
+    std::snprintf(what, sizeof what, "split_q_rms rows=%d D=%d", rows, D);
+    check(what, a, b);
+}
+
+void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
+    std::uniform_real_distribution<float> d(-3.0f, 3.0f);
+    std::vector<float> hx((size_t) rows * width), hw((size_t) width), hs((size_t) width), ha((size_t) rows * width);
+    for (float& v : hx) v = d(rng);
+    for (float& v : ha) v = d(rng) * 0.5f;
+    for (float& v : hw) v = 0.5f + d(rng) * 0.1f;
+    for (float& v : hs) v = (rng() & 1) ? 1.0f : -1.0f;
+    float *x = nullptr, *add = nullptr, *w = nullptr, *s = nullptr, *xn1 = nullptr, *xn2 = nullptr;
+    void *q1 = nullptr, *q2 = nullptr;
+    const size_t qb = strata::kernels::native_q8_1_bytes(width, rows);
+    cudaMalloc(&x, hx.size() * 4);
+    cudaMalloc(&add, ha.size() * 4);
+    cudaMalloc(&w, (size_t) width * 4);
+    cudaMalloc(&s, (size_t) width * 4);
+    cudaMalloc(&xn1, hx.size() * 4);
+    cudaMalloc(&xn2, hx.size() * 4);
+    cudaMalloc(&q1, qb);
+    cudaMalloc(&q2, qb);
+    cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(add, ha.data(), ha.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(w, hw.data(), (size_t) width * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(s, hs.data(), (size_t) width * 4, cudaMemcpyHostToDevice);
+
+    if (with_add) strata::kernels::add_inplace(x, add, (int64_t) rows * width, nullptr);
+    strata::kernels::dense_rms_norm(x, w, xn1, rows, width, 1e-6f, nullptr);
+    strata::kernels::dense_fwht_quantize_rows(xn1, q1, nullptr, s, width, rows, 0, 0, 0, nullptr);
+    if (with_add) cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);   // same pre-add state
+    strata::kernels::dense_rms_fwht_quant_rows(x, with_add ? add : nullptr, w, xn2, q2, s, width, rows, 1e-6f, nullptr);
+    cudaDeviceSynchronize();
+    std::vector<float> a((size_t) rows * width), b((size_t) rows * width);
+    cudaMemcpy(a.data(), xn1, a.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(b.data(), xn2, b.size() * 4, cudaMemcpyDeviceToHost);
+    char what[96];
+    std::snprintf(what, sizeof what, "rms_fwht_quant rows=%d width=%d%s", rows, width, with_add ? " + add" : "");
+    check(what, a, b);
+    std::vector<unsigned char> qa(qb), qbb(qb);
+    cudaMemcpy(qa.data(), q1, qb, cudaMemcpyDeviceToHost);
+    cudaMemcpy(qbb.data(), q2, qb, cudaMemcpyDeviceToHost);
+    std::snprintf(what, sizeof what, "rms_fwht_quant q8_1 rows=%d width=%d%s", rows, width, with_add ? " + add" : "");
+    check_bytes(what, qa, qbb);
+}
+}  // namespace
+
+int main() {
+    std::mt19937 rng(1234);
+    qrms_case(24, 256, rng);
+    qrms_case(4, 256, rng);
+    qrms_case(8, 128, rng);
+    rmsfq_case(1, 5120, false, rng);
+    rmsfq_case(2, 5120, false, rng);
+    rmsfq_case(1, 5120, true, rng);
+    rmsfq_case(1, 6144, false, rng);
+    rmsfq_case(3, 6144, true, rng);
+    rmsfq_case(1, 17408, false, rng);
+    rmsfq_case(2, 17408, true, rng);
+    if (g_fail) { std::printf("%d case(s) FAILED\n", g_fail); return 1; }
+    std::printf("all dense fusion parities identical\n");
+    return 0;
+}

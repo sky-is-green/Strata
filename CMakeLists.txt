@@ -777,6 +777,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(pq2_bench tests/pq2_bench.cu)
   target_include_directories(pq2_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(pq2_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(dense_fusion_parity tests/dense_fusion_parity.cu)
+  target_include_directories(dense_fusion_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dense_fusion_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(dense_micro tests/dense_micro.cu)
+  target_include_directories(dense_micro PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dense_micro PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   # TODO 24: the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
   # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
   # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
