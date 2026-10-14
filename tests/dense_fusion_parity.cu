@@ -74,7 +74,7 @@ void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
     for (float& v : hw) v = 0.5f + d(rng) * 0.1f;
     for (float& v : hs) v = (rng() & 1) ? 1.0f : -1.0f;
     float *x = nullptr, *add = nullptr, *w = nullptr, *s = nullptr, *xn1 = nullptr, *xn2 = nullptr;
-    void *q1 = nullptr, *q2 = nullptr;
+    void *q1 = nullptr, *q2 = nullptr, *q3 = nullptr, *q3ref = nullptr;
     const size_t qb = strata::kernels::native_q8_1_bytes(width, rows);
     cudaMalloc(&x, hx.size() * 4);
     cudaMalloc(&add, ha.size() * 4);
@@ -84,17 +84,21 @@ void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
     cudaMalloc(&xn2, hx.size() * 4);
     cudaMalloc(&q1, qb);
     cudaMalloc(&q2, qb);
+    cudaMalloc(&q3, qb);
+    cudaMalloc(&q3ref, qb);
     cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(add, ha.data(), ha.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(w, hw.data(), (size_t) width * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(s, hs.data(), (size_t) width * 4, cudaMemcpyHostToDevice);
 
-    if (with_add) strata::kernels::add_inplace(x, add, (int64_t) rows * width, nullptr);
-    strata::kernels::dense_rms_norm(x, w, xn1, rows, width, 1e-6f, nullptr);
-    strata::kernels::dense_fwht_quantize_rows(xn1, q1, nullptr, s, width, rows, 0, 0, 0, nullptr);
+    if (with_add) strata::kernels::add_inplace(x, add, (int64_t) rows * width, g_st);
+    strata::kernels::dense_rms_norm(x, w, xn1, rows, width, 1e-6f, g_st);
+    strata::kernels::dense_fwht_quantize_rows(xn1, q1, nullptr, s, width, rows, 0, 0, 0, g_st);
+    cudaStreamSynchronize(g_st);
     if (with_add) cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);   // same pre-add state
-    strata::kernels::dense_rms_fwht_quant_rows(x, with_add ? add : nullptr, w, xn2, q2, s, width, rows, 1e-6f, nullptr);
-    cudaDeviceSynchronize();
+    strata::kernels::dense_rms_fwht_quant_rows(x, with_add ? add : nullptr, w, xn2, q2, s, width, rows, 1e-6f, g_st, q3);
+    strata::kernels::native_quantize_q8_1(xn1, q3ref, width, rows, g_st);
+    cudaStreamSynchronize(g_st);
     std::vector<float> a((size_t) rows * width), b((size_t) rows * width);
     cudaMemcpy(a.data(), xn1, a.size() * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(b.data(), xn2, b.size() * 4, cudaMemcpyDeviceToHost);
@@ -105,6 +109,10 @@ void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
     cudaMemcpy(qa.data(), q1, qb, cudaMemcpyDeviceToHost);
     cudaMemcpy(qbb.data(), q2, qb, cudaMemcpyDeviceToHost);
     std::snprintf(what, sizeof what, "rms_fwht_quant q8_1 rows=%d width=%d%s", rows, width, with_add ? " + add" : "");
+    check_bytes(what, qa, qbb);
+    cudaMemcpy(qa.data(), q3ref, qb, cudaMemcpyDeviceToHost);
+    cudaMemcpy(qbb.data(), q3, qb, cudaMemcpyDeviceToHost);
+    std::snprintf(what, sizeof what, "rms_fwht_quant plain q8_1 rows=%d width=%d%s", rows, width, with_add ? " + add" : "");
     check_bytes(what, qa, qbb);
 }
 

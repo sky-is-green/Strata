@@ -48,8 +48,11 @@ void dense_swiglu_quantize_rows(const float* gate, const float* up, void* q8_out
 
 /// dense_rms_norm + dense_fwht_rows + native_quantize_q8_1 in one launch, bit-identical to the triple: one
 /// 1024-thread block per row writes xn and the rotated row's q8_1 in the same pass.  width a multiple of 1024.
+/// `q8_plain` (optional) also receives native_quantize_q8_1 of the same normalized row (the GDN layer's
+/// alpha/beta GEMVs read it), so one launch serves the layer's plain and folded activation scratches.
 void dense_rms_fwht_quant_rows(float* x, const float* add, const float* w, float* xn, void* q8_out,
-                               const float* signs, int width, int rows, float eps, void* stream);
+                               const float* signs, int width, int rows, float eps, void* stream,
+                               void* q8_plain = nullptr);
 
 /// y[r] = sum_i W[r * n_in + i] * x[i]           W is a GGUF matrix stored as F32: ne0 = n_in is the contiguous axis
 void dense_gemv_f32(const float* W, const float* x, float* y, int n_in, int n_out, void* stream);

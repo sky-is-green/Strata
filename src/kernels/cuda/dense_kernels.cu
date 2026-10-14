@@ -336,13 +336,14 @@ __global__ void swiglu_quant_kernel(const float* __restrict__ g, const float* __
 }
 
 // dense_rms_norm + the folded-basis rotation + native_quantize_q8_1 with ONE 1024-thread block per row: threads
-// 0..255 run rms_norm_kernel's own reduction and its strided write of xn, then the row's 1024-blocks are
-// rotated and quantized the way fwht_quant_kernel's blocks do.  One launch where there were two; xn is still
-// written for the callers that read it (the f32 alpha/beta pair).
+// 0..255 run rms_norm_kernel's own reduction, the whole block runs the scaled write, and the row's 1024-blocks are
+// rotated and quantized the way fwht_quant_kernel's blocks do.  One launch where there were two or three; xn is
+// still written for the callers that read it (the f32 alpha/beta pair), and `y_plain` takes a second quantization
+// output so the GDN layer's plain and folded activation scratches come out of the same pass.
 __global__ void rms_fwht_quant_kernel(float* __restrict__ x, const float* __restrict__ add,
                                       const float* __restrict__ w, float* __restrict__ xn,
-                                      const float* __restrict__ signs, Q81Twin* __restrict__ y, int width, float eps,
-                                      int nblk) {
+                                      const float* __restrict__ signs, Q81Twin* __restrict__ y,
+                                      Q81Twin* __restrict__ y_plain, int width, float eps, int nblk) {
     __shared__ float bufA[1024], bufB[1024];
     __shared__ float part[8];
     __shared__ float scale;
@@ -369,19 +370,33 @@ __global__ void rms_fwht_quant_kernel(float* __restrict__ x, const float* __rest
     }
     __syncthreads();
     const float sc = scale;
-    if (threadIdx.x < 256) {
-#pragma unroll 4
-        for (int i = threadIdx.x; i < width; i += 256) orow[i] = xr[i] * sc * w[i];
-    }
-    __syncthreads();
+    // The scaled write runs on the whole block (the expression is per element, so its value does not depend on the
+    // thread that computes it), and the thread that writes element blk*1024 + t keeps that element for the
+    // butterfly whose input is exactly it: no second global read for the transform, no write/read barrier.  The
+    // optional `y_plain` is native_quantize_q8_1's own q8_1 of the same row (the GDN layer's alpha/beta GEMVs read
+    // it), quantized warp for warp with that kernel's calls.
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     for (int blk = 0; blk < nblk; ++blk) {
         const size_t j = (size_t) blk * 1024 + threadIdx.x;
-        float v = orow[j] * (1.0f / 32.0f);
+        const float vi = xr[j] * sc * w[j];
+        orow[j] = vi;
+        if (y_plain) {
+            float amax = fabsf(vi);
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            float psum = vi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) psum += __shfl_xor_sync(0xffffffffu, psum, o);
+            const float pd = q8_1_finite(amax / 127.0f);
+            Q81Twin* pdst = y_plain + (size_t) row * (width / 32) + blk * 32 + warp;
+            pdst->qs[lane] = q8_1_quant(vi, pd, amax);
+            if (lane == 0) pdst->ds = q8_1_ds(pd, psum);
+        }
+        float v = vi * (1.0f / 32.0f);
         v *= signs[j];
         // Alternate the first write buffer: the previous block's last stage ended on a read, and no barrier
         // follows it (see fwht1024_shuffled).
         const float xi = fwht1024_shuffled(bufA, bufB, (blk & 1) ? bufA : bufB, v, threadIdx.x);
-        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
         float amax = fabsf(xi);
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
@@ -1517,13 +1532,13 @@ void dense_fwht_rows(const float* x, float* y, const float* signs, int width, in
 }
 
 void dense_rms_fwht_quant_rows(float* x, const float* add, const float* w, float* xn, void* q8_out,
-                               const float* signs, int width, int rows, float eps, void* stream) {
+                               const float* signs, int width, int rows, float eps, void* stream, void* q8_plain) {
     if (rows < 1) return;
     if (!signs || !q8_out) throw std::runtime_error("dense_rms_fwht_quant_rows: signs and q8_1 output required");
     if (width <= 0 || width % 1024 != 0)
         throw std::runtime_error("dense_rms_fwht_quant_rows: width must be a multiple of 1024");
-    rms_fwht_quant_kernel<<<rows, 1024, 0, (cudaStream_t) stream>>>(x, add, w, xn, signs, (Q81Twin*) q8_out, width,
-                                                                    eps, width / 1024);
+    rms_fwht_quant_kernel<<<rows, 1024, 0, (cudaStream_t) stream>>>(x, add, w, xn, signs, (Q81Twin*) q8_out,
+                                                                    (Q81Twin*) q8_plain, width, eps, width / 1024);
     check("dense_rms_fwht_quant_rows");
 }
 

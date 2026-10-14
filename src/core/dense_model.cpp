@@ -364,6 +364,7 @@ struct DenseModel::Impl {
     float* output_norm = nullptr;
     QMat head;
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
+    void* q8_1_ab = nullptr;                        // the GDN layer's second scratch: q8_1 of the un-rotated xn
     int64_t max_context = 0;
 
     // ---- HIP graphs (STRATA_DENSE_GRAPH=1): the whole single-card decode pass is captured once per attention
@@ -684,12 +685,13 @@ struct DenseModel::Impl {
         return true;
     }
 
-    // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.
-    void gemv(const QMat& w, float* y, int n, void* s) {
+    // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.  `act` picks a
+    // different q8_1 scratch (the GDN layer's plain-quantized xn lives in one while q8_1 holds the rotated one).
+    void gemv(const QMat& w, float* y, int n, void* s, const void* act = nullptr) {
         PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
         const uint8_t* base = (const uint8_t*) w.dev;
         if (w.row0) base += (size_t) w.row0 * native_mmvq_weight_bytes(w.type, w.n_in, 1);
-        native_mmvq(w.type, base, q8_1, y, w.n_in, w.n_out, n, s);
+        native_mmvq(w.type, base, act ? act : q8_1, y, w.n_in, w.n_out, n, s);
     }
     void quantize(const float* x, int n_in, int n, void* s) {
         PScope ps(&prof, Prof::QUANT, s);
@@ -704,6 +706,8 @@ struct DenseModel::Impl {
     }
 
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
+    // `pre_rot` for a GDN layer of a quantized-alpha/beta file means the caller's rms already produced BOTH
+    // quantizations of its output (plain in q8_1_ab for alpha/beta, folded in q8_1 for qkv/z).
     void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s, bool pre_rot = false);
     void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
@@ -743,16 +747,23 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
     const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
     if (L.ab_quant) {                               // the scratch holds q8_1(xn) for the two quantized projections
-        quantize(xn, E, n, s);
-        gemv(L.alpha_q, alpha, n, s);
-        gemv(L.beta_q, beta, n, s);
+        if (pre_rot) {                              // the caller's rms wrote q8_1_ab for these two
+            gemv(L.alpha_q, alpha, n, s, q8_1_ab);
+            gemv(L.beta_q, beta, n, s, q8_1_ab);
+        } else {
+            quantize(xn, E, n, s);
+            gemv(L.alpha_q, alpha, n, s);
+            gemv(L.beta_q, beta, n, s);
+        }
     } else {
         // The file stores alpha/beta as floats: the pair reads `xn` itself, and the rotation below overwrites
         // q8_1 -- quantizing xn first (as this used to) was a dead launch on every GDN layer of such a file.
         PScope ps(&prof, Prof::F32ROW, s);
         dense_gemv_f32_rows_pair(L.alpha_w, L.beta_w, xn, alpha, beta, E, VH, n, s);
     }
-    // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not
+    // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not.  With the
+    // quantized alpha/beta, the pre-block rms already produced BOTH quantizations of its own output, so `pre_rot`
+    // means "q8_1 holds the folded row and q8_1_ab the plain one" here.
     if (L.rot & (ROT_QKV | ROT_Z)) {
         if (!pre_rot) fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);   // else the caller's rms did it
     } else if (!L.ab_quant) {
@@ -1735,6 +1746,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const int max_in = std::max({2 * E, cfg_.n_ff, V, H * D});
         const uint64_t f = 4, K = NC;
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, NC), err, "q8_1 scratch") &&
+                  I.alloc(&I.q8_1_ab, native_q8_1_bytes(max_in, NC), err, "q8_1 alpha/beta scratch") &&
                   I.alloc(&I.rot_scratch, K * (uint64_t) max_in * f, err, "rotation scratch") &&
                   I.alloc(&I.x, K * E * f, err, "x") && I.alloc(&I.xn, K * E * f, err, "xn") &&
                   I.alloc(&I.mix, K * E * f, err, "mix") && I.alloc(&I.qkv, K * C * f, err, "qkv") &&
@@ -1978,12 +1990,16 @@ bool DenseModel::Impl::enqueue_pass(const DenseConfig& c, int n, int64_t pos0, L
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& L = layers[(size_t) l];
         // The pre-block rms and the folded-basis rotation of its output are one launch when the block needs the
-        // rotation (a quantized-projection file quantizes xn itself for alpha/beta first, so it keeps the pair).
-        const bool pre_rot = L.attn ? (L.rot & (ROT_Q | ROT_K | ROT_V)) != 0
-                                    : ((L.rot & (ROT_QKV | ROT_Z)) != 0 && !L.ab_quant);
+        // rotation.  A GDN layer of a quantized-alpha/beta file needs BOTH quantizations of that output -- plain
+        // for alpha/beta and folded for qkv/z -- and gets them from the same pass (q8_1 and q8_1_ab).
+        const bool rot_pre = L.attn ? (L.rot & (ROT_Q | ROT_K | ROT_V)) != 0
+                                    : (L.rot & (ROT_QKV | ROT_Z)) != 0;
+        const bool pre_rot = rot_pre;
+        const bool pre_ab = !L.attn && L.ab_quant && rot_pre;
         if (pre_rot) {
             PScope ps(&prof, Prof::QUANT, s);
-            dense_rms_fwht_quant_rows(x, nullptr, L.attn_norm, xn, q8_1, ham_signs(E), E, n, c.rms_eps, s);
+            dense_rms_fwht_quant_rows(x, nullptr, L.attn_norm, xn, q8_1, ham_signs(E), E, n, c.rms_eps, s,
+                                      pre_ab ? q8_1_ab : nullptr);
         } else {
             PScope ps(&prof, Prof::RMS, s);
             dense_rms_norm(x, L.attn_norm, xn, n, E, c.rms_eps, s);
