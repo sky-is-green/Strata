@@ -4017,8 +4017,9 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
     const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BL), cap = 2 * slots_half;
     auto slot_ptr = [&](size_t k) { return gp.c_bounce[(k % cap) / slots_half] + ((k % cap) % slots_half) * (size_t) BL; };
-    std::vector<std::atomic<int>> ready(nF);
+    std::vector<std::atomic<int>> ready(nF), pdone(nF);   // pdone: parts of a blob read (STRATA_WAVE_PARTS)
     for (auto& r : ready) r.store(0, std::memory_order_relaxed);
+    for (auto& r : pdone) r.store(0, std::memory_order_relaxed);
     std::atomic<size_t> rnext{0}, rdone{0};
     std::atomic<double> t_rd_last{0};
     size_t wave_end = 0;   // reads issued for file blobs [0, wave_end)
@@ -4029,19 +4030,28 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         readers.clear();
         const size_t w0 = wave_end, w1 = std::min(nF, wave_end + cap);
         wave_end = w1;
-        rnext.store(w0);
         // STRATA_WAVE_THREADS (default 32, was 8): the on-demand reader's threads - small batch turns read only their
         // routed file-tier experts here, so this is their NVMe queue depth.  s11, +272-token turn at 512K: 8 / 16 / 32
         // threads -> batch 14.89 / 13.78 / 13.55 s (3.17 / 3.61 / 3.79 GB/s)
         static const int wave_threads = std::getenv("STRATA_WAVE_THREADS") ? std::max(1, std::min(64, std::atoi(std::getenv("STRATA_WAVE_THREADS")))) : 32;
-        const int nth = (int) std::min<size_t>((size_t) wave_threads, w1 - w0);
+        // STRATA_WAVE_PARTS (default 8): each blob split into parts read by different threads (read_part, as D3) -
+        // a blob is 3 tensor spans, and one thread reading them in turn left the queue shallow.  1 = whole blobs.
+        // s11, +272-token turn (32 threads): parts 1 / 4 / 8 -> 3.60 / 5.02 / 5.29 GB/s, batch 14.25 / 11.17 / 10.68 s,
+        // tokens identical (exact routing)
+        static const size_t P = (size_t) (std::getenv("STRATA_WAVE_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_WAVE_PARTS")))) : 8);
+        rnext.store(w0 * P);
+        const int nth = (int) std::min<size_t>((size_t) wave_threads, (w1 - w0) * P);
         for (int k = 0; k < nth; ++k)
             readers.emplace_back([&, w1]() {
-                for (size_t q; (q = rnext.fetch_add(1)) < w1;) {
-                    im.blobs->read(layer, order[2][q], slot_ptr(q));
-                    ready[q].store(1, std::memory_order_release);
-                    ready[q].notify_one();
-                    if (prof && rdone.fetch_add(1) + 1 == nF) t_rd_last.store(now_ms());
+                for (size_t x; (x = rnext.fetch_add(1)) < w1 * P;) {
+                    const size_t q = x / P;
+                    if (P == 1) im.blobs->read(layer, order[2][q], slot_ptr(q));
+                    else im.blobs->read_part(layer, order[2][q], (int) (x % P), (int) P, slot_ptr(q));
+                    if (P == 1 || pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
+                        ready[q].store(1, std::memory_order_release);
+                        ready[q].notify_one();
+                        if (prof && rdone.fetch_add(1) + 1 == nF) t_rd_last.store(now_ms());
+                    }
                 }
             });
     };

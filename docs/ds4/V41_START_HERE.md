@@ -154,7 +154,9 @@ ee2845ca (+ serve defaults / docs).
   context = dense 3.2 s + experts 11.6 s, and the experts are the NVMe reads of the routed file tier (34.5 GB through
   the chunk's on-demand "wave" reader at 3.2 GB/s; the expert tier's own wall is ~1.1 s).  Wave reader threads 8 ->
   32 (`STRATA_WAVE_THREADS`, default now 32): batch 14.9 -> 13.6 s (3.8 GB/s).  Still below the drive (~5.4 GB/s in
-  the microbench): each blob is 3 sequential span preads + a bounce memcpy, in waves of `cap` blobs - the next lever.
+  the microbench): each blob was 3 sequential span preads.  Now split into 8 parts read by different threads
+  (`STRATA_WAVE_PARTS`, default 8): 3.60 -> **5.29 GB/s, batch 14.25 -> 10.68 s**, tokens identical (exact routing).
+  Production smoke: +310-token turn batch 13.9 -> 11.4 s.
 - **Relay fix** (`~/AI/QuetzaCodetl/wrappers/tools/relay`, untracked file - live via ~/.local/bin/relay; skill text
   regenerated): `ask/reply/broadcast --name X` from a window with another name now gets an UNBOUND daemon instead of
   renaming the window (the session-10 gotcha).  Not committed in QuetzaCodetl (its tree has others' uncommitted work).
