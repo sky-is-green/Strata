@@ -704,10 +704,10 @@ struct DenseModel::Impl {
     }
 
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
-    void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s);
+    void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s, bool pre_rot = false);
     void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
-                    const int32_t* pos_slot, uint16_t rot, void* s);
+                    const int32_t* pos_slot, uint16_t rot, void* s, bool pre_rot = false);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n,
                    uint16_t rot, void* s, const float* pre_add = nullptr);
     void ffn_selfcheck(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s);
@@ -739,7 +739,7 @@ struct DenseModel::Impl {
 // and the per-column kernels read and write it once per column; over 48 GDN layers and a 3-column speculative pass
 // that is 446 MB of traffic that a chunk does not have.  And the rollback snapshots, which used to be two 3 MiB
 // copies per column, are now stores the recurrence makes from registers it already holds.
-void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s) {
+void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s, bool pre_rot) {
     const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
     const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
     if (L.ab_quant) {                               // the scratch holds q8_1(xn) for the two quantized projections
@@ -754,7 +754,7 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     }
     // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not
     if (L.rot & (ROT_QKV | ROT_Z)) {
-        fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
+        if (!pre_rot) fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);   // else the caller's rms did it
     } else if (!L.ab_quant) {
         quantize(xn, E, n, s);                      // not folded: the qkv/z GEMVs' activation is q8_1(xn)
     }
@@ -788,10 +788,10 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
 
 void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                                   const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
-                                  const int32_t* pos_slot, uint16_t rot, void* s) {
+                                  const int32_t* pos_slot, uint16_t rot, void* s, bool pre_rot) {
     const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
     if (rot & (ROT_Q | ROT_K | ROT_V)) {
-        fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
+        if (!pre_rot) fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);   // else the caller's rms did it
     } else {
         quantize(xn, E, n, s);
     }
@@ -844,13 +844,15 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
 void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
                                  int n, uint16_t rot, void* s, const float* pre_add) {
     const int E = c.n_embd;
-    {
-        PScope ps(&prof, Prof::RMS, s);
-        dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s, pre_add);
-    }
     if (rot & (ROT_FFN_GATE | ROT_FFN_UP)) {
-        fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
+        // rms + rotation + q8_1 in one launch, with the pending mixed-block add folded in.
+        PScope ps(&prof, Prof::QUANT, s);
+        dense_rms_fwht_quant_rows(x, pre_add, post_norm, xn, q8_1, ham_signs(E), E, n, c.rms_eps, s);
     } else {
+        {
+            PScope ps(&prof, Prof::RMS, s);
+            dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s, pre_add);
+        }
         quantize(xn, E, n, s);
     }
     gemv(g, ffn_g, n, s);
@@ -1975,12 +1977,20 @@ bool DenseModel::Impl::enqueue_pass(const DenseConfig& c, int n, int64_t pos0, L
     if (dbg) trace_vec("embed", pos0, -1, "", x, n * E, s);
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& L = layers[(size_t) l];
-        {
+        // The pre-block rms and the folded-basis rotation of its output are one launch when the block needs the
+        // rotation (a quantized-projection file quantizes xn itself for alpha/beta first, so it keeps the pair).
+        const bool pre_rot = L.attn ? (L.rot & (ROT_Q | ROT_K | ROT_V)) != 0
+                                    : ((L.rot & (ROT_QKV | ROT_Z)) != 0 && !L.ab_quant);
+        if (pre_rot) {
+            PScope ps(&prof, Prof::QUANT, s);
+            dense_rms_fwht_quant_rows(x, nullptr, L.attn_norm, xn, q8_1, ham_signs(E), E, n, c.rms_eps, s);
+        } else {
             PScope ps(&prof, Prof::RMS, s);
             dense_rms_norm(x, L.attn_norm, xn, n, E, c.rms_eps, s);
         }
-        if (!L.attn) gdn_block(c, L, n, snapshot, s);
-        else attn_block(c, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, pos_slot, L.rot, s);
+        if (!L.attn) gdn_block(c, L, n, snapshot, s, pre_rot);
+        else attn_block(c, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, pos_slot, L.rot, s,
+                        pre_rot);
         cur_layer = l;
         // The mixed block's residual add rides in the FFN's input rms (the only reader of mix before the FFN's
         // own down GEMV overwrites it), one launch instead of two.
