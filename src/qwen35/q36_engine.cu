@@ -445,51 +445,9 @@ __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl
     out[gi] = num / den * sigm(gate[gi]);
 }
 
-/// The expert setup's two launches in one: block 0 builds the group tables (the routed entries T tokens x K picks,
-/// entry e = t * K + k, grouped per expert: one group per expert used, its blob address, its entries in entry
-/// order), blocks 1.. quantize
-/// h for the experts and the shared expert (native_quantize_q8_1_kernel's blocks, shifted by one block).  The two
-/// are independent; the values are bitwise the two calls.
-__global__ void k_group_quant(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
-                              unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start,
-                              int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok, const float* qin, Q81Block* qout,
-                              int n) {
-    __shared__ int cnt[512], off[512];
-    if (blockIdx.x != 0) {
-        const int i = ((int) blockIdx.x - 1) * kThreads + (int) threadIdx.x;
-        if (i >= n) return;
-        const float xi = qin[i];
-        const float amax = warp_max32(fabsf(xi));
-        const float sum = warp_sum32(xi);
-        const float d = K::q8_1_finite(amax / 127.0f);
-        const int8_t q = K::q8_1_quant(xi, d, amax);
-        qout[i / 32].qs[i % 32] = q;
-        if (i % 32 == 0) qout[i / 32].ds = K::q8_1_ds(d, sum);
-        return;
-    }
-    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
-    __syncthreads();
-    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        int g = 0, pos = 0;
-        for (int x = 0; x < n_expert; ++x) {
-            off[x] = pos;
-            if (cnt[x] == 0) continue;
-            grp_ptr[g] = (unsigned long long) (blobs + (size_t) x * blob);
-            grp_start[g] = pos;
-            pos += cnt[x];
-            ++g;
-        }
-        grp_start[g] = pos;
-        *n_groups = g;
-        for (int e = 0; e < n_ent; ++e) {
-            const int p = off[ids[e]]++;
-            ent_dst[p] = e;
-            ent_tok[p] = e / K_;
-        }
-    }
-}
+/// The expert group tables and the q8_1 staging of h moved to the expert kernels next to the launches that read
+/// them: `native_group_quant_kernel` in iq_kernels.cu (the q36 router tail runs the tables in its own launch at
+/// one row, `group_tables` there).
 /// k_group for the hybrid mode: only the entries whose expert has a VRAM slot (slot_of[x] >= 0) are grouped, each
 /// group's blob at blobs + slot * blob; the others are the CPU pool's (their rows come from k_merge_cpu).  One block.
 __global__ void k_group_hy(const int32_t* ids, int n_ent, int K_, int n_expert, const int32_t* slot_of,
@@ -1611,6 +1569,7 @@ struct Engine {
         // the quantize is already done then
         const bool xq_hot = xq_staged && T <= kGemmT;
         xq_staged = false;
+        bool tail_fused = false;   // the router tail's launch carries the deltas, top-k and the group tables
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -1767,11 +1726,17 @@ struct Engine {
         tick(6, false);
         tick(7, true);   // the router delta (f16) and the MoE delta (g128): one mixed pair at one row
         bool mixed = false;
+        // at one row the deltas' B pass, top-k and the group tables are one launch: it wants the deltas'
+        // inputs (mixed A's outputs), the native expert path's tables and the 256 x 8 router
+        const bool hy_here = lhy(li) && (T <= hybrid_t || !main_hybrid);
+        tail_fused = mixed_ok && one && !skip_mb && !skip_tk && !hy_here &&
+                     K::native_router_tail_ok(L.moe_corr_b.n_in, L.moe_corr_b.n_out, L.router_corr_b.n_in,
+                                              (int) g.n_expert, (int) g.n_expert, (int) Kp);
         if (mixed_ok) {
             if (!mixed_a_fused && !skip_ma)
                 K::iq_corr_mixed_a(L.moe_corr_a.d, xq, L.moe_corr_a.n_in, L.moe_corr_a.n_out, corr_tq,
                                    L.router_corr_a.d, h, (int) g.n_embd, (int) L.router_corr_a.n_out, corr_t16, st);
-            if (!skip_mb)
+            if (!tail_fused && !skip_mb)
                 K::iq_corr_mixed_b(L.moe_corr_b.d, corr_tq, L.moe_corr_b.n_in, L.moe_corr_b.n_out, corr,
                                    L.router_corr_b.d, corr_t16, (int) L.router_corr_b.n_in, (int) g.n_expert, logits_r, st);
             mixed = true;
@@ -1779,8 +1744,13 @@ struct Engine {
             corr_router(L, T, h, one ? (int) g.n_expert + 1 : (int) g.n_expert);
         }
         tick(7, false);
-        tick(8, true);   // top-k
-        if (skip_tk) k_topk_dummy<<<T, kThreads, 0, st>>>(ids, ewts, Kp);
+        tick(8, true);   // the router tail at one row (the deltas, top-k and the tables) or just top-k
+        if (tail_fused)
+            K::native_router_tail(L.moe_corr_b.d, corr_tq, L.moe_corr_b.n_in, L.moe_corr_b.n_out, corr,
+                                  L.router_corr_b.d, corr_t16, L.router_corr_b.n_in, (int) g.n_expert, logits_r, ids,
+                                  ewts, (int) g.n_expert, (int) Kp, L.blobs, L.stride, (int) (T * Kp), grp_ptr,
+                                  grp_start, n_groups, ent_dst, ent_tok, st);
+        else if (skip_tk) k_topk_dummy<<<T, kThreads, 0, st>>>(ids, ewts, Kp);
         else K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         tick(8, false);
         tick(9, true);   // the routed experts
@@ -1824,11 +1794,13 @@ struct Engine {
             if (lhy(li)) stream_done();
             prow = rinv;
         } else {
-            // the group tables (and, past the first row, the q8_1 image of h: k_add_rms staged it for T <= 8)
-            const unsigned qblocks = (T <= kGemmT) ? 0 : (unsigned) (((int64_t) N * T + kThreads - 1) / kThreads);
-            k_group_quant<<<1 + qblocks, kThreads, 0, st>>>(
-                ids, (int) n_ent, Kp, (int) g.n_expert, L.blobs, L.stride, grp_ptr, grp_start, n_groups, ent_dst,
-                ent_tok, h, (Q81Block*) xq, (int) (N * T));
+            // the group tables (and, past the first row, the q8_1 image of h: k_add_rms staged it for T <= 8);
+            // at one row the router tail's launch already built them
+            if (!tail_fused) {
+                const unsigned qblocks = (T <= kGemmT) ? 0 : (unsigned) (((int64_t) N * T + kThreads - 1) / kThreads);
+                K::native_group_quant(ids, (int) n_ent, Kp, (int) g.n_expert, L.blobs, L.stride, grp_ptr, grp_start,
+                                      n_groups, ent_dst, ent_tok, h, (Q81Block*) xq, (int) (N * T), (int) qblocks, st);
+            }
             tick(9, false);
             tick(10, true);
             K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,

@@ -21,6 +21,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/router_topk_body.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cfloat>
@@ -155,55 +156,10 @@ template <int NE, int K>
 __launch_bounds__(256, 1)
 __global__ void route_topk(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights,
                            int n_tok) {
-    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
-    constexpr int V = NE / 32;
     const int tk = (int) blockIdx.x * 8 + (int) threadIdx.y;
     if (tk >= n_tok) return;
-    logits += (size_t) tk * NE; ids += (size_t) tk * K; weights += (size_t) tk * K;
-    const int lane = threadIdx.x;
-    float values[V];
-#pragma unroll
-    for (int i = 0; i < V; ++i) values[i] = logits[lane + i * 32];
-    float maximum = -INFINITY;
-#pragma unroll
-    for (int i = 0; i < V; ++i) maximum = max(maximum, values[i]);
-    maximum = warp_max(maximum);
-    float sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < V; ++i) {
-        values[i] = expf(values[i] - maximum);
-        sum += values[i];
-    }
-    const float reciprocal = 1.0f / warp_sum(sum);
-#pragma unroll
-    for (int i = 0; i < V; ++i) {
-        values[i] *= reciprocal;
-        if (__isnanf(values[i])) values[i] = -FLT_MAX;
-    }
-    float selected = 0.0f, selected_sum = 0.0f;
-    for (int rank = 0; rank < K; ++rank) {
-        float best = values[0];
-        int expert = lane;
-#pragma unroll
-        for (int i = 1; i < V; ++i) {
-            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
-        }
-#pragma unroll
-        for (int mask = 16; mask; mask >>= 1) {
-            const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
-            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
-            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
-        }
-        if ((expert & 31) == lane) {
-            values[expert / 32] = -INFINITY;
-            ids[rank] = expert;
-            selected_sum += best;
-        }
-        if (rank == lane) selected = best;
-    }
-    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
-    const float inverse_selected_sum = 1.0f / selected_sum;
-    if (lane < K) weights[lane] = selected * inverse_selected_sum;
+    router_topk_body<NE, K>(logits + (size_t) tk * NE, ids + (size_t) tk * K, weights + (size_t) tk * K,
+                            (int) threadIdx.x);
 }
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);

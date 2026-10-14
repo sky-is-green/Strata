@@ -9,6 +9,7 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_dot8.hpp"
+#include "strata/kernels/router_topk_body.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.cuh"
 
@@ -2163,6 +2164,107 @@ __global__ void __launch_bounds__(256) corr_mixed_b_kernel(const uint8_t* __rest
     if (lane == 0) out_router[o] += acc;   // one row: the logits' shared-gate slot is not touched
 }
 
+// ---------------------------------------------------------------- the q36 router tail at one row
+// The MoE output delta's rows (the g128 B pass), the router f16 delta's rows, the top-k and the expert group
+// tables in one launch: every row keeps its own kernel's tree (corr_mixed_b_kernel's warp_sum for the g128
+// rows, its f16_dot8 / shfl_down for the f16 rows, route_topk's warp body, k_group_quant's block-0 body) -
+// only the launches are shared.  Block 0 builds the tables after the picks; the other blocks are the MoE rows.
+__device__ __forceinline__ void group_tables(const int32_t* __restrict__ ids, int n_ent, int K_, int n_expert,
+                                             const uint8_t* __restrict__ blobs, unsigned long long blob,
+                                             unsigned long long* __restrict__ grp_ptr,
+                                             int32_t* __restrict__ grp_start, int32_t* __restrict__ n_groups,
+                                             int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok,
+                                             int* __restrict__ cnt, int* __restrict__ off) {
+    for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int g = 0, pos = 0;
+        for (int x = 0; x < n_expert; ++x) {
+            off[x] = pos;
+            if (cnt[x] == 0) continue;
+            grp_ptr[g] = (unsigned long long) (blobs + (size_t) x * blob);
+            grp_start[g] = pos;
+            pos += cnt[x];
+            ++g;
+        }
+        grp_start[g] = pos;
+        *n_groups = g;
+        for (int e = 0; e < n_ent; ++e) {
+            const int p = off[ids[e]]++;
+            ent_dst[p] = e;
+            ent_tok[p] = e / K_;
+        }
+    }
+}
+
+// The group tables (block 0) and the q8_1 image of h for the experts (blocks 1.., when the call is not already
+// staged): the engine's k_group_quant moved here, next to the expert kernels that read the tables.  Bitwise the
+// moved kernel (the staging is q8_1_store, the same XOR trees and finite rule).
+__global__ void native_group_quant_kernel(const int32_t* __restrict__ ids, int n_ent, int K_, int n_expert,
+                                          const uint8_t* __restrict__ blobs, unsigned long long blob,
+                                          unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
+                                          int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
+                                          int32_t* __restrict__ ent_tok, const float* __restrict__ qin,
+                                          block_q8_1* __restrict__ qout, int n) {
+    __shared__ int cnt[512], off[512];
+    if (blockIdx.x != 0) {
+        const int i = ((int) blockIdx.x - 1) * 256 + (int) threadIdx.x;
+        if (i >= n) return;
+        q8_1_store(qin[i], qout, i);
+        return;
+    }
+    group_tables(ids, n_ent, K_, n_expert, blobs, blob, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cnt, off);
+}
+
+__global__ void __launch_bounds__(1024) router_tail_kernel(const uint8_t* __restrict__ b_moe,
+                                                           const block_q8_1* __restrict__ tq_moe, int rank_moe,
+                                                           int n_out_moe, float* __restrict__ out_moe,
+                                                           const uint16_t* __restrict__ b_router,
+                                                           const uint16_t* __restrict__ t16_router, int rank_router,
+                                                           int n_out_router, float* __restrict__ logits,
+                                                           int32_t* __restrict__ ids, float* __restrict__ weights,
+                                                           int n_expert, int k, const uint8_t* __restrict__ blobs,
+                                                           unsigned long long blob, int n_ent,
+                                                           unsigned long long* __restrict__ grp_ptr,
+                                                           int32_t* __restrict__ grp_start,
+                                                           int32_t* __restrict__ n_groups,
+                                                           int32_t* __restrict__ ent_dst,
+                                                           int32_t* __restrict__ ent_tok, int moe_blocks) {
+    __shared__ int cnt[512], off[512];
+    const int warp = (int) threadIdx.x >> 5, lane = (int) threadIdx.x & 31;
+    if ((int) blockIdx.x < moe_blocks) {
+        const int row = (int) blockIdx.x * 32 + warp;
+        if (row < n_out_moe) {
+            const int nb = rank_moe / 128;
+            const uint8_t* wr = b_moe + (size_t) row * ((size_t) (rank_moe / 128) * sizeof(block_pq2_0));
+            float s = 0.0f;
+            for (int k2 = lane; k2 < nb; k2 += 32) {
+                const Split<142>::W w = Split<142>::load(wr, k2, 0);
+                s += Split<142>::apply(w, tq_moe + k2 * 4, 0);
+            }
+            s = warp_sum(s);
+            if (lane == 0) out_moe[row] = s;
+        }
+        return;
+    }
+    const int64_t n8 = rank_router / 8;
+    for (int o = warp; o < n_out_router; o += 32) {
+        const uint4* rp = reinterpret_cast<const uint4*>(b_router + (size_t) o * rank_router);
+        const uint4* tp = reinterpret_cast<const uint4*>(t16_router);
+        float acc = 0.0f;
+        for (int64_t k2 = lane; k2 < n8; k2 += 32) acc += f16_dot8(rp[k2], tp[k2]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) logits[o] += acc;
+    }
+    __syncthreads();
+    if (warp == 0) router_topk_body<256, 8>(logits, ids, weights, lane);
+    __syncthreads();
+    group_tables(ids, n_ent, k, n_expert, blobs, blob, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cnt, off);
+}
+
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
 // [grp_start[0], grp_start[*n_groups]) (a call's entries are contiguous; the verify window's PCIe call starts after
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
@@ -3699,6 +3801,35 @@ void iq_corr_g128_b(const void* b, const void* t_q8_1, int rank, int n_out, floa
     corr_g128_b_kernel<<<(unsigned) ((n_out + 3) / 4), dim3(32, 4), 0, (cudaStream_t) stream>>>(
         (const uint8_t*) b, (const block_q8_1*) t_q8_1, out, rank, n_out, accumulate);
     check("iq_corr_g128_b");
+}
+
+// The q36 router tail's launcher (false where the shapes do not fit the 256 x 8 template) and the moved group
+// tables' launcher: `qblocks` = 0 when the call is already staged (blocks 1.. are skipped then).
+bool native_router_tail_ok(int rank_moe, int n_out_moe, int rank_router, int n_out_router, int n_expert, int k) {
+    return n_expert == 256 && k == 8 && n_out_router == 256 && n_out_moe > 0 && rank_moe > 0 && rank_moe % 128 == 0 &&
+           rank_router > 0 && rank_router % 8 == 0;
+}
+void native_router_tail(const void* b_moe, const void* tq_moe, int rank_moe, int n_out_moe, float* out_moe,
+                        const void* b_router, const void* t16_router, int rank_router, int n_out_router,
+                        float* logits, int32_t* ids, float* weights, int n_expert, int k, const uint8_t* blobs,
+                        unsigned long long blob, int n_ent, unsigned long long* grp_ptr, int32_t* grp_start,
+                        int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok, void* stream) {
+    const int moe_blocks = (n_out_moe + 31) / 32;
+    router_tail_kernel<<<(unsigned) (moe_blocks + 1), 1024, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) b_moe, (const block_q8_1*) tq_moe, rank_moe, n_out_moe, out_moe, (const uint16_t*) b_router,
+        (const uint16_t*) t16_router, rank_router, n_out_router, logits, ids, weights, n_expert, k, blobs, blob,
+        n_ent, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, moe_blocks);
+    check("native_router_tail");
+}
+
+void native_group_quant(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
+                        unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
+                        int32_t* ent_dst, int32_t* ent_tok, const float* qin, void* qout, int n, int qblocks,
+                        void* stream) {
+    native_group_quant_kernel<<<1 + (unsigned) qblocks, 256, 0, (cudaStream_t) stream>>>(
+        ids, n_ent, K_, n_expert, blobs, blob, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, qin,
+        (block_q8_1*) qout, n);
+    check("native_group_quant");
 }
 
 // The mixed T=1 pair (see corr_mixed_a_kernel / corr_mixed_b_kernel): the MoE's g128 delta and the router's f16

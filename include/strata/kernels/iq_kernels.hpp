@@ -51,6 +51,20 @@ bool native_gemv_corr_mixed_a(const void* W, const float* h, float* y, int n_in,
 void iq_corr_mixed_b(const void* b_moe, const void* tq_moe, int rank_moe, int n_out_moe, float* out_moe,
                      const void* b_router, const void* t16_router, int rank_router, int n_out_router, float* out_router,
                      void* stream);
+/// The router tail at one row: the MoE output delta, the router f16 delta, top-k and the expert group tables in
+/// one launch (256 x 8 routers; the last two bodies are the moved k_group_quant and route_topk's own).
+bool native_router_tail_ok(int rank_moe, int n_out_moe, int rank_router, int n_out_router, int n_expert, int k);
+void native_router_tail(const void* b_moe, const void* tq_moe, int rank_moe, int n_out_moe, float* out_moe,
+                        const void* b_router, const void* t16_router, int rank_router, int n_out_router,
+                        float* logits, int32_t* ids, float* weights, int n_expert, int k, const uint8_t* blobs,
+                        unsigned long long blob, int n_ent, unsigned long long* grp_ptr, int32_t* grp_start,
+                        int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok, void* stream);
+/// The expert group tables and the q8_1 staging of h in one launch (the engine's k_group_quant; `qblocks` = 0
+/// when the call is already staged, so only the tables run).
+void native_group_quant(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
+                        unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups,
+                        int32_t* ent_dst, int32_t* ent_tok, const float* qin, void* qout, int n, int qblocks,
+                        void* stream);
 
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
