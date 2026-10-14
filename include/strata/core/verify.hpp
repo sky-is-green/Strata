@@ -314,6 +314,10 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// STRATA_VERIFY_GRAPH_TIME=1 - the replay's GPU span (events around the graph launch) and the host side
+    /// (staging/launch) of the windows since the last call, plus the captured node count per window size;
+    /// one line per stage, empty when off.  Events only: no kernel, node or stream change.
+    std::string graph_time_report();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
@@ -435,6 +439,14 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    // STRATA_VERIFY_GRAPH_TIME=1: the replay span and the host split of the windows since the last report
+    bool gt_on_ = false;
+    cudaEvent_t gt_ev0_ = nullptr, gt_ev1_ = nullptr;
+    double gt_gpu_ms_ = 0, gt_launch_ms_ = 0;   // summed replay span / launch call time (ms)
+    int64_t gt_windows_ = 0;
+    double gt_gpu_t_[9] = {};       // the same per window size T, so an ablation arm's T=1 can be compared
+    int64_t gt_windows_t_[9] = {};
+    size_t gt_nodes_[9] = {};   // captured node count per window size T (capture() fills it)
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;

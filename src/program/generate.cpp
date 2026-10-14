@@ -12805,6 +12805,11 @@ int main(int argc, char** argv) {
                     if (st == 0) std::fprintf(stderr, "strata decode GPU stages (ms/window):%s\n", pr.c_str());   // text as before
                     else std::fprintf(stderr, "strata decode GPU stages, stage %d (ms/window):%s\n", st, pr.c_str());
                 }
+                for (int st = 0; st < n_stages; ++st) {   // STRATA_VERIFY_GRAPH_TIME=1: the replay itself
+                    const std::string gr = stage_ver(st).graph_time_report();
+                    if (gr.empty()) continue;
+                    std::fprintf(stderr, "strata decode replay, stage %d:%s\n", st, gr.c_str());
+                }
             }
             if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
             if (!cancelled) {

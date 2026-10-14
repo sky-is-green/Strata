@@ -522,6 +522,8 @@ Verifier::~Verifier() {
     if (ev_done_) cudaEventDestroy(ev_done_);
     if (ev_commit_) cudaEventDestroy(ev_commit_);
     if (prof_pin_) cudaFreeHost(prof_pin_);
+    if (gt_ev0_) cudaEventDestroy(gt_ev0_);
+    if (gt_ev1_) cudaEventDestroy(gt_ev1_);
     if (ev_fork_) cudaEventDestroy(ev_fork_);
     if (ev_join_) cudaEventDestroy(ev_join_);
     for (cudaStream_t s : df_side_)
@@ -739,6 +741,23 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const size_t np = (size_t) g.n_layers * kProfPer + 4;
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
+    }
+    // STRATA_VERIFY_GRAPH_TIME=1: events around the replay (the GPU span) and the host split of the window.
+    // Timed this stage's own stream; off by default and side-effect free (events are recorded around the launch,
+    // never inside the captured graph).
+    gt_on_ = [] {
+        const char* e = std::getenv("STRATA_VERIFY_GRAPH_TIME");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (gt_on_) {
+        const bool ok0 = cudaEventCreate(&gt_ev0_) == cudaSuccess;
+        const bool ok1 = ok0 && cudaEventCreate(&gt_ev1_) == cudaSuccess;
+        if (!ok1) {
+            (void) cudaGetLastError();
+            if (gt_ev0_) { cudaEventDestroy(gt_ev0_); gt_ev0_ = nullptr; }
+            if (gt_ev1_) { cudaEventDestroy(gt_ev1_); gt_ev1_ = nullptr; }
+            gt_on_ = false;
+        }
     }
     Bump real;
     real.base = (uint8_t*) arena_;
@@ -1620,6 +1639,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
+            // STRATA_VERIFY_ABLATE=1 (bench-only): the routed expert GEMMs are skipped, so the replay time splits
+            // into the expert weights and everything else (with STRATA_VERIFY_GRAPH_TIME=1).  The output is
+            // garbage; never a served configuration.
+            static const bool ablate = [] {
+                const char* e = std::getenv("STRATA_VERIFY_ABLATE");
+                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            }();
+            static const bool ablate_said = !ablate || (std::fprintf(stderr,
+                "strata verify: STRATA_VERIFY_ABLATE=1: the routed expert GEMMs are skipped (bench-only, the output is garbage)\n"), true);
+            (void) ablate_said;
+            if (ablate) return;
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
@@ -1872,6 +1902,35 @@ std::string Verifier::profile_report() {
     return out;
 }
 
+// STRATA_VERIFY_GRAPH_TIME=1: the replay's GPU span (events around the graph launch) and the host side of the
+// windows since the last call, plus the captured node count per window size.  One line per stage; empty when off.
+// The replay span of a pipelined window includes its in-graph waits (the window can be launched before its inputs
+// or its GPU plan are ready), which is exactly what the host cannot see from the launch return time.
+std::string Verifier::graph_time_report() {
+    if (!gt_on_ || gt_windows_ == 0) return std::string();
+    char b[128];
+    std::string out;
+    const double w = (double) gt_windows_;
+    std::snprintf(b, sizeof b, " replay %.2f ms gpu over %lld windows; launch call %.3f ms/window",
+                  gt_gpu_ms_ / w, (long long) gt_windows_, gt_launch_ms_ / w);
+    out += b;
+    for (int T = 1; T <= 8; ++T) {
+        if (gt_windows_t_[T] == 0) continue;
+        std::snprintf(b, sizeof b, " | T=%d %.2f ms x%lld", T, gt_gpu_t_[T] / (double) gt_windows_t_[T],
+                      (long long) gt_windows_t_[T]);
+        out += b;
+        if (gt_nodes_[T] > 0) {
+            std::snprintf(b, sizeof b, " (%zu nodes)", gt_nodes_[T]);
+            out += b;
+        }
+    }
+    gt_gpu_ms_ = 0;
+    gt_launch_ms_ = 0;
+    gt_windows_ = 0;
+    for (int T = 1; T <= 8; ++T) { gt_gpu_t_[T] = 0; gt_windows_t_[T] = 0; }
+    return out;
+}
+
 // #871: is the zero-doorbell graph right for the next window?  Only while every expert of [lb_, le_) is in VRAM now
 // (the host table is the one the device copy was uploaded from; a loan, a VRAM shrink or a swap in flight has
 // marked some -1).  Not: the doorbell graph, which asks the pool for what the device does not hold.
@@ -1917,6 +1976,15 @@ bool Verifier::capture(int T, std::string& err) {
     if (ce != cudaSuccess) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
+    }
+    if (gt_on_) {   // STRATA_VERIFY_GRAPH_TIME: the captured node count for this window size
+#if defined(STRATA_USE_HIP)
+        size_t nn = 0;
+        if (hipGraphGetNodes(graph, nullptr, &nn) == hipSuccess && T >= 1 && T <= 8) gt_nodes_[T] = nn;
+#else
+        size_t nn = 0;
+        if (cudaGraphGetNodes(graph, nullptr, &nn) == cudaSuccess && T >= 1 && T <= 8) gt_nodes_[T] = nn;
+#endif
     }
 #if defined(STRATA_USE_HIP)   // 143-amdk: the same listing on HIP (kernel names by hipKernelNameRefByPtr); STRATA_VERIFY_NODES=2 also lists the first nodes in graph order
     if (std::getenv("STRATA_VERIFY_NODES") != nullptr) {
@@ -2286,6 +2354,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
         !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+    if (gt_on_) cudaEventRecord(gt_ev0_, cs_);
+    const Clock::time_point tl = Clock::now();
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
     static const bool threaded_launch = [] {
@@ -2298,6 +2368,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #else
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
 #endif
+    if (gt_on_) { gt_launch_ms_ += ms_since(tl); cudaEventRecord(gt_ev1_, cs_); }
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -2433,6 +2504,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (gt_on_) {   // the replay span: both events are on cs_, ev1 right after the launch
+        float gms = 0.0f;
+        if (cudaEventElapsedTime(&gms, gt_ev0_, gt_ev1_) == cudaSuccess) {
+            gt_gpu_ms_ += gms; ++gt_windows_;
+            gt_gpu_t_[T] += gms; ++gt_windows_t_[T];
+        } else (void) cudaGetLastError();
+    }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
@@ -3459,7 +3537,10 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
+    if (gt_on_) cudaEventRecord(gt_ev0_, cs_);
+    const Clock::time_point tl = Clock::now();
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    if (gt_on_) { gt_launch_ms_ += ms_since(tl); cudaEventRecord(gt_ev1_, cs_); }
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
@@ -3588,6 +3669,13 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     fl_active_ = false;
+    if (gt_on_) {   // the replay span of this pipelined window (events around its own launch)
+        float gms = 0.0f;
+        if (cudaEventElapsedTime(&gms, gt_ev0_, gt_ev1_) == cudaSuccess) {
+            gt_gpu_ms_ += gms; ++gt_windows_;
+            gt_gpu_t_[fl_T_] += gms; ++gt_windows_t_[fl_T_];
+        } else (void) cudaGetLastError();
+    }
     if (fl_prof_) accumulate_profile(prof_pin_);
     ++windows;
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
