@@ -94,6 +94,61 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 10 (2026-10-14 15:10-) - arena-adapt WIRED INTO D3 (DSpark), MARGIN measured, REAL-TASK eval started
+**Read this block first.**  Code `976b76fe`.  Mal's aim (2026-10-14): **30-40 tok/s with quality maintained**, and
+"have you tested the bias on actual coding / agentic / tool calling?" - answer at handoff: NO, only token agreement
+(teacher-forced API top-1) + prose loops.  Real-task screen built and running (below).
+- Reboot overnight killed the HF upload; SSD NVME was unmounted (`udisksctl mount -b /dev/nvme0n1p3`).  **HF done:**
+  Q2_K sidecar on the Hub (size-verified), card published (commit 89aa0665) - `~/AI/v41-dev/hf/upload_q2k_and_card.sh`.
+- `score_official.py score` mapped req files by ROW: scoring short34 against a short (102) run gave garbage (4% top-1).
+  Fixed (case id via run.json meta).  short34 tracks the full 102 within ~1 pt - the subset baselines below are free.
+- **34-case subset, API top-1 / 128-tok plain decode docs / python tok/s** (`~/AI/v41-dev/s10/`):
+  | config | top-1 | plain | plain + `--arena-adapt` | DSpark | DSpark + arena-adapt |
+  |---|---|---|---|---|---|
+  | exact (no bias) | 85.92% | 5.5 / 3.5 (96 tok) | 6.6 / 5.4 | - | - |
+  | MARGIN=0.1 | 85.36% | 8.4 / 5.0 | - | - | - |
+  | x0.25 + arena-adapt (quality measured, not assumed) | 85.31% | - | 14.7 / 11.4 | - | **13.7 / 16.1** |
+  | flat x0.25 | 84.93% | 11.8 / 6.8 | 14.7 / 11.4 | 8.9 / 8.5 | 13.7 / 16.1 |
+  | PROTECT=3 | 84.27% | ~10.6 / 6.6 (256) | - | - | - |
+  | MARGIN=0.3 | 83.47% | 13.0 / 7.7 | - | - | - |
+  | x0.5 | 81.59% | 16.8 / 10.3 | 18.4 / 15.6 | 16.7 / 14.6 | **22.3 / 22.9** |
+  | default 1.0 | 72.98% | 24.4 / 17.3 | ~neutral | 37.7 / 28.2 | **37.7 / 39.1** |
+  MARGIN loses to flat x0.25 (+arena-adapt) on both axes - smart bias is done, flat scale + arena-adapt wins.
+  arena-adapt with bias on changes residency hence (in principle) routing: x0.25 tokens identical over 128 on docs and
+  python, x0.5 diverge at 74 / 30 - so quality is measured per config, never assumed.
+- **arena-adapt in D3** (`gpu_run_n_ex`): it was actively HARMFUL there (never bumped tick/last_use -> froze the
+  vram_lru clock; disabled FILEG -> file misses fell to serial acquire + pool).  Now FILEG stays on and each file blob
+  is read straight into an LRU arena victim slot (pinned; the DMA sources it there), swaps published after the call's
+  final sync.  Helpers `arena_victim` / `arena_publish_swap` / `arena_check_swap` shared with gpu_run.  The checker
+  now publishes all of a call's swaps before verifying (adjacent victims gave a FALSE "NEIGHBOUR CORRUPT").
+  DS41_CHECK_ARENA: 3200+ swaps x 2 runs (x0.5 python, x0.25 docs), 0 bad.
+- **Confidence-gate screen** (`~/AI/v41-dev/s10/gate_sim.py`, offline from the q_bias / q_exact logit dumps): "biased
+  row unless its top-1 p < t, else exact row".  The bias makes the model CONFIDENTLY wrong (median p at bias errors
+  0.57): back to 83.5% needs 40% of positions re-done at bias 1.0 (28% at x0.5 for 85.3%).  Not a free lunch.
+- **Real-task screen** `~/AI/v41-dev/taskeval/` (`taskeval.py run|score`, `arm.sh <name> <engine args>`,
+  `pipeline.sh`): serve_ds41.py on :8151 with the build-ds4-dspark binary (`engine.sh`, cfg.json), greedy, thinking
+  off.  21 HumanEval (every 8th, own check()), 10 tool-choice cases (structural), 3 agentic bug-fix loops (mock FS,
+  read_file / write_file / run_tests, hidden tests).  Graders validated (canonical 21/21, buggy files fail, reference
+  fixes pass).  Arms: def (bias 1.0) / aa025 (x0.25 + arena-adapt) / exact (+ arena-adapt; routing identical).
+  DSpark output = the trunk's greedy output, so plain serve measures DSpark's quality too.
+  **RESULTS (stopped at Mal's call 17:45 before the exact arm; aa025's agent set not reached; per-case lines in
+  `r_def.out` / `r_aa025.out`, full texts in `r_def/results.json`):**
+  | arm | HumanEval (21) | tool calls | agentic bug-fix | tok/s needed path |
+  |---|---|---|---|---|
+  | bias 1.0 (default, DSpark 37.7 / 39.1) | **16/21** (76%) | 10/10 | 3/3 | |
+  | x0.25 + arena-adapt (DSpark 13.7 / 16.1) | **20/21** (95%) | 8/8 run (all pass) | not run | |
+  Paired: bias 1.0 failed 0, 32, 80, 120, 128; x0.25 failed only 32 (find_zero - hard).  The 4 extra bias-1.0 failures
+  are careless LOGIC slips on easy problems (compares an element with itself; misses one of three pairwise checks;
+  descending instead of ascending; sets the sign instead of flipping it) - exactly what a degraded router looks like.
+  4-0 discordant pairs: sign test p = 0.125 two-sided - strongly suggestive, not proof at n=21.
+  Reading: the full-speed bias does NOT break tool calling / simple agentic loops, but it DOES cost coding correctness
+  (~-19 pt HumanEval).  NEXT: x0.5 + arena-adapt (DSpark 22.3 / 22.9 tok/s, 81.6% agreement) on the same screen, and
+  the file-penalty-only sweep, looking for a config at 30+ tok/s that keeps HumanEval near 20/21.
+- Ideas queued for the 30-40 tok/s target: (a) file-penalty-only bias (`--route-bias 0 --route-bias-file f`, + arena-
+  adapt the file tier = cold experts) - 2D sweep of (rb, rbf); (b) pass-union bias in DSpark verify (bias only toward
+  experts another token of the same pass already loads - they are paid for); (c) the task screen decides how much the
+  token-agreement loss actually matters.
+
 ### Session 9d (2026-10-14 03:00-06:05) - SMART route bias measured; --arena-adapt FIXED (exact routing +26-60%)
 **Read this block first.**  Code: `43cf3354` (smart bias), arena fix (commit below this block's date).
 - **Smart route bias** (opt-in env, `tools/v41/engine/ds41_dense.cpp` router, `build_attn`): `STRATA_RB_PROTECT=P` keeps
