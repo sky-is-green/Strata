@@ -1808,6 +1808,91 @@ __global__ void native_q8_0_packed_kernel(const int8_t* __restrict__ qs, const h
 }
 
 struct Q8Packed { const int8_t* qs; const half* d; int n_in, n_out; };
+
+// The ncols = 1 pair (the 35B q36 driver's qkv+zg / wk+wv pattern): two Q8_0 matrices that share one q8_1
+// activation in one launch.  Every row block runs the single-call kernel's own body (packed or small,
+// whichever the single calls would take), so the pair is bitwise the two calls.
+__global__ void __launch_bounds__(WARPS * WARP, 1) q8_0_packed_pair1_kernel(
+    const int8_t* __restrict__ qs1, const half* __restrict__ d1, int n_out1, const int8_t* __restrict__ qs2,
+    const half* __restrict__ d2, int n_out2, const Q81Block* __restrict__ x, float* __restrict__ y1,
+    float* __restrict__ y2, int n_in, int row_step) {
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int nb = n_in / 32;
+    const int kqs = 2 * (tid % 4);
+    __shared__ float partial[2][WARPS - 1][WARP];
+    int buf = 0;
+    const int total = n_out1 + n_out2;
+    for (int r = int(blockIdx.x); r < total; r += row_step, buf ^= 1) {
+        const bool first = r < n_out1;
+        const int row = first ? r : r - n_out1;
+        const int8_t* qs = first ? qs1 : qs2;
+        const half* dpl = first ? d1 : d2;
+        float tmp = 0.0f;
+        for (int kbx = tid / 4; kbx < nb; kbx += 2 * WARPS * WARP / 8) {
+            const std::size_t block = std::size_t(row) * nb + kbx;
+            const int* p = reinterpret_cast<const int*>(qs + block * 32) + kqs;
+            const int v0 = STRATA_Q8P_LOAD(p);
+            const int v1 = STRATA_Q8P_LOAD(p + 1);
+            const float d0 = dpl[block];
+            const Q81Block* xb = x + kbx;
+            const int* u = reinterpret_cast<const int*>(xb->qs);
+            int sumi = 0;
+            sumi = STRATA_DP4A(v0, u[kqs], sumi);
+            sumi = STRATA_DP4A(v1, u[kqs + 1], sumi);
+            tmp += d0 * __low2float(xb->ds) * float(sumi);
+        }
+        if (threadIdx.y > 0) partial[buf][threadIdx.y - 1][threadIdx.x] = tmp;
+        __syncthreads();
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp += partial[buf][l][threadIdx.x];
+            tmp = warp_sum(tmp);
+            if (threadIdx.x == 0) (first ? y1 : y2)[row] = tmp;
+        }
+    }
+}
+
+template<bool SmallK>
+__global__ void __launch_bounds__(WARPS * WARP, 1) q8_0_small_pair1_kernel(
+    const Q80Block* __restrict__ w1, int n_out1, const Q80Block* __restrict__ w2, int n_out2,
+    const Q81Block* __restrict__ x, float* __restrict__ y1, float* __restrict__ y2, int n_in) {
+    constexpr int Qi = 8;
+    constexpr int ROWS = SmallK ? WARPS : 1;
+    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 32;
+    const int total = n_out1 + n_out2;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / (Qi / 2); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kqs = 2 * (tid % (Qi / 2));
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            const int r = row0 + i;
+            if (r < total) {
+                const Q80Block* w = r < n_out1 ? w1 + std::size_t(r) * blocks_per_row
+                                               : w2 + std::size_t(r - n_out1) * blocks_per_row;
+                tmp[i] += small_q8_dot(w + kbx, x + kbx, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        const int r = row0 + i;
+        if (threadIdx.x == i && r < total) (r < n_out1 ? y1 : y2)[r < n_out1 ? r : r - n_out1] = tmp[i];
+    }
+}
+
 std::unordered_map<const void*, Q8Packed>& q8_packed_registry() {
     static std::unordered_map<const void*, Q8Packed> registry;
     return registry;
@@ -2481,6 +2566,45 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         case 7: q8_0_pair_launch<7>(a, b, x, y1, y2, n_in, n_out, s); break;
         default: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
     }
+    launch_check();
+    return true;
+}
+
+// The ncols = 1 pair over the Q8_0 matrices the decode reads two at a time (qkv+zg, wk+wv): one launch, each
+// row block the body of the single call that matrix would take (packed or small).  Returns false (nothing
+// launched) where that does not hold; the caller falls back to the two calls.
+bool native_mmvq_pair1(int ggml_type, const void* w1, int n_out1, const void* w2, int n_out2, const void* x_q8_1,
+                       float* y1, float* y2, int n_in, void* stream) {
+    if (ggml_type != 8 || n_in <= 0 || n_in % 32 != 0 || n_out1 <= 0 || n_out2 <= 0 || !w1 || !w2 || !x_q8_1 ||
+        !y1 || !y2 || !stream)
+        return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    auto& reg = q8_packed_registry();
+    const auto f1 = reg.find(w1), f2 = reg.find(w2);
+    if (f1 != reg.end() && f2 != reg.end()) {
+        if (f1->second.n_in != n_in || f2->second.n_in != n_in || f1->second.n_out != n_out1 ||
+            f2->second.n_out != n_out2 || n_in > Q8P_PERSIST_MAX_IN || s26_tsum_on())
+            return false;
+        const int total = n_out1 + n_out2;
+        const int grid = (std::min)(total, Q8P_PERSIST_GRID);
+        q8_0_packed_pair1_kernel<<<unsigned(grid), dim3(WARP, WARPS), 0, s>>>(
+            f1->second.qs, f1->second.d, n_out1, f2->second.qs, f2->second.d, n_out2, x, y1, y2, n_in, grid);
+        launch_check();
+        return true;
+    }
+    if (reg.count(w1) || reg.count(w2)) return false;   // one packed, one not: the singles differ in kernel
+    constexpr int Qi = 8;
+    const int blocks_per_row = n_in / 32;
+    const bool smallk = blocks_per_row < 2 * WARPS * WARP / Qi;
+    const int rows_per = smallk ? WARPS : 1;
+    const unsigned blocks = unsigned((n_out1 + n_out2 + rows_per - 1) / rows_per);
+    if (smallk)
+        q8_0_small_pair1_kernel<true><<<blocks, dim3(WARP, WARPS), 0, s>>>(
+            static_cast<const Q80Block*>(w1), n_out1, static_cast<const Q80Block*>(w2), n_out2, x, y1, y2, n_in);
+    else
+        q8_0_small_pair1_kernel<false><<<blocks, dim3(WARP, WARPS), 0, s>>>(
+            static_cast<const Q80Block*>(w1), n_out1, static_cast<const Q80Block*>(w2), n_out2, x, y1, y2, n_in);
     launch_check();
     return true;
 }

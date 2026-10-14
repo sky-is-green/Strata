@@ -134,6 +134,12 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
 
+/// The same idea at one column (the decode's qkv+zg / wk+wv): two Q8_0 matrices that share the q8_1 activation,
+/// possibly of different output sizes, in one launch - each row the single call's own kernel body (the packed
+/// path when both are registered, else the small path).  Returns false where that does not hold.
+bool native_mmvq_pair1(int ggml_type, const void* w1, int n_out1, const void* w2, int n_out2, const void* x_q8_1,
+                       float* y1, float* y2, int n_in, void* stream);
+
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
 // (position-major), float d[nb][CP] (each block's scale as the dots read it, __low2float of ds).

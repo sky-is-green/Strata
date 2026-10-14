@@ -1390,6 +1390,15 @@ struct Engine {
         prep(xin, w.n_in, T, q8);
         apply(w, q8, out, T);
     }
+    /// y1 = W1 x, y2 = W2 x in one launch at one row (the two applications' shared activation); falls back to
+    /// the two calls where the pair is not available.
+    void mm_pair(const Mat& w1, float* y1, const Mat& w2, float* y2, int T) {
+        if (T == 1 && w1.n_in == w2.n_in &&
+            K::native_mmvq_pair1(w1.type, w1.d, w1.n_out, w2.d, w2.n_out, xq, y1, y2, w1.n_in, st))
+            return;
+        apply(w1, xq, y1, T);
+        apply(w2, xq, y2, T);
+    }
     /// y [T][n_out] = W [n_out][n_in] (f32) x [T][n_in]: a decode batch on the warp-per-row kernel, a prompt chunk on
     /// cuBLAS's FP32 GEMM (the router and the GDN alpha / beta stay in FP32, as llama.cpp keeps them).
     void f32mm(const float* W, const float* xin, float* out, int n_in, int n_out, int T) {
@@ -1524,8 +1533,7 @@ struct Engine {
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
             if (!xq_hot) prep(h, N, T, xq);
-            apply(L.qkv, xq, qkv_b, T);
-            apply(L.zg, xq, z, T);
+            mm_pair(L.qkv, qkv_b, L.zg, z, T);
             tick(0, false);
             tick(1, true);   // the GDN core: alpha/beta, the conv, the delta rule, the norm
             if (T <= kGemmT) {
@@ -1563,8 +1571,7 @@ struct Engine {
         } else {
             if (!xq_hot) prep(h, N, T, xq);
             apply(L.wq, xq, qg, T);
-            apply(L.wk, xq, kx, T);
-            apply(L.wv, xq, vx, T);
+            mm_pair(L.wk, kx, L.wv, vx, T);
             tick(0, false);
             tick(1, true);   // the attention core: prep + scores/values + the gate
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, kc[li], vc[li], H,
