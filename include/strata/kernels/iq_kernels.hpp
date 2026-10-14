@@ -104,6 +104,9 @@ void native_grouped_set_v1(bool v1);
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
 void native_expert_set_mode(int mode, int phase);
+/// The bench only: the down phase's rows-per-warp kernel (bitwise the one-row mapping; on by default where it
+/// applies, STRATA_IQ_DOWN_ROWS=0 disables at startup).  Set before graph capture; captured graphs keep theirs.
+void native_expert_set_down_rows(bool v);
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;
 /// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.

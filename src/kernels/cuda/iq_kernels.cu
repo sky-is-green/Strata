@@ -1735,6 +1735,46 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
     else row_dot_40_sub8<TD, NC, EXACT_N>(row, x, off, n, t, s);
 }
 
+// The down phase with Q = 32 / nb rows per warp: lane (q, p) = (lane / nb, lane % nb) decodes row q's block p
+// once and applies it to every entry of the group; the per-row sum is the down kernels' 32-lane XOR tree with
+// only the row's nb lanes active, emulated with masked shuffles (lane p adds the value of lane p ^ off when
+// p ^ off < nb, else +0) - every output is bitwise the single-row kernels'.  For the PTQ1_0 / PQ2_0 down shapes
+// (nb 4-5) this puts 4-6 rows' decode in the instructions the one-row mapping spends on a single row.
+template<int TD>
+__global__ void __launch_bounds__(256) native_down_rows_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+                                                               const int32_t* __restrict__ ent_dst,
+                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                               float* __restrict__ out) {
+    using F = Fmt<TD>;
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
+    const int Q = 32 / nb;                        // rows per warp
+    const int q = lane / nb, p = lane % nb;       // row within the warp's group, block within the row
+    const int r = (blockIdx.x * 8 + warp) * Q + q;
+    const bool rvalid = q < Q && r < L.n_embd;
+    const uint8_t* wr = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) (rvalid ? r : 0) * L.d_row;
+    const typename Split<TD>::W w = Split<TD>::load(wr, p, 0);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;   // NVFP4: s_down
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            float v = Split<TD>::apply(w, hq + (size_t) e * hb + p * (F::qk / 32), 0);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const int p2 = p ^ off;
+                const float t = (p2 < nb) ? __shfl_sync(0xffffffffu, v, q * nb + p2) : 0.0f;
+                v += t;
+            }
+            if (p == 0 && rvalid) out[(size_t) ent_dst[e] * L.n_embd + r] = v * sd;
+        }
+    }
+}
+
 // native_down_kernel with the entries taken GRP_NC at a time
 template<int TD, bool SUB_DOWN = true>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -2592,6 +2632,12 @@ bool env_on(const char* name) {
 }
 // STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
 bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
+// The down phase's rows-per-warp kernel (bitwise the one-row mapping; qk-128 formats with short rows): on by
+// default where it applies, STRATA_IQ_DOWN_ROWS=0 disables, the bench toggles it with the setter.
+bool g_down_rows = [] {
+    const char* v = std::getenv("STRATA_IQ_DOWN_ROWS");
+    return v == nullptr || v[0] != '0';
+}();
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
@@ -3326,6 +3372,17 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
                  float* out, bool single = false) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else if constexpr (TD == 142 || TD == 143) {
+        const int nb = (int) (L.n_ff / Fmt<TD>::qk);
+        if (!g_old_kernels && g_down_rows && nb >= 2 && nb <= 16) {
+            const int Q = 32 / nb;
+            const dim3 gr((unsigned) ((L.n_embd + 8 * Q - 1) / (8 * Q)), grid.y);
+            native_down_rows_kernel<TD><<<gr, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            return;
+        }
+        if (g_old_kernels || single) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_multi_kernel<TD, kSub16<TD>><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    }
     else if (g_old_kernels || single) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_no_sub16_gu) native_down_multi_kernel<TD, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD, kSub16<TD>><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
@@ -3335,6 +3392,7 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
+void native_expert_set_down_rows(bool v) { g_down_rows = v; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }

@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     }
     const int G = std::atoi(argv[3]), T = std::atoi(argv[4]), mref = std::atoi(argv[5]), mode = std::atoi(argv[6]);
     const int iters = argc > 7 ? std::atoi(argv[7]) : 200;
+    const bool single = argc > 8 ? std::atoi(argv[8]) != 0 : false;   // the per-entry kernels (single_entry)
     const int NTOK = 8;
     if (T < 1 || T > NTOK || G < 1) { std::fprintf(stderr, "tokens 1..8, groups >= 1\n"); return 2; }
     const int64_t H = 2560, FF_FULL = 640, FF = FF_FULL;   // Flash-Next's expert geometry
@@ -119,9 +120,10 @@ int main(int argc, char** argv) {
         K::quantize_q8_1_rows((const float*) dx, NTOK, H, dxq, s);
         auto run = [&](int m, int phase) {
             K::native_expert_set_mode(m, phase);
-            K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G, NE, dxq, dscr, dout, s);
+            K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G, NE, dxq, dscr, dout, s, 0, single);
         };
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
+        K::native_expert_set_down_rows(false);   // the reference arm: the one-row down mapping
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
         run(mref, 0);
         cudaMemcpyAsync(ref.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost, s);
@@ -151,12 +153,26 @@ int main(int argc, char** argv) {
         for (int round = 0; round < 3; ++round)   // interleaved, the minimum: the clocks wander between runs
             for (int k = 0; k < 2; ++k)
                 for (int p = 0; p < 3; ++p) us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p));
-        std::printf("layer %2d %-7s/%-6s G %d T %d | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
+        std::printf("layer %2d %-7s/%-6s G %d T %d%s | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
                     " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s) | %s\n",
                     l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
+                    single ? " single" : "",
                     mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
                     mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
                     ndiff ? "DIFFERS" : "bitwise equal");
+        // the rows-per-warp down kernel: outputs against the one-row mapping (the ref above) and its time
+        K::native_expert_set_down_rows(true);
+        cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+        run(0, 0);
+        cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
+        const double rows_d = time(0, 2);
+        if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error (rows)\n", l); return 1; }
+        size_t rdiff = 0;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (std::memcmp(&ref[i], &got[i], 4) != 0) ++rdiff;
+        std::printf("          down rows-per-warp: %6.1f -> %6.1f us (%3.0f GB/s), outputs %s\n", us[0][2], rows_d,
+                    d_b / rows_d / 1e3, rdiff ? "DIFFER" : "bitwise equal");
+        if (rdiff) ++failures;
         if (ndiff) {
             std::printf("          %zu of %zu outputs differ, worst rel %.2e\n", ndiff, ref.size(), worst);
             ++failures;
