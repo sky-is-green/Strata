@@ -42,9 +42,11 @@ int main(int argc, char** argv) {
     const int G = std::atoi(argv[3]), T = std::atoi(argv[4]), mref = std::atoi(argv[5]), mode = std::atoi(argv[6]);
     const int iters = argc > 7 ? std::atoi(argv[7]) : 200;
     const bool single = argc > 8 ? std::atoi(argv[8]) != 0 : false;   // the per-entry kernels (single_entry)
+    const int64_t H = argc > 9 ? std::atoll(argv[9]) : 2560;          // the expert geometry (Flash-Next default)
+    const int64_t FF = argc > 10 ? std::atoll(argv[10]) : 640;
+    const int64_t FF_FULL = FF;
     const int NTOK = 8;
     if (T < 1 || T > NTOK || G < 1) { std::fprintf(stderr, "tokens 1..8, groups >= 1\n"); return 2; }
-    const int64_t H = 2560, FF_FULL = 640, FF = FF_FULL;   // Flash-Next's expert geometry
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
@@ -58,25 +60,23 @@ int main(int argc, char** argv) {
             for (int r = 0; r < 3; ++r)
                 if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
-        cpu::NativeFmt f;
-        std::string err;
-        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
-            std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
+        const K::NativeExpertLayout L = K::native_expert_layout((int) t[0]->type, (int) t[2]->type, H, FF);
+        if (L.bytes == 0 || L.gu_row == 0 || L.d_row == 0) {
+            std::printf("layer %d: the expert layout does not take types %d/%d at %lldx%lld\n", l, (int) t[0]->type,
+                        (int) t[2]->type, (long long) H, (long long) FF);
+            ++failures;
+            continue;
         }
-        cpu::NativeFmt ff;    // the full expert's geometry, for strides into the GGUF
-        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF_FULL, ff, err)) {
-            std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
-        }
-        const size_t dsz = f.bytes - f.down_off, dsz_full = ff.bytes - ff.down_off;
-        const size_t drow = dsz / H, drow_full = dsz_full / H;
-        std::vector<uint8_t> blobs((size_t) G * f.bytes);
+        const int64_t n_exp = t[0]->shape.size() > 2 ? t[0]->shape[2] : 1;
+        const size_t dsz = (size_t) L.bytes - L.down_off, drow = dsz / H;
+        std::vector<uint8_t> blobs((size_t) G * L.bytes);
         for (int g = 0; g < G; ++g) {
-            const size_t E = (size_t) ((g * 37 + 5) % 256);
-            uint8_t* b = blobs.data() + (size_t) g * f.bytes;
-            std::memcpy(b, gguf.tensor_data(*t[0]) + E * ff.up_off, f.up_off);
-            std::memcpy(b + f.up_off, gguf.tensor_data(*t[1]) + E * ff.up_off, f.up_off);
+            const size_t E = (size_t) ((g * 37 + 5) % n_exp);
+            uint8_t* b = blobs.data() + (size_t) g * L.bytes;
+            std::memcpy(b, gguf.tensor_data(*t[0]) + E * L.up_off, L.up_off);
+            std::memcpy(b + L.up_off, gguf.tensor_data(*t[1]) + E * L.up_off, L.up_off);
             for (int64_t r = 0; r < H; ++r)
-                std::memcpy(b + f.down_off + r * drow, gguf.tensor_data(*t[2]) + E * dsz_full + r * drow_full, drow);
+                std::memcpy(b + L.down_off + r * drow, gguf.tensor_data(*t[2]) + E * dsz + r * drow, drow);
         }
         std::mt19937 rng(17 + l);
         std::normal_distribution<float> nd(0.f, 1.f);
@@ -85,7 +85,6 @@ int main(int argc, char** argv) {
         const int NE = G * T;
         std::vector<unsigned long long> ptr(G);
         std::vector<int32_t> start(G + 1), dst(NE), tok(NE);
-        const auto L = K::native_expert_layout(f.gu_type, f.d_type, H, FF);
         uint8_t* dblob;
         void *dx, *dxq, *dscr;
         float* dout;
@@ -102,7 +101,7 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &ddst, (size_t) NE * 4);
         cudaMalloc((void**) &dtok, (size_t) NE * 4);
         for (int g = 0; g < G; ++g) {
-            ptr[g] = (unsigned long long) (dblob + (size_t) g * f.bytes);
+            ptr[g] = (unsigned long long) (dblob + (size_t) g * L.bytes);
             start[g] = g * T;
             for (int j = 0; j < T; ++j) {
                 dst[g * T + j] = g * T + j;
@@ -124,6 +123,7 @@ int main(int argc, char** argv) {
         };
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
         K::native_expert_set_down_rows(false);   // the reference arm: the one-row down mapping
+        K::native_expert_set_gu_rows(false);     // ... and the one-row gate/up mapping
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
         run(mref, 0);
         cudaMemcpyAsync(ref.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost, s);
@@ -148,19 +148,31 @@ int main(int argc, char** argv) {
             cudaEventElapsedTime(&ms, e0, e1);
             return 1e3 * ms / iters;
         };
-        const double gu_b = (double) G * 2 * f.up_off, d_b = (double) G * dsz;
+        const double gu_b = (double) G * 2 * L.up_off, d_b = (double) G * dsz;
         double us[2][3] = {{1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}};
         for (int round = 0; round < 3; ++round)   // interleaved, the minimum: the clocks wander between runs
             for (int k = 0; k < 2; ++k)
                 for (int p = 0; p < 3; ++p) us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p));
         std::printf("layer %2d %-7s/%-6s G %d T %d%s | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
                     " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s) | %s\n",
-                    l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
+                    l, ggml_type_name((ggml_type) L.gu_type), ggml_type_name((ggml_type) L.d_type), G, T,
                     single ? " single" : "",
                     mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
                     mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
                     ndiff ? "DIFFERS" : "bitwise equal");
-        // the rows-per-warp down kernel: outputs against the one-row mapping (the ref above) and its time
+        // the rows-per-warp kernels: outputs against the one-row mapping (the ref above) and their times
+        K::native_expert_set_gu_rows(true);
+        cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+        run(0, 0);
+        cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
+        const double rows_g = time(0, 1);
+        if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error (rows gu)\n", l); return 1; }
+        size_t gdiff = 0;
+        for (size_t i = 0; i < ref.size(); ++i)
+            if (std::memcmp(&ref[i], &got[i], 4) != 0) ++gdiff;
+        std::printf("          gu rows-per-warp: %6.1f -> %6.1f us (%3.0f GB/s), outputs %s\n", us[0][1], rows_g,
+                    gu_b / rows_g / 1e3, gdiff ? "DIFFER" : "bitwise equal");
+        if (gdiff) ++failures;
         K::native_expert_set_down_rows(true);
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
         run(0, 0);

@@ -107,6 +107,8 @@ void native_expert_set_mode(int mode, int phase);
 /// The bench only: the down phase's rows-per-warp kernel (bitwise the one-row mapping; on by default where it
 /// applies, STRATA_IQ_DOWN_ROWS=0 disables at startup).  Set before graph capture; captured graphs keep theirs.
 void native_expert_set_down_rows(bool v);
+/// The bench only: the gate/up phase's rows-per-warp kernel (Q = 32/nb >= 2; STRATA_IQ_GU_ROWS=0 disables).
+void native_expert_set_gu_rows(bool v);
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;
 /// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.

@@ -1775,6 +1775,48 @@ __global__ void __launch_bounds__(256) native_down_rows_kernel(const unsigned lo
     }
 }
 
+// The gate/up phase with Q = 32 / nb rows per warp (the down phase's rows kernel, applied to the 2*n_ff row
+// space): lane (q, p) decodes row q's block p once, applies it to every entry of the group, and the per-row sum
+// reproduces the one-row kernels' 32-lane XOR tree with only nb active lanes via masked shuffles - bitwise the
+// single-row mapping.  Used where Q >= 2 (n_embd / 128 <= 16).
+template<int TG>
+__global__ void __launch_bounds__(256) native_gu_rows_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_tok,
+                                                              const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                              float* __restrict__ gate, float* __restrict__ up) {
+    using F = Fmt<TG>;
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32);
+    const int Q = 32 / nb;
+    const int q = lane / nb, p = lane % nb;
+    const int row = (blockIdx.x * 8 + warp) * Q + q;
+    const bool rvalid = q < Q && row < 2 * L.n_ff;
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const uint8_t* wr = (const uint8_t*) grp_ptr[blockIdx.y] + (is_up ? L.up_off : 0) +
+                        (size_t) (rvalid ? r : 0) * L.gu_row;
+    const typename Split<TG>::W w = Split<TG>::load(wr, p, 0);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const float sc = L.tail_off ? ((const float*) (blob + L.tail_off))[is_up ? 1 : 0] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; ++e) {
+            float v = Split<TG>::apply(w, xq + (size_t) ent_tok[e] * xb + p * (F::qk / 32), 0);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const int p2 = p ^ off;
+                const float t = (p2 < nb) ? __shfl_sync(0xffffffffu, v, q * nb + p2) : 0.0f;
+                v += t;
+            }
+            if (p == 0 && rvalid) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = v * sc;
+        }
+    }
+}
+
 // native_down_kernel with the entries taken GRP_NC at a time
 template<int TD, bool SUB_DOWN = true>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -2633,9 +2675,14 @@ bool env_on(const char* name) {
 // STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
 bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
 // The down phase's rows-per-warp kernel (bitwise the one-row mapping; qk-128 formats with short rows): on by
-// default where it applies, STRATA_IQ_DOWN_ROWS=0 disables, the bench toggles it with the setter.
+// default where it applies, STRATA_IQ_DOWN_ROWS=0 disables, the bench toggles it with the setter.  The gate/up
+// rows kernel (Q = 32/nb >= 2) is the same switch under STRATA_IQ_GU_ROWS.
 bool g_down_rows = [] {
     const char* v = std::getenv("STRATA_IQ_DOWN_ROWS");
+    return v == nullptr || v[0] != '0';
+}();
+bool g_gu_rows = [] {
+    const char* v = std::getenv("STRATA_IQ_GU_ROWS");
     return v == nullptr || v[0] != '0';
 }();
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
@@ -3352,6 +3399,16 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up, bool single = false) {
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    else if constexpr (TG == 142 || TG == 143) {
+        const int nb = (int) (L.n_embd / Fmt<TG>::qk), Q = 32 / nb;
+        if (!g_old_kernels && g_gu_rows && Q >= 2) {
+            const dim3 gr((unsigned) ((2 * L.n_ff + 8 * Q - 1) / (8 * Q)), grid.y);
+            native_gu_rows_kernel<TG><<<gr, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            return;
+        }
+        if (g_old_kernels || single) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else native_gu_multi_kernel<TG, false, kSub16<TG>><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    }
     else if (g_old_kernels || single) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if constexpr (kStageIqGrid<TG>) {
         if (!g_stage_grid) {
@@ -3393,6 +3450,7 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
 void iq_set_old_kernels(bool old) { g_old_kernels = old; }
 bool iq_old_kernels() { return g_old_kernels; }
 void native_expert_set_down_rows(bool v) { g_down_rows = v; }
+void native_expert_set_gu_rows(bool v) { g_gu_rows = v; }
 
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
