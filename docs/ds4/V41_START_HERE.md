@@ -156,7 +156,10 @@ ee2845ca (+ serve defaults / docs).
   32 (`STRATA_WAVE_THREADS`, default now 32): batch 14.9 -> 13.6 s (3.8 GB/s).  Still below the drive (~5.4 GB/s in
   the microbench): each blob was 3 sequential span preads.  Now split into 8 parts read by different threads
   (`STRATA_WAVE_PARTS`, default 8): 3.60 -> **5.29 GB/s, batch 14.25 -> 10.68 s**, tokens identical (exact routing).
-  Production smoke: +310-token turn batch 13.9 -> 11.4 s.
+  Production smoke: +310-token turn batch 13.9 -> 11.4 s.  With reads at 5.3 GB/s the whole-layer chunk prefetch
+  stopped paying at every size (gate 640 / never: fresh 8000 33.6 / 32.4 s, +1000 19.1 / 16.6 s, +272 10.5 / 10.5) ->
+  **default never** (`STRATA_CHUNK_PF_MIN=<rows>` brings it back); its 2 x 2.71 GiB pinned slabs are no longer
+  allocated: serve min MemAvailable 15 GiB (arena 64).  Arena 68 then: no visible decode gain, min 11 GiB -> stays 64.
 - **Relay fix** (`~/AI/QuetzaCodetl/wrappers/tools/relay`, untracked file - live via ~/.local/bin/relay; skill text
   regenerated): `ask/reply/broadcast --name X` from a window with another name now gets an UNBOUND daemon instead of
   renaming the window (the session-10 gotcha).  Not committed in QuetzaCodetl (its tree has others' uncommitted work).

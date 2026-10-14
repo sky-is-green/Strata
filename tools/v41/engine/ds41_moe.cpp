@@ -809,11 +809,15 @@ bool chunk_stage_alloc(Ds41MoeImpl& im) {
 /// on-demand reader).  Called once per run_chunk(layer), before its class passes consume the slab.
 int chunk_pf_prepare(Ds41MoeImpl& im, int64_t layer, int n) {
     if (!im.cfg.chunk_prefetch || !im.gpu || im.cfg.cpu_only) return -1;
-    // STRATA_CHUNK_PF_MIN (default 640 rows): the slabs stage a layer's WHOLE file tier before its routing is known -
+    // STRATA_CHUNK_PF_MIN (rows; default: never - see below): the slabs stage a layer's WHOLE file tier before its routing is known -
     // a win only when the call routes most of it.  s11 (512K serve turns, batch s, prefetch on / off): fresh 8000
     // 33.7 / 38.8, +1000 tokens 19.2 / 22.0, +272 tokens 18.3 / 14.5 (it routes ~39% of the file tier) -> break-even
     // ~690 rows.  Below the cut the class passes read only the routed file-tier experts (the on-demand reader).
-    static const int pf_min = std::getenv("STRATA_CHUNK_PF_MIN") ? std::atoi(std::getenv("STRATA_CHUNK_PF_MIN")) : 640;
+    // After the wave reader went to 32 threads x 8 parts (5.3 GB/s for the ROUTED experts only), reading on demand
+    // beats the whole-layer prefetch at every size measured (512K turns, gate 640 / never: fresh 8000 33.6 / 32.4 s,
+    // +1000 19.1 / 16.6 s, +272 10.5 / 10.5 s) -> default never; the slabs (2 x 2.71 GiB pinned) are then never
+    // allocated either.  STRATA_CHUNK_PF_MIN=<rows> brings it back.
+    static const int pf_min = std::getenv("STRATA_CHUNK_PF_MIN") ? std::atoi(std::getenv("STRATA_CHUNK_PF_MIN")) : (1 << 30);
     if (n < pf_min) return -1;
     if (!chunk_stage_alloc(im)) return -1;
     ChunkStage& cs = *im.cstage;

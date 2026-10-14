@@ -13,8 +13,8 @@ Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepse
 STATE (RTX 4090 + 90 GB RAM), all committed + pushed, production build-ds4-gpu rebuilt:
 - Serve defaults (tools/v41/serve/ds41-engine.sh + strata-ds41.json, used by the strata-ds41-quetza wrapper): route
   bias x0.5 + file 0.3 + --arena-adapt + arena 64 GiB, DSpark speculative decode (exact sampling) + confidence trim
-  0.6, --kv-fp4 (bit-exact), elastic state columns, batch-seeded DSpark tail, chunk prefetch only >= 640 rows, D3 file
-  reads 32 x 32.  Production e2e: HumanEval 20/21, tools 10/10, agentic 3/3, real Quetza turns work.
+  0.6, --kv-fp4 (bit-exact), elastic state columns, batch-seeded DSpark tail, chunk prefetch OFF (on-demand reads, 32 threads x 8 parts),
+  D3 file reads 32 x 32.  Production e2e: HumanEval 20/21, tools 10/10, agentic 3/3, real Quetza turns work.
 - 512K serve: 14.00 GiB free after the dense half (was 10.46), turns: fresh 8000 ~37 s, +272 ~15 s, +1000 ~20 s
   (were 51 / 33.5 / 40; +272 now ~11-12 s with the wave-reader parts), decode ~21-34 tok/s on the 4-turn bench.
 - third_party/llama.cpp is UNTRACKED: ggml changes ship as tools/v41/ggml/*.patch (kv-fp4.patch is applied).
