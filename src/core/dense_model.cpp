@@ -851,6 +851,9 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     quantize(xsend, E, n, s);
     SDBG("s0 activation quantized (n=%d)", n);
 
+    if (dbg)
+        std::fprintf(stderr, "[ffn-split] guard peer=%d bell=%d hf=%d hf1=%d\n", (int) peer_ok, split_bell != nullptr,
+                     h_full != nullptr, h_full1 != nullptr);
     if (peer_ok && split_bell && h_full && h_full1) {
         // ---- the bit-exact two-card FFN, row-split end to end.  Each card computes different gate/up rows and
         // rotates its own half; the halves are exchanged (each card assembles the full n_ff-wide activation and
