@@ -175,6 +175,19 @@ void trace_vec(const char* what, int64_t pos, int layer, const char* kind, const
                  kind, what, mx, std::sqrt(sum2 / std::max(1, n)), nan, inf);
 }
 
+void trace_head(const char* what, int layer, const char* kind, const float* dev, int n, void* stream) {
+    cudaStreamSynchronize((cudaStream_t) stream);
+    const int k = std::min(n, 4);
+    float h[4] = {0, 0, 0, 0};
+    if (cudaMemcpy(h, dev, (size_t) k * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::fprintf(stderr, "dbg head %s: copy failed\n", what);
+        return;
+    }
+    std::fprintf(stderr, "dbg layer=%d %-6s %-9s head:", layer, kind, what);
+    for (int i = 0; i < k; ++i) std::fprintf(stderr, " %.6g", h[i]);
+    std::fprintf(stderr, "\n");
+}
+
 void trace_logits(int64_t pos, const float* dev, int n, void* stream) {
     cudaStreamSynchronize((cudaStream_t) stream);
     std::vector<float> h((size_t) n);
@@ -803,7 +816,10 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
         quantize(ffn_h, c.n_ff, n, s);
     }
     gemv(d, mix, n, s);
-    if (trb) trace_vec("ffn_mix", -1, cur_layer, "single", mix, n * E, s);
+    if (trb) trace_vec("ffn_mix", -1, cur_layer, "single", mix, E, s);
+    if (trb && n > 1) trace_vec("ffn_mix_c1", -1, cur_layer, "single", mix + E, E, s);
+    if (trb) trace_head("ffn_mix", cur_layer, "single", mix, E, s);
+    if (trb) trace_head("ffn_vs", cur_layer, "single", rot_scratch, c.n_ff, s);
     {
         PScope ps(&prof, Prof::ADD, s);
         add_inplace(x, mix, (int64_t) n * E, s);
@@ -857,12 +873,13 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
             dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * r0, s);
         }
         {
-            const float* hs0 = ffn_h;
-            if (rot & ROT_FFN_DOWN) {
-                dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), r0, n, false, s);
-                hs0 = rot_scratch;
-            }
-            dense_split_copy(hs0, h_full, r0, n, c.n_ff, 0, s);
+        const float* hs0 = ffn_h;
+        if (rot & ROT_FFN_DOWN) {
+            dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), r0, n, false, s);
+            hs0 = rot_scratch;
+        }
+        dense_split_copy(hs0, h_full, r0, n, c.n_ff, 0, s);
+        if (tr) trace_head("ffn_hs0", cur_layer, "card0", hs0, r0, s);
         }
         SDBG("s0 own half placed (r0=%d)", r0);
 
@@ -884,6 +901,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
             hs1 = h1_rot;
         }
         if (tr) trace_vec("ffn_hs1", -1, cur_layer, "card1", hs1, r1, stream1);
+        if (tr) trace_head("ffn_hs1", cur_layer, "card1", hs1, r1, stream1);
         dense_split_ring(split_bell_dev + 16, seq_h, stream1);
         cudaSetDevice(prev);
         SDBG("card1 leg enqueued");
@@ -893,9 +911,13 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         cudaMemcpyPeerAsync(h_peer, 0, (const void*) hs1, 1, (size_t) n * r1 * 4, (cudaStream_t) s);   // on s0: the destination's stream
         dense_split_copy(h_peer, h_full, r1, n, c.n_ff, r0, s);
         if (tr) trace_vec("ffn_hfull", -1, cur_layer, "assembled", h_full, c.n_ff, s);
+        if (tr && n > 1) trace_vec("ffn_hfull_c1", -1, cur_layer, "assembled", h_full + c.n_ff, c.n_ff, s);
+        if (tr) trace_head("ffn_vs", cur_layer, "assembled", h_full, c.n_ff, s);
         quantize(h_full, c.n_ff, n, s);
         gemv(L.ffn_down, mix, n, s);
         if (tr) trace_vec("ffn_mix", -1, cur_layer, "full", mix, E, s);
+        if (tr && n > 1) trace_vec("ffn_mix_c1", -1, cur_layer, "full", mix + E, E, s);
+        if (tr) trace_head("ffn_mix", cur_layer, "full", mix, E, s);
         {
             PScope ps(&prof, Prof::ADD, s);
             add_inplace(x, mix, (int64_t) n * E, s);
