@@ -1741,13 +1741,17 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
 // only the row's nb lanes active, emulated with masked shuffles (lane p adds the value of lane p ^ off when
 // p ^ off < nb, else +0) - every output is bitwise the single-row kernels'.  For the PTQ1_0 / PQ2_0 down shapes
 // (nb 4-5) this puts 4-6 rows' decode in the instructions the one-row mapping spends on a single row.
+// The correction branch's B pass at one row with the add folded in: out = (or +=) B tq, tq the staged q8_1
+__device__ __forceinline__ void q8_1_store(const float xi, block_q8_1* __restrict__ y, const long long i);
+
 template<int TD>
 __global__ void __launch_bounds__(256) native_down_rows_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                const int32_t* __restrict__ grp_start,
                                                                const int32_t* __restrict__ n_groups,
                                                                const int32_t* __restrict__ ent_dst,
                                                                const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                               float* __restrict__ out) {
+                                                               float* __restrict__ out, const float* __restrict__ gate,
+                                                               const float* __restrict__ up) {
     using F = Fmt<TD>;
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
@@ -1759,12 +1763,35 @@ __global__ void __launch_bounds__(256) native_down_rows_kernel(const unsigned lo
     const bool rvalid = q < Q && r < L.n_embd;
     const uint8_t* wr = (const uint8_t*) grp_ptr[blockIdx.y] + L.down_off + (size_t) (rvalid ? r : 0) * L.d_row;
     const typename Split<TD>::W w = Split<TD>::load(wr, p, 0);
+    __shared__ block_q8_1 shq[64];   // the entry's q8_1 image when the SwiGLU is recomputed here (n_ff <= 2048)
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
         const uint8_t* blob = (const uint8_t*) grp_ptr[g];
         const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;   // NVFP4: s_down
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
         for (int e = e0; e < e1; ++e) {
-            float v = Split<TD>::apply(w, hq + (size_t) e * hb + p * (F::qk / 32), 0);
+            // the entry's SwiGLU and its q8_1 image in shared: swiglu_q8_1_entries_kernel's own bits (the product
+            // rounded on its own, then q8_1_store's warp trees and finite rule) - the rows below read the same
+            // blocks the separate kernel staged
+            if (gate != nullptr) {
+                const long long base = (long long) e * L.n_ff;
+                {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+                    for (int i = (int) threadIdx.x; i < (int) L.n_ff; i += (int) blockDim.x) {
+                        const float gv = gate[base + i];
+#if defined(__HIPCC__)
+                        const float hv = (gv / (1.0f + __expf(-gv))) * up[base + i];
+#else
+                        const float hv = __fmul_rn(gv / (1.0f + __expf(-gv)), up[base + i]);
+#endif
+                        q8_1_store(hv, shq, i);
+                    }
+                }
+                __syncthreads();
+            }
+            float v = Split<TD>::apply(w, gate != nullptr ? shq + p * (F::qk / 32)
+                                                          : hq + (size_t) e * hb + p * (F::qk / 32), 0);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1) {
                 const int p2 = p ^ off;
@@ -1772,6 +1799,7 @@ __global__ void __launch_bounds__(256) native_down_rows_kernel(const unsigned lo
                 v += t;
             }
             if (p == 0 && rvalid) out[(size_t) ent_dst[e] * L.n_embd + r] = v * sd;
+            if (gate != nullptr) __syncthreads();   // the next entry's staging reuses shq
         }
     }
 }
@@ -2787,6 +2815,21 @@ bool g_gu_rows = [] {
     const char* v = std::getenv("STRATA_IQ_GU_ROWS");
     return v == nullptr || v[0] != '0';
 }();
+// The down kernel recomputes the entry's SwiGLU + q8_1 image in shared (its own bits) instead of the separate
+// pass; STRATA_EXPERT_SWIGLU_IN_DOWN=0 disables (the A/B arm).  The swiglu skip and the down launch must agree:
+// one predicate.
+bool g_swiglu_in_down = [] {
+    const char* v = std::getenv("STRATA_EXPERT_SWIGLU_IN_DOWN");
+    return v == nullptr || v[0] != '0';
+}();
+inline bool swiglu_in_down_ok(const NativeExpertLayout& L, int64_t entries) {
+    return !g_old_kernels && g_down_rows && (L.d_type == 142 || L.d_type == 143) && L.n_ff % Fmt<142>::qk == 0 &&
+           (int) (L.n_ff / Fmt<142>::qk) >= 2 && (int) (L.n_ff / Fmt<142>::qk) <= 16 && (L.n_ff / 32) <= 64 &&
+           entries <= 16 &&   // a decode-shaped call: a prompt's groups hold many entries and recompute per
+                              // row-block, where the separate pass is the cheaper shape (measured 5.9/6.1 vs
+                              // 6.0/6.1 ms at T=29; the decode's 8 entries win ~0.8% from the node saved)
+           g_swiglu_in_down;
+}
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
@@ -3529,14 +3572,14 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
 template<int TD>
 void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
-                 float* out, bool single = false) {
+                 float* out, bool single = false, const float* gate = nullptr, const float* up = nullptr) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if constexpr (TD == 142 || TD == 143) {
         const int nb = (int) (L.n_ff / Fmt<TD>::qk);
         if (!g_old_kernels && g_down_rows && nb >= 2 && nb <= 16) {
             const int Q = 32 / nb;
             const dim3 gr((unsigned) ((L.n_embd + 8 * Q - 1) / (8 * Q)), grid.y);
-            native_down_rows_kernel<TD><<<gr, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            native_down_rows_kernel<TD><<<gr, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, gate, up);
             return;
         }
         if (g_old_kernels || single) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
@@ -4707,6 +4750,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
+    const bool sw_in_down = swiglu_in_down_ok(L, cap_entries);   // the down kernel recomputes the SwiGLU and q8_1
 #if defined(STRATA_HIP_GFX906)
     // gfx906: the separate SwiGLU and q8_1 passes stay the default (the A/B baseline); the RDNA one-pass
     // kernel (bitwise the same) with STRATA_HIP_SWIGLU_FUSED=1
@@ -4715,14 +4759,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool sw_v1 = v1;
 #endif
-    if (sw_v1) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
-        quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
-    } else {
-        swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+    if (!sw_in_down) {
+        if (sw_v1) {
+            swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+            quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+        } else {
+            swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
+                                                                                    (int) L.n_ff, hq);
+        }
+        check("native_expert_grouped/swiglu");
     }
-    check("native_expert_grouped/swiglu");
     }
     if (g_exp_phase == 1) return;
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
@@ -4752,7 +4798,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #undef STRATA_D_AMD
 #endif
     switch (L.d_type) {
-#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, single_entry); break;
+#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, single_entry, \
+                                              swiglu_in_down_ok(L, cap_entries) ? gate : nullptr, swiglu_in_down_ok(L, cap_entries) ? up : nullptr); break;
         STRATA_D_FMTS(STRATA_DOWN)
 #undef STRATA_DOWN
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
