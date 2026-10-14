@@ -40,6 +40,9 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     const float* xr = x + (size_t) blockIdx.x * cols;
     float* orow = out + (size_t) blockIdx.x * cols;
     float acc = 0.0f;
+    // One block per row, and at n=1 that is one block for the whole 5120-wide row: the loads are the latency,
+    // so unroll both passes (the sum stays thread-strided and serial in the same order).
+#pragma unroll 4
     for (int i = threadIdx.x; i < cols; i += blockDim.x) acc += xr[i] * xr[i];
     acc = warp_sum(acc);
     __shared__ float part[32];
@@ -53,6 +56,7 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
         scale = rsqrtf(s / (float) cols + eps);
     }
     __syncthreads();
+#pragma unroll 4
     for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * scale * w[i];
 }
 
@@ -66,6 +70,7 @@ __global__ void rms_norm_add_kernel(float* __restrict__ x, const float* __restri
     const float* ar = add + (size_t) row * cols;
     float* orow = out + (size_t) row * cols;
     float acc = 0.0f;
+#pragma unroll 4
     for (int i = threadIdx.x; i < cols; i += blockDim.x) {
         const float v = xr[i] + ar[i];
         xr[i] = v;
@@ -83,6 +88,7 @@ __global__ void rms_norm_add_kernel(float* __restrict__ x, const float* __restri
         scale = rsqrtf(s / (float) cols + eps);
     }
     __syncthreads();
+#pragma unroll 4
     for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * scale * w[i];
 }
 
@@ -1578,6 +1584,9 @@ __global__ void gemv_f32_rows_pair_kernel(const float* __restrict__ Wa, const fl
     const float* wb = Wb + (size_t) row * n_in;
     const float* xr = X + (size_t) col * n_in;
     float aa = 0.0f, ab = 0.0f;
+    // The one-warp-per-row shape is global-latency bound at n_in 5120 (~33 us/call): unrolling keeps several
+    // iterations' loads in flight.  The accumulation stays aa/ab serial in the same i order (no fast-math here).
+#pragma unroll 4
     for (int i = lane; i < n_in; i += 32) {
         const float x = xr[i];
         aa += wa[i] * x;

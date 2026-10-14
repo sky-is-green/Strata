@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace {
 
@@ -168,6 +170,32 @@ int main(int argc, char** argv) {
                     (double) wb_bytes / 1e9, R, s, (double) wb_bytes * R / 1e9 / s, 1000.0 * s / R);
     };
 
+    if (variant == 8) {
+        // Bit-parity of the alternative row mappings against variant 1 (the shape native_mmvq used): same W, X,
+        // different launch shape, y must be bit-identical.
+        std::printf("bit check: variant 1 as reference\n");
+        float* dref = nullptr;
+        cudaMalloc(&dref, (size_t) n_out * 4);
+        std::vector<float> ref((size_t) n_out), got((size_t) n_out);
+        gemv_warp_row<<<(n_out + 7) / 8, 256, 0, st>>>((const WB*) w, (const XB*) x, dref, n_in, n_out);
+        cudaStreamSynchronize(st);
+        cudaMemcpy(ref.data(), dref, (size_t) n_out * 4, cudaMemcpyDeviceToHost);
+        auto check = [&](const char* what, auto launch) {
+            cudaMemset(y, 0, (size_t) n_out * 4);
+            launch();
+            cudaStreamSynchronize(st);
+            cudaMemcpy(got.data(), y, (size_t) n_out * 4, cudaMemcpyDeviceToHost);
+            size_t nd = 0, first = got.size();
+            for (size_t i = 0; i < got.size(); ++i)
+                if (std::memcmp(&ref[i], &got[i], 4) != 0) { if (first == got.size()) first = i; ++nd; }
+            std::printf("  %s: %zu of %d differ%s", what, nd, n_out, nd ? "" : "\n");
+            if (nd) std::printf(", first at %zu: ref %a got %a\n", first, (double) ref[first], (double) got[first]);
+        };
+        check("variant 2 (lane per block)", [&] { gemv_lane_block<<<(n_out + 7) / 8, 256, 0, st>>>((const WB*) w, (const XB*) x, y, n_in, n_out); });
+        check("variant 3 (2 rows/warp)", [&] { gemv_warp_rows<2><<<(n_out / 2 + 7) / 8, 256, 0, st>>>((const WB*) w, (const XB*) x, y, n_in, n_out); });
+        check("variant 4 (4 rows/warp)", [&] { gemv_warp_rows<4><<<(n_out / 4 + 7) / 8, 256, 0, st>>>((const WB*) w, (const XB*) x, y, n_in, n_out); });
+        return 0;
+    }
     if (variant == 0 || variant == 9) run(0);
     if (variant == 1 || variant == 9) run(1);
     if (variant == 2 || variant == 9) run(2);
