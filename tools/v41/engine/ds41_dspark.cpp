@@ -56,6 +56,7 @@ struct Ds41DSpark::Impl {
     // acceptance, never the output.
     std::vector<std::vector<int32_t>> keep;
     std::map<std::pair<int, bool>, G> graphs;
+    std::pair<int, bool> last_key { -1, false };   ///< the graph ga was last planned for
     double ms = 0;
 
     ~Impl() {
@@ -442,6 +443,20 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
         ggml_backend_tensor_set(im.i_bonus, &bo, 0, 4);
     }
     Impl::G & gr = im.graph(k, draft);
+    // ONE gallocr serves every cached graph, and ggml_gallocr only places tensors whose data is NULL: a cached graph
+    // kept the addresses of its FIRST allocation, which a later, bigger graph's reserve frees (the buffer is
+    // reallocated) - --serve crashed (CUDA invalid argument in a cpy) when a 16-row seeding graph ran again after the
+    // decode graphs had grown the buffer.  So: this graph's own tensors are re-placed every step (external weights /
+    // state live in other contexts and keep theirs), and a graph change re-plans.
+    for (ggml_tensor * t = ggml_get_first_tensor(gr.c); t; t = ggml_get_next_tensor(gr.c, t)) {
+        t->data = nullptr;
+        t->buffer = nullptr;
+    }
+    const std::pair<int, bool> key { k, draft };
+    if (im.last_key != key) {
+        if (!ggml_gallocr_reserve(im.ga, gr.gf)) { im.err = "DSpark graph reserve failed"; return false; }
+        im.last_key = key;
+    }
     if (!ggml_gallocr_alloc_graph(im.ga, gr.gf)) { im.err = "DSpark graph allocation failed"; return false; }
     if (ggml_backend_graph_compute(im.be, gr.gf) != GGML_STATUS_SUCCESS) { im.err = "DSpark graph compute failed"; return false; }
     if (!gr.rids.empty()) {

@@ -177,6 +177,51 @@ int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top
     return idx[(size_t) n - 1];
 }
 
+// the distribution sample_p draws from, as (token, probability) pairs summing to 1 (temp 0: the argmax alone) - the
+// trunk's p for --serve's speculative sampling (same candidates, same weights as sample_p)
+void sample_dist(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p,
+                 std::vector<std::pair<int, double>> & out) {
+    out.clear();
+    if (temp <= 0.0f) { out.push_back({ (int) (std::max_element(logits, logits + n_vocab) - logits), 1.0 }); return; }
+    const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
+    std::vector<int> idx((size_t) n_vocab);
+    for (int i = 0; i < n_vocab; ++i) idx[(size_t) i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(), [&](int x, int y) { return logits[x] > logits[y]; });
+    const double mx = logits[idx[0]];
+    std::vector<double> p((size_t) K);
+    for (int i = 0; i < K; ++i) p[(size_t) i] = std::exp(((double) logits[idx[(size_t) i]] - mx) / temp);
+    int n = K;
+    if (min_p > 0.0f) while (n > 1 && p[(size_t) n - 1] < (double) min_p * p[0]) --n;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        double zn = 0, c = 0;
+        for (int i = 0; i < n; ++i) zn += p[(size_t) i];
+        for (int i = 0; i < n; ++i) { c += p[(size_t) i] / zn; if (c >= top_p) { n = i + 1; break; } }
+    }
+    double z = 0;
+    for (int i = 0; i < n; ++i) z += p[(size_t) i];
+    for (int i = 0; i < n; ++i) out.push_back({ idx[(size_t) i], p[(size_t) i] / z });
+}
+
+// Speculative sampling with a DETERMINISTIC draft d (DSpark drafts by argmax: q = a point mass on d).  Leviathan /
+// Chen: accept with min(1, p(d) / q(d)) = p(d); on rejection sample from norm(max(0, p - q)) = p without d.  The
+// emitted token is then distributed exactly as p - the same as plain sampling.  true = d accepted; false = `out` is
+// the replacement token.
+bool spec_accept(const std::vector<std::pair<int, double>> & dist, int d, std::mt19937_64 & rng, int & out) {
+    double pd = 0;
+    for (const auto & c : dist) if (c.first == d) pd = c.second;
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    if (pd > 0 && u(rng) < pd) return true;
+    double r = u(rng) * (1.0 - pd);
+    int last = -1;
+    for (const auto & c : dist) {
+        if (c.first == d) continue;
+        last = c.first;
+        if ((r -= c.second) <= 0) { out = c.first; return false; }
+    }
+    out = last >= 0 ? last : d;   // rounding: the last candidate (d only if it was the sole candidate - then pd was 1)
+    return false;
+}
+
 double log_softmax_at(const float * lg, int nv, int tok) {
     const float mx = *std::max_element(lg, lg + nv);
     double z = 0;
@@ -668,7 +713,12 @@ int main(int argc, char ** argv) {
     // STRATA_DSPARK=<sidecar> (one-shot, greedy): DSpark speculative decoding - the checkpoint's mtp.0-2 draft stack
     // (ds41_dspark) drafts STRATA_DSPARK_DEPTH (default 4, <= 5) tokens, one dense pass verifies them (pass_v).  The
     // drafter loads here, before the VRAM expert cache measures the free memory, so the cache sizes around it.
-    const char * dsp_path = a.serve ? nullptr : std::getenv("STRATA_DSPARK");
+    // --serve: STRATA_SERVE_DSPARK=<sidecar> (opt-in) - speculative SAMPLING (spec_accept), same output distribution
+    const char * dsp_path = a.serve ? std::getenv("STRATA_SERVE_DSPARK") : std::getenv("STRATA_DSPARK");
+    if (a.serve && dsp_path && (!defer_vram || S < 17)) {
+        std::fprintf(stderr, "serve: STRATA_SERVE_DSPARK needs the GPU layer-major prompt path - DSpark off\n");
+        dsp_path = nullptr;
+    }
 #if defined(DS41_HAVE_DSPARK)
     std::unique_ptr<Ds41DSpark> dsp;
 #endif
@@ -886,6 +936,15 @@ int main(int argc, char ** argv) {
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         int n_req = 0;
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
+#if defined(DS41_HAVE_DSPARK)
+        // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
+        // request's last min(128, new) prompt tokens through pass_v instead of the passes / batch (no extra work), and
+        // it carries over when the next request continues this one (dsp_next = the position its ring expects next);
+        // any other reuse resets it (lower acceptance for a while, never a different output).
+        int dsp_next = -1;
+        const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 4;
+        long sv_pass = 0, sv_acc = 0;
+#endif
         // STRATA_SERVE_STEP_MAX: new prompt tokens up to which a request runs on the decode side - passes of
         // STRATA_SERVE_PASS_M tokens with the VRAM cache and the decode biases (~40 tok/s) - instead of the exact
         // layer-major batch (~16.8 s + n / 250 tok/s; measured crossover ~765 tokens); 0 = always the batch (every prompt
@@ -949,7 +1008,16 @@ int main(int argc, char ** argv) {
             // result) runs on the decode side instead - small dense passes, the cache and the decode biases: the
             // layer-major path streams nearly every expert of every layer whatever the batch size (~18 s for 40 tokens)
             const int delta = total - reused;
-            const bool by_step = defer_vram && delta >= 1 && delta <= step_max;
+            int sp_tail = 0;   // DSpark: the last new prompt tokens, fed by pass_v (seeds the window)
+#if defined(DS41_HAVE_DSPARK)
+            if (dsp_path) {
+                if (!(reused > 0 && reused == dsp_next) && dsp) dsp->reset();
+                dsp_next = -1;
+                sp_tail = std::min(128, delta);
+            }
+#endif
+            const int dh = delta - sp_tail;   // the part the passes / batch feed
+            const bool by_step = defer_vram && dh >= 1 && dh <= step_max;
             if (by_step && !cache_open) {
                 if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
                 cache_open = true;
@@ -961,7 +1029,7 @@ int main(int argc, char ** argv) {
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
-            if (!by_step && defer_vram && cache_open && delta >= 2) {
+            if (!by_step && defer_vram && cache_open && dh >= 2) {
                 tier.release_cache();
                 cache_open = false;
                 bias_now = a.bias_prompt > 0;
@@ -976,23 +1044,52 @@ int main(int argc, char ** argv) {
             };
             auto feed_steps = [&]() -> bool {   // the short-turn path: passes of up to pass_max tokens (a lone token: a step)
                 int last_rows = 1;
-                for (int i = 0; i < delta; ) {
-                    const int m = std::min(pass_max, delta - i);
+                for (int i = 0; i < dh; ) {
+                    const int m = std::min(pass_max, dh - i);
                     if (!(m == 1 ? step(ids[(size_t) (reused + i)], reused + i) : pass_m(ids.data() + reused + i, m, reused + i))) return false;
                     if (!capture_tail(delta, i, m, 0)) return false;   // this pass's rows, before the next pass replaces them
                     const int before = i;
                     i += m;
                     last_rows = m;
-                    if (i / 64 != before / 64 && i < delta) pp(i);
+                    if (i / 64 != before / 64 && i < dh) pp(i);
                 }
                 if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
-                pp(delta);
+                pp(dh);
                 return true;
             };
             static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
             tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
             tail_logits.clear();
-            const bool ok = total == reused || (by_step ? feed_steps() : feed(ids.data() + reused, delta, reused, pp, nullptr));
+            bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            int sp_t = -1;   // DSpark: the first decode token (sampled from the last prompt row), its drafts in sp_ids
+            int sp_ids[5] = {0}, sp_tmp[5];
+            float sp_conf[5];
+#if defined(DS41_HAVE_DSPARK)
+            if (ok && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
+                if (defer_vram && !cache_open) {
+                    if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
+                    else cache_open = true;
+                }
+                if (ok) { bias_now = pass_bias; apply_bias(); }
+                std::vector<int> spos;
+                for (int i0 = total - sp_tail; ok && i0 < total; i0 += 16) {
+                    const int m = std::min(16, total - i0);
+                    if (!pass_v(ids.data() + i0, m, i0)) { ok = false; break; }
+                    spos.resize((size_t) m);
+                    for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
+                    const bool last = i0 + m == total;
+                    if (last) {
+                        std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
+                        sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                    }
+                    if (!dsp->step(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
+                        ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
+                    }
+                }
+                if (ok) { bias_now = true; apply_bias(); }
+                pp(delta);
+            }
+#endif
             if (tail_keep > 0 && ok) {   // the quality scorer's rows: req%03d.tail.f32, [tail_keep x n_vocab], last prompt row last
                 if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {
                     char nb[40];
@@ -1043,7 +1140,64 @@ int main(int argc, char ** argv) {
             int gen = 0, pos = total;
             const char * finish = "length";
             std::vector<float> lg = last_logits;
-            while (gen < max_new || max_new <= 0) {
+#if defined(DS41_HAVE_DSPARK)
+            // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
+            // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
+            long rq_pass = 0, rq_acc = 0;
+            if (sp_t >= 0) {
+                int P = total - 1, t = sp_t, prev = ids.back();
+                bool dirty = false;
+                std::vector<int> vt;
+                std::vector<std::pair<int, double>> dist;
+                auto emit = [&](int tok) -> bool {   // false = stop here
+                    std::printf("T %d\n", tok);
+                    std::fflush(stdout);
+                    ++gen;
+                    if (is_stop(tok)) { finish = "stop"; return false; }
+                    if (max_new > 0 && gen >= max_new) return false;
+                    return true;
+                };
+                while (emit(t)) {
+                    if (stop_pending()) { finish = "cancel"; break; }
+                    int k = sp_depth_serve;
+                    if (max_new > 0) k = std::min(k, max_new - gen);
+                    k = std::min(k, ctxv - (P + 3));   // the pass writes P+1 .. P+1+k
+                    if (k < 0) break;
+                    const bool refeed = dirty && ((P + 1) & 1);
+                    vt.clear();
+                    if (refeed) vt.push_back(prev);
+                    vt.push_back(t);
+                    for (int i = 0; i < k; ++i) vt.push_back(sp_ids[i]);
+                    const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
+                    if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
+                    int acc = 0, tn = -1;
+                    for (; acc < k; ++acc) {
+                        sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
+                        if (!spec_accept(dist, sp_ids[acc], rng, tn)) break;
+                    }
+                    if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
+                    ++rq_pass; rq_acc += acc;
+                    int spos[6];
+                    for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
+                    const int drafts[5] = { sp_ids[0], sp_ids[1], sp_ids[2], sp_ids[3], sp_ids[4] };
+                    if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
+                        ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
+                    }
+                    hist.push_back(t);
+                    bool more = true;
+                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
+                    prev = acc == 0 ? t : drafts[acc - 1];
+                    dirty = acc < k;
+                    P += 1 + acc;
+                    t = tn;
+                    if (!more) break;
+                }
+                dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
+                if (std::strcmp(finish, "error") == 0) dsp_next = -1;
+                sv_pass += rq_pass; sv_acc += rq_acc;
+            }
+#endif
+            while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
                 if (stop_pending()) { finish = "cancel"; break; }
                 const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
                 std::printf("T %d\n", tok);
@@ -1066,6 +1220,11 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+#if defined(DS41_HAVE_DSPARK)
+            if (rq_pass > 0)
+                std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
+                             1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
+#endif
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);

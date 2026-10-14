@@ -94,6 +94,47 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 10b (2026-10-14 19:40-21:10) - DSpark IN --serve (speculative SAMPLING), crash fix UNTESTED; research
+**Read this block first.**  Mal's go 2026-10-14: (1) default x0.5 + arena-adapt + draft K=64 + arena 64 GiB, (2) DSpark
+in --serve, (3) Quetza wrapper with those settings, (4) GitHub update, (5) research FreeToken / llama.cpp.
+- **DSpark in --serve** (`ds41_generate.cpp`, opt-in `STRATA_SERVE_DSPARK=<sidecar>`, + `STRATA_DSPARK_KEEP`,
+  `STRATA_DSPARK_DEPTH`; unset = the old serve path bit for bit): a request's last min(128, new) prompt tokens go
+  through pass_v (seeds DSpark's window, no extra work); the window carries over when the next request continues
+  this one (`dsp_next`), else `dsp->reset()`; a pure regenerate (total == reused) decodes plain.  Decode = the one-shot
+  verify loop with `sample_dist` (sample_p's exact distribution) + `spec_accept`: deterministic draft d -> accept with
+  p(d), else sample p without d (Leviathan/Chen with q = point mass) -> output distribution IDENTICAL to plain sampling.
+  Unit test (scratchpad t.cpp, 400k draws x 12 cases): max |emp - p| 0.0016, never outside the support.
+  Line protocol (`~/AI/v41-dev/taskeval/drive_dsp.py` = drive_engine.py with temp/top_p/seed + the dspark build):
+  temp 0 fresh 25.5 tok/s (4.57 tok/pass), continuation after a plain turn 13.1 (window reset), **temp 1.0 continuation
+  25.9 tok/s (3.84 tok/pass)**.
+- **CRASH (fix built, NOT yet tested):** `CUDA error: invalid argument` in ggml_cuda_cpy inside `Ds41DSpark::step`
+  (gdb backtrace `~/AI/v41-dev/taskeval/gdb.out`) on a 2nd request whose tail runs the 16-row seed graph after a
+  DSpark decode.  Cause: ONE gallocr for every cached DSpark graph and gallocr only places tensors with data == NULL -
+  a cached graph kept its FIRST allocation's addresses, freed when a bigger graph grew the buffer.  Fix (in
+  `Ds41DSpark::step`): null every tensor of the graph's own context each step + `ggml_gallocr_reserve` on a graph
+  change (`last_key`).  This may also have made one-shot drafts read stale memory (verify kept output correct; could
+  have cost acceptance) - re-measure one-shot tokens/pass after the fix.  Repro: `crash2_reqs.json` (drive_dsp.py ...
+  262144 crash2_reqs.json), `crash2_stdin.txt` + `gdbrun.sh`.  NOT context-specific (crashed at 256K and 512K).
+- Serve VRAM after the dense half: ctx 32K 11.83 / 128K 11.56 / 256K 11.17 / 512K 10.36 GiB (one-shot 14.28 - serve
+  holds the prompt-batch + snapshot buffers).  HTTP serve DSpark measured 15.9-17.6 tok/s (77-78% hits) vs one-shot
+  25-28: fewer expert slots in serve - Mal wants **512K**: shrink KV (Mal: Strata-dense used int8 K / int4 V - check
+  what DS4's caches use) and/or the snapshot/prompt buffers, then re-measure.
+- **Research** (`~/AI/research/REPORT.md` by deepseek-quetza pro; repos cloned there: freetoken, llama.cpp-master with
+  branch pr29887): FreeToken publishes **22-25 tok/s DS-V4-Flash on an RTX 5090** - we are at 25-28 one-shot on a 4090.
+  Ideas we lack, ranked: (1) **q* CPU/GPU miss split** (`freetoken/python/freetoken/moe/offload_kernels.py:261-345`:
+  fetch F = frac*M misses over PCIe - the most RECENTLY active (recurring) ones - and compute the rest on the CPU
+  uncached, frac = the measured bandwidth balance) - our D3 sends 100% of RAM misses over PCIe
+  (`STRATA_TIER_BATCH_PCIE`, default 1.0, picks misses in arbitrary order): first test 0.85 / 0.75, then recency
+  selection; (2) flag-handshake CPU handoff without cudaLaunchHostFunc; (3) cudaMemcpyBatchAsync coalescing; (4)
+  prompt bypass that does not evict decode experts; (5) global (cross-layer) LRU.  Also FreeToken's semantic-anchor
+  KV checkpoints (agent context edits resume from the nearest anchor) - a serve-latency win for Quetza.  AcceptMoE
+  (arXiv 2608.02989) = our route bias inside verify, validated (-0.27 pt, 2.06x under offload); HOBBIT (low-bit copies
+  of missed experts) = a bigger project that could replace part of the route bias.
+- Relay gotcha found: `relay ask ... --name X` re-registers the CALLING window's name as X (my test renamed this session
+  from strata-dspark to chronos-ds4, so the cron nudge then refused: not-registered).  Cron nudges must run from cron
+  (own identity), never be hand-tested from the target window.  `~/.local/bin/chronos/ds4-overnight-nudge.sh` exists;
+  its crontab line was REMOVED at handoff.
+
 ### Session 10 (2026-10-14 15:10-) - arena-adapt WIRED INTO D3 (DSpark), MARGIN measured, REAL-TASK eval started
 **Read this block first.**  Code `976b76fe`.  Mal's aim (2026-10-14): **30-40 tok/s with quality maintained**, and
 "have you tested the bias on actual coding / agentic / tool calling?" - answer at handoff: NO, only token agreement
