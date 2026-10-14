@@ -1853,10 +1853,12 @@ struct Engine {
         if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
         mm_pair(L.sh_gate, sg, L.sh_up, su, T);
         tick(11, false);
-        tick(12, true);   // SwiGLU, the down projection and the shared gate
-        if (T <= kGemmT) {   // SwiGLU and its q8_1 image in one launch
-            K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);
-            mmq(L.sh_down, q8, sy, T);
+        tick(12, true);   // SwiGLU and the shared down in one launch at one column (the two calls otherwise)
+        if (T <= kGemmT) {
+            if (!(T == 1 && K::native_mmvq_swiglu_q8_0(L.sh_down.d, sg, su, sy, (int) FS, L.sh_down.n_out, 1, st))) {
+                K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);
+                mmq(L.sh_down, q8, sy, T);
+            }
         } else {
             k_swiglu<<<grid1((int64_t) T * FS), kThreads, 0, st>>>(sg, su, shh, (int64_t) T * FS);
             mm(L.sh_down, shh, sy, T);

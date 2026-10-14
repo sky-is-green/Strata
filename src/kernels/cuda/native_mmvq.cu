@@ -1712,6 +1712,59 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     launch_check();
 }
 
+// small_mmvq's small-K kernel with the activation computed in the same launch: `gate`/`up` are the shared
+// expert's gate/up rows, the SwiGLU and its q8_1 image are staged once per block into shared (the standalone
+// native_swiglu_quantize_q8_1_kernel's own bits: __fmul_rn(__fdividef(...)) and the warp trees), then the rows
+// read those blocks.  One launch where the engine ran native_swiglu_quantize_q8_1 + native_mmvq(8, ...).
+template<typename Weight, int Qi>
+__global__ void native_small_mmvq_swiglu_kernel(const Weight* __restrict__ w, const float* __restrict__ gate,
+                                                const float* __restrict__ up, float* __restrict__ y, int n_in,
+                                                int n_out) {
+    constexpr int ROWS = WARPS;
+    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / 32;
+    __shared__ Q81Block shq[64];
+    for (int i = tid; i < n_in; i += WARP * WARPS) {
+        const float gi = gate[i];
+        const float xi = __fmul_rn(__fdividef(gi, __fadd_rn(1.0f, __expf(-gi))), up[i]);
+        const float amax = warp_max(fabsf(xi));
+        const float sum = warp_sum(xi);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        shq[i / Q8K].qs[i % Q8K] = q;
+        if (i % Q8K == 0) shq[i / Q8K].ds = q8_1_ds(d, sum);
+    }
+    __syncthreads();
+    float tmp[ROWS] = {};
+    for (int kbx = tid / (Qi / 2); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kqs = 2 * (tid % (Qi / 2));
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += small_q8_dot(w + block, shq + kbx, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
+
 template<typename Weight, int Qi>
 void small_f32(const void* weights, const float* x, void* scratch_q8_1,
                float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -2614,6 +2667,21 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
+
+// The fused pair's launcher: type 8, one column, the small-K shape (the shared expert's down).  False otherwise
+// and where the weights are in the packed layout (a different kernel), so the caller runs the two calls.
+bool native_mmvq_swiglu_q8_0(const void* weights, const float* gate, const float* up, float* y, int n_in, int n_out,
+                             int ncols, void* stream) {
+    if (n_in <= 0 || n_in % 32 != 0 || n_in / 32 > 64 || n_out <= 0 || gate == nullptr || up == nullptr) return false;
+    if (ncols != 1 || n_in / 32 >= 2 * WARPS * WARP / 8) return false;   // only the small-K shape
+    if (q8_packed_registry().find(weights) != q8_packed_registry().end()) return false;
+    native_small_mmvq_swiglu_kernel<Q80Block, 8><<<unsigned((std::size_t(n_out) + WARPS - 1) / WARPS),
+                                                    dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Q80Block*>(weights), gate, up, y, n_in, n_out);
+    launch_check();
+    return true;
+}
+
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream) {

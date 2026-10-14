@@ -41,6 +41,11 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
 
+/// The shared expert's SwiGLU + its q8_1 image + the Q8_0 down in one launch (type 8, one column, the small-K
+/// shape).  False where the pair is not available: the caller runs native_swiglu_quantize_q8_1 + native_mmvq.
+bool native_mmvq_swiglu_q8_0(const void* weights, const float* gate, const float* up, float* y, int n_in, int n_out,
+                             int ncols, void* stream);
+
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 
