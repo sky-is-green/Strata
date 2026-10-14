@@ -1543,7 +1543,10 @@ struct Engine {
             mm(L.ssm_out, gdn_y, y, T);
             tick(2, false);
             tick(3, true);   // the out-projection correction
-            if (L.corr_a.d) corr_add(L.corr_a, L.corr_b, T, gdn_y, y, N);
+            if (L.corr_a.d) {   // mm()'s prep just staged q8_1 of the same input in `q8` (T <= 8)
+                if (T <= kGemmT) corr_branch_staged(L.corr_a, L.corr_b, T, q8, y, true);
+                else corr_add(L.corr_a, L.corr_b, T, gdn_y, y, N);
+            }
             tick(3, false);
         } else {
             if (!xq_hot) prep(h, N, T, xq);
@@ -1613,7 +1616,10 @@ struct Engine {
             mm(L.wo, att, y, T);
             tick(2, false);
             tick(3, true);   // the out-projection correction
-            if (L.corr_a.d) corr_add(L.corr_a, L.corr_b, T, att, y, N);
+            if (L.corr_a.d) {   // mm()'s prep just staged q8_1 of the same input in `q8` (T <= 8)
+                if (T <= kGemmT) corr_branch_staged(L.corr_a, L.corr_b, T, q8, y, true);
+                else corr_add(L.corr_a, L.corr_b, T, att, y, N);
+            }
             tick(3, false);
         }
         tick(4, true);   // the post-attention norm, the router (with its correction) and top-k
