@@ -427,7 +427,8 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
 }
 /// The chunks merged, times sigmoid(gate): grid (n_rows), block HD.
 __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl, const float* gate,
-                             const int32_t* pos0, int t0, int H, int n_chunk, float* out) {
+                             const int32_t* pos0, int t0, int H, int n_chunk, float* out,
+                             Q81Block* hq = nullptr) {
     constexpr int HD = 256;
     const int row = blockIdx.x, t = t0 + row / H, h = row % H, d = threadIdx.x;
     const int npos = *pos0 + t + 1;
@@ -442,7 +443,20 @@ __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl
         den += w * pl[o];
     }
     const size_t gi = ((size_t) t * H + h) * HD + d;
-    out[gi] = num / den * sigm(gate[gi]);
+    const float av = num / den * sigm(gate[gi]);
+    out[gi] = av;
+    if (hq != nullptr) {   // the q8_1 image of the attention output, the standalone quantizer's bits
+        float amax = fabsf(av), sum = av;
+        for (int o2 = 16; o2 > 0; o2 >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o2));
+            sum += __shfl_xor_sync(0xffffffffu, sum, o2);
+        }
+        const float dd = K::q8_1_finite(amax / 127.0f);
+        const int8_t q = K::q8_1_quant(av, dd, amax);
+        const size_t bl = gi / 32;
+        hq[bl].qs[d % 32] = q;
+        if (d % 32 == 0) hq[bl].ds = K::q8_1_ds(dd, sum);
+    }
 }
 
 /// The expert group tables and the q8_1 staging of h moved to the expert kernels next to the launches that read
@@ -1585,6 +1599,7 @@ struct Engine {
         xq_staged = false;
         bool tail_fused = false;   // the router tail's launch carries the deltas, top-k and the group tables
         bool gdn_y_staged = false; // k_gdn_seq staged q8_1 of its output for the out projection
+        bool att_staged = false;   // k_attn_merge staged q8_1 of its output for the out projection
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -1707,14 +1722,16 @@ struct Engine {
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
                     k_attn_part<<<dim3(nc, nt * H), kChunkCells, 0, st>>>(q, kc[li], vc[li], dpos, t0, H, HKV, ctx,
                                                                          1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
-                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att);
+                    k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att,
+                                                        (T <= kGemmT) ? (Q81Block*) q8 : nullptr);
                 }
+                att_staged = T <= kGemmT;
             }
             tick(2, false);
             tick(3, true);   // GDN-only class: nothing on an attention layer (an empty pair keeps the read valid)
             tick(3, false);
             tick(4, true);   // the out projection, the correction's A pass folded in at one row
-            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa && mm_fused_corr_a(L.wo, att, y, L.corr_a);
+            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa && mm_fused_corr_a(L.wo, att, y, L.corr_a, att_staged);
             if (!corr_a_done) mm(L.wo, att, y, T);
             tick(4, false);
             tick(5, true);   // the out-projection correction
