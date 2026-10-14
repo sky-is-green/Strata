@@ -37,4 +37,10 @@ void lora_corr_round_x(const float* x, uint16_t* x16, int64_t n, void* stream);
 void lora_corr_apply(const uint16_t* a, const uint16_t* b, const float* x, uint16_t* x16, uint16_t* t16, float* out,
                      int64_t n_rows, int64_t n_in, int64_t rank, int64_t n_out, void* stream);
 
+/// The router branch (f16 pairs) at one row: the rounding + A pass in one launch and B in one, bitwise
+/// `lora_corr_apply` at `n_rows = 1` without the separate round launch and the caller's memset / add.  `t16`
+/// is [rank] f16 scratch; `out` [n_out] receives `+= B (A x)` (T=1 is one row, so no stride is involved).
+void lora_corr_router(const uint16_t* a, const uint16_t* b, const float* x, uint16_t* t16, float* out, int64_t n_in,
+                      int64_t rank, int64_t n_out, void* stream);
+
 }  // namespace strata::kernels

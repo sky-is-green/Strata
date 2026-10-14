@@ -143,6 +143,27 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(tgot.data(), dt, tgot.size() * 4, cudaMemcpyDeviceToHost), "t down");
     CK(cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost), "out down");
 
+    // the B pass with the add folded in (the q36 driver's T=1 decode path) against the staged B output plus the
+    // f32 add, bitwise: `dacc` starts at 1.0 everywhere, so the kernel's += must land on 1.0 + staged B
+    float* dacc = nullptr;
+    CK(cudaMalloc(&dacc, (size_t) T * n_out * 4), "acc");
+    std::vector<float> ones((size_t) T * n_out, 1.0f);
+    CK(cudaMemcpy(dacc, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice), "ones up");
+    const size_t tcol = K::native_q8_1_bytes((int) rank, 1);
+    for (int r = 0; r < T; ++r)
+        K::iq_corr_g128_b(db, (const char*) dtq + (size_t) r * tcol, (int) rank, (int) n_out,
+                          dacc + (size_t) r * n_out, 1, s);
+    CK(cudaStreamSynchronize(s), "sync2");
+    std::vector<float> acc((size_t) T * n_out);
+    CK(cudaMemcpy(acc.data(), dacc, acc.size() * 4, cudaMemcpyDeviceToHost), "acc down");
+    bool fused_out = true;
+    for (size_t i = 0; i < acc.size() && fused_out; ++i) {
+        const float expect = 1.0f + got[i];
+        if (std::memcmp(&acc[i], &expect, 4) != 0) fused_out = false;
+    }
+    std::fprintf(stderr, "g128_corr: fused single-row B pass (add folded) vs the staged B + add: %s (bitwise)\n",
+                 fused_out ? "equal" : "DIFFER");
+
     double errsum = 0, denom = 0, worst = 0;
     double a_errsum = 0, a_denom = 0, a_worst = 0;
     for (int r = 0; r < T; ++r) {
@@ -173,7 +194,8 @@ int main(int argc, char** argv) {
                  "%.4g, max %.4g; B %.4g, max %.4g\n",
                  (long long) layer, placement.c_str(), (long long) n_in, (long long) rank, (long long) rank,
                  (long long) n_out, T, a_mean_rel, a_max_rel, mean_rel, max_rel);
-    const bool pass = a_mean_rel < 1e-5 && mean_rel < 1e-5 && a_max_rel < 1e-4 && max_rel < 1e-4;
-    std::fprintf(stderr, "g128_corr: %s (f32 summation-order noise only)\n", pass ? "PASS" : "FAIL");
+    const bool pass = a_mean_rel < 1e-5 && mean_rel < 1e-5 && a_max_rel < 1e-4 && max_rel < 1e-4 && fused_out;
+    std::fprintf(stderr, "g128_corr: %s (f32 summation-order noise only; fused passes bitwise)\n",
+                 pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

@@ -125,6 +125,41 @@ __global__ void lora_b_kernel(const uint16_t* __restrict__ b, const uint16_t* __
     if (lane == 0) out[(size_t) tok * n_out + o] += acc;
 }
 
+// The A pass of the fused single-row router branch: the block rounds x into shared once (f16_from_f32, the same
+// element-for-element rule as lora_round_kernel) and then the four warps run lora_a_kernel's quarter-split
+// reduction over the shared row.  Values and addition order are lora_round_kernel + lora_a_kernel's, bit for bit.
+__global__ void lora_a_round_kernel(const uint16_t* __restrict__ a, const float* __restrict__ x,
+                                    uint16_t* __restrict__ t16, int64_t n_in, int64_t rank) {
+    __shared__ __align__(16) uint16_t xs[4096];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int64_t i = blockIdx.x;                      // the output index r (one row)
+    if (i >= rank) return;
+    for (int64_t j = threadIdx.x; j < n_in; j += blockDim.x) xs[j] = f16_from_f32(x[j]);
+    __syncthreads();
+    const int64_t n8 = n_in / 8;                       // uint4 groups in the reduction axis
+    const uint16_t* row = a + (size_t) i * n_in;
+    const uint4* rp = reinterpret_cast<const uint4*>(row);
+    const uint4* xp = reinterpret_cast<const uint4*>(xs);
+    const int64_t q0 = (n8 * warp) / A_WARPS;
+    const int64_t q1 = (n8 * (warp + 1)) / A_WARPS;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    int64_t k = q0 + lane;
+    for (; k + 96 < q1; k += 128) {
+        acc0 += dot8(rp[k], xp[k]);
+        acc1 += dot8(rp[k + 32], xp[k + 32]);
+        acc2 += dot8(rp[k + 64], xp[k + 64]);
+        acc3 += dot8(rp[k + 96], xp[k + 96]);
+    }
+    for (; k < q1; k += 32) acc0 += dot8(rp[k], xp[k]);
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    __shared__ float part[A_WARPS];
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) t16[i] = f16_from_f32(((part[0] + part[1]) + part[2]) + part[3]);
+}
+
 }  // namespace
 
 void lora_corr_round_x(const float* x, uint16_t* x16, int64_t n, void* stream) {
@@ -132,6 +167,19 @@ void lora_corr_round_x(const float* x, uint16_t* x16, int64_t n, void* stream) {
     cudaStream_t s = (cudaStream_t) stream;
     lora_round_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, s>>>(x, x16, n);
     check("lora_corr_round_x");
+}
+
+/// The router branch (f16 pairs) at one row, fused: one launch for the rounding + A pass (lora_a_round_kernel)
+/// and one for B (lora_b_kernel unchanged, `out[tok * n_out + o] += acc`, one row).  Bitwise lora_corr_apply at
+/// n_rows=1, without the separate round launch and the memset / add around the logits.
+void lora_corr_router(const uint16_t* a, const uint16_t* b, const float* x, uint16_t* t16, float* out, int64_t n_in,
+                      int64_t rank, int64_t n_out, void* stream) {
+    if (a == nullptr || b == nullptr || n_in <= 0 || n_in > 4096) return;
+    cudaStream_t s = (cudaStream_t) stream;
+    lora_a_round_kernel<<<(unsigned) rank, 32 * A_WARPS, 0, s>>>(a, x, t16, n_in, rank);
+    check("lora_corr_router/a");
+    lora_b_kernel<<<(unsigned) ((n_out + WARPS - 1) / WARPS), THREADS, 0, s>>>(b, t16, out, 1, rank, n_out);
+    check("lora_corr_router/b");
 }
 
 void lora_corr_apply(const uint16_t* a, const uint16_t* b, const float* x, uint16_t* x16, uint16_t* t16, float* out,

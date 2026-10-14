@@ -1914,6 +1914,29 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     q8_1_store(x[i], y, i);
 }
 
+// ---------------------------------------------------------------- the correction branch's fused single-row B pass
+// The g128 branches' A pass and the two q8_1 stagings are already one launch each; only the trailing add is a
+// separate node (the out-projection path).  This B pass folds it in: out[row] = (or +=) B_row . tq on the staged
+// q8_1 image of t, with mmvq_multi_kernel<142, 1>'s exact mapping (the same Split<142>::load / apply calls, the
+// same lane-strided k loop and warp_sum), so the result is bitwise iq_mmvq(142, ncols = 1) and the f32 add.
+__global__ void __launch_bounds__(128) corr_g128_b_kernel(const uint8_t* __restrict__ b,
+                                                          const block_q8_1* __restrict__ tq,
+                                                          float* __restrict__ out, int rank, int n_out,
+                                                          int accumulate) {
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    if (row >= n_out) return;
+    const int lane = threadIdx.x;
+    const int nb = rank / Fmt<142>::qk;
+    const uint8_t* wr = b + (size_t) row * ((size_t) (rank / 128) * sizeof(block_pq2_0));
+    float s = 0.0f;
+    for (int k = lane; k < nb; k += 32) {
+        const Split<142>::W w = Split<142>::load(wr, k, 0);
+        s += Split<142>::apply(w, tq + k * 4, 0);
+    }
+    s = warp_sum(s);
+    if (lane == 0) out[row] = accumulate ? __fadd_rn(out[row], s) : s;
+}
+
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
 // [grp_start[0], grp_start[*n_groups]) (a call's entries are contiguous; the verify window's PCIe call starts after
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
@@ -3219,6 +3242,18 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
+}
+
+// The correction branch's B pass at one row with the add folded in: out [n_out] = (or +=) B tq, tq the staged
+// q8_1 image of t (quantize_q8_1_rows), bitwise iq_mmvq(142, ncols = 1) + the f32 add.
+void iq_corr_g128_b(const void* b, const void* t_q8_1, int rank, int n_out, float* out, int accumulate, void* stream) {
+    if (rank <= 0 || rank % 128 != 0 || n_out <= 0) {
+        std::fprintf(stderr, "iq_corr_g128_b: bad shape rank %d n_out %d\n", rank, n_out);
+        std::exit(1);
+    }
+    corr_g128_b_kernel<<<(unsigned) ((n_out + 3) / 4), dim3(32, 4), 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) b, (const block_q8_1*) t_q8_1, out, rank, n_out, accumulate);
+    check("iq_corr_g128_b");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
