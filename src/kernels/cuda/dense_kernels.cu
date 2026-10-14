@@ -494,6 +494,53 @@ __global__ void kv_append_kernel(uint8_t* __restrict__ kc, uint8_t* __restrict__
 // dims each (strided by 32 so the loads coalesce), the dot product is a warp reduction, and the warp's
 // running (m, l, acc) is the online softmax over the cells it visited (cells t = begin + warp, +8, ...).
 // With Q4 keys q is rotated (Walsh-Hadamard) first; the scores q . k are the same in the rotated space.
+// The per-cell walk of attn_partial_kernel, templated on the dims-per-lane so the `i < per` guards fold away for
+// the model geometries (head_dim 256 -> 8, 128 -> 4), and walking four of the warp's cells per iteration so a whole
+// iteration's K and V loads issue as one cluster.  PER == 0 keeps the runtime guard for other head_dims.
+template <int KF, int VF, int PER>
+__device__ __forceinline__ void attn_partial_walk(const uint8_t* Kb, const uint8_t* Vb, const float (&qv)[8],
+                                                  int begin, int end, size_t kcell, size_t vcell, int per_rt,
+                                                  int warp, int lane, float& m, float& l, float (&acc)[8]) {
+    constexpr int NC = 2;                                    // the warp's cells in flight per iteration
+    const int per = PER ? PER : per_rt;
+    // The cells' K dots and V values come in first; only then the sequential softmax updates, in cell order.  Loads
+    // move, every cell's own update (and its operand order) stays the one-cell loop's, so the result is bit-identical.
+    for (int t0 = begin + warp; t0 < end; t0 += NC * kWarps) {
+        float d[NC], vv[NC][8];
+        bool two[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int t = t0 + c * kWarps;
+            two[c] = t < end;
+            d[c] = 0.0f;
+            const uint8_t* kcl = Kb + (size_t) t * kcell;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (two[c] && i < per) d[c] += qv[i] * kv_val<KF>(kcl, i, lane);
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const uint8_t* vcl = Vb + (size_t) (t0 + c * kWarps) * vcell;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                vv[c][i] = (two[c] && i < per) ? kv_val<VF>(vcl, i, lane) : 0.0f;
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (!two[c]) continue;
+            d[c] = warp_sum(d[c]);
+            const float mn = fmaxf(m, d[c]);
+            const float corr = __expf(m - mn);               // m == -FLT_MAX on the first cell: exp(-huge) = 0
+            const float p = __expf(d[c] - mn);
+            l = l * corr + p;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (i < per) acc[i] = acc[i] * corr + p * vv[c][i];
+            m = mn;
+        }
+    }
+}
+
 template <int KF, int VF>
 __global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* __restrict__ K,
                                     const uint8_t* __restrict__ V, float* __restrict__ part_acc,
@@ -531,23 +578,12 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* 
 #pragma unroll
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
 
-    for (int t = begin + warp; t < end; t += kWarps) {
-        const uint8_t* kcl = Kb + (size_t) t * kcell;
-        float d = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 8; ++i)
-            if (i < per) d += qv[i] * kv_val<KF>(kcl, i, lane);
-        d = warp_sum(d);
-        const float mn = fmaxf(m, d);
-        const float corr = __expf(m - mn);               // m == -FLT_MAX on the first cell: exp(-huge) = 0
-        const float p = __expf(d - mn);
-        l = l * corr + p;
-        const uint8_t* vcl = Vb + (size_t) t * vcell;
-#pragma unroll
-        for (int i = 0; i < 8; ++i)
-            if (i < per) acc[i] = acc[i] * corr + p * kv_val<VF>(vcl, i, lane);
-        m = mn;
-    }
+    if (per == 8)
+        attn_partial_walk<KF, VF, 8>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, m, l, acc);
+    else if (per == 4)
+        attn_partial_walk<KF, VF, 4>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, m, l, acc);
+    else
+        attn_partial_walk<KF, VF, 0>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, m, l, acc);
 
     __shared__ float sm[kWarps], sl[kWarps];
     __shared__ float sacc[kWarps][kMaxHeadDim];
