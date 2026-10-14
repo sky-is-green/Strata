@@ -1386,17 +1386,17 @@ struct Engine {
 
     /// dst [T][n_out] = B (A x): one g128 correction branch (the out-projection and the MoE block output).
     /// The factors are type 43, the PQ2_0 block - the same 34 bytes per 128 as the experts - so both passes run
-    /// on the q8_1 image of their input, the fork's mul_mat path for that container: the A pass writes f32 t,
-    /// the B pass reads t's own q8_1 image.  A single row (the decode step) folds the trailing add into the B
-    /// pass; a batch keeps the staged chain with its separate add.
+    /// on the q8_1 image of their input, the fork's mul_mat path for that container.  A single row (the decode
+    /// step) folds the two quantizations into the passes (quant x, A+q, B+add); a batch keeps the staged chain.
     void corr_branch(const Mat& a, const Mat& b, int T, const float* x, float* dst, bool accumulate) {
         quant(x, a.n_in, T, corr_xq);
-        K::iq_mmvq(142, a.d, corr_xq, corr_t, a.n_in, a.n_out, T, st);
-        quant(corr_t, b.n_in, T, corr_tq);
         if (T == 1) {
+            K::iq_corr_g128_aq(a.d, corr_xq, a.n_in, a.n_out, corr_tq, st);
             K::iq_corr_g128_b(b.d, corr_tq, b.n_in, b.n_out, dst, accumulate ? 1 : 0, st);
             return;
         }
+        K::iq_mmvq(142, a.d, corr_xq, corr_t, a.n_in, a.n_out, T, st);
+        quant(corr_t, b.n_in, T, corr_tq);
         K::iq_mmvq(142, b.d, corr_tq, dst, b.n_in, b.n_out, T, st);
     }
     /// out [T][ld_out] += B (A x): the branch through `corr`, then the f32 add (the fork's ggml_add).
@@ -1412,12 +1412,13 @@ struct Engine {
     /// The g128 branch from an already staged q8_1 image of x: the native expert path quantizes h for the
     /// experts themselves, and the MoE branch reads the same h - the same blocks, one node fewer.
     void corr_branch_staged(const Mat& a, const Mat& b, int T, const void* xq_staged, float* dst, bool accumulate) {
-        K::iq_mmvq(142, a.d, xq_staged, corr_t, a.n_in, a.n_out, T, st);
-        quant(corr_t, b.n_in, T, corr_tq);
         if (T == 1) {
+            K::iq_corr_g128_aq(a.d, xq_staged, a.n_in, a.n_out, corr_tq, st);
             K::iq_corr_g128_b(b.d, corr_tq, b.n_in, b.n_out, dst, accumulate ? 1 : 0, st);
             return;
         }
+        K::iq_mmvq(142, a.d, xq_staged, corr_t, a.n_in, a.n_out, T, st);
+        quant(corr_t, b.n_in, T, corr_tq);
         K::iq_mmvq(142, b.d, corr_tq, dst, b.n_in, b.n_out, T, st);
     }
     /// The router delta (f16 pairs): logits [T][ld_logits] += B (A x) with the repo's f16 round-trip rule

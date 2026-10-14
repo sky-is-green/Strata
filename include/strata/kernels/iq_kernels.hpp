@@ -25,6 +25,10 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
+/// The correction branch's A pass with its q8_1 image fused in: tq = q8_1(A xq), both bitwise the staged
+/// quantize + iq_mmvq(142, ncols = 1).  n_in is a multiple of 128, rank of 32.
+void iq_corr_g128_aq(const void* a, const void* x_q8_1, int n_in, int rank, void* t_q8_1, void* stream);
+
 /// The correction branch's B pass at one row with the add folded in: out = (or +=) B tq, tq the staged q8_1
 /// image of t.  Bitwise iq_mmvq(142, ncols = 1) + the f32 add.  rank is a multiple of 128.
 void iq_corr_g128_b(const void* b, const void* t_q8_1, int rank, int n_out, float* out, int accumulate, void* stream);

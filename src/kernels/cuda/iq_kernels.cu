@@ -1914,11 +1914,46 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     q8_1_store(x[i], y, i);
 }
 
-// ---------------------------------------------------------------- the correction branch's fused single-row B pass
-// The g128 branches' A pass and the two q8_1 stagings are already one launch each; only the trailing add is a
-// separate node (the out-projection path).  This B pass folds it in: out[row] = (or +=) B_row . tq on the staged
-// q8_1 image of t, with mmvq_multi_kernel<142, 1>'s exact mapping (the same Split<142>::load / apply calls, the
-// same lane-strided k loop and warp_sum), so the result is bitwise iq_mmvq(142, ncols = 1) and the f32 add.
+// ---------------------------------------------------------------- the correction branch's fused single-row passes
+// The g128 branches' A pass and the q8_1 staging of its result are one node here: 32 rows per block (one warp
+// each, mmvq_multi_kernel<142, 1>'s exact mapping), the 32 outputs staged in shared, and one warp turning them
+// into one q8_1 block with the standalone quantizer's own reduction (lane l holds row 32 b + l, as that
+// kernel's warp holds element l of its block).  Bitwise quantize_q8_1_rows of iq_mmvq's output.
+__global__ void __launch_bounds__(1024) corr_g128_aq_kernel(const uint8_t* __restrict__ a,
+                                                            const block_q8_1* __restrict__ xq,
+                                                            block_q8_1* __restrict__ tq, int n_in, int rank) {
+    __shared__ float ts[32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 32 + warp;
+    float s = 0.0f;
+    if (row < rank) {
+        const int nb = n_in / Fmt<142>::qk;
+        const uint8_t* wr = a + (size_t) row * ((size_t) (n_in / 128) * sizeof(block_pq2_0));
+        for (int k = lane; k < nb; k += 32) {
+            const Split<142>::W w = Split<142>::load(wr, k, 0);
+            s += Split<142>::apply(w, xq + k * 4, 0);
+        }
+        s = warp_sum(s);
+    }
+    if (lane == 0) ts[warp] = s;   // zero for a row past the end (rank % 32 == 0 makes that unused)
+    __syncthreads();
+    if (warp == 0) {
+        const float xi = ts[lane];
+        float amax = fabsf(xi), sum = xi;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        }
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        tq[blockIdx.x].qs[lane] = q;
+        if (lane == 0) tq[blockIdx.x].ds = q8_1_ds(d, sum);
+    }
+}
+
+// The correction branch's B pass at one row with the add folded in: out [n_out] = (or +=) B tq, tq the staged
+// q8_1 image of t (quantize_q8_1_rows), bitwise iq_mmvq(142, ncols = 1) + the f32 add.
 __global__ void __launch_bounds__(128) corr_g128_b_kernel(const uint8_t* __restrict__ b,
                                                           const block_q8_1* __restrict__ tq,
                                                           float* __restrict__ out, int rank, int n_out,
@@ -3242,6 +3277,18 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
+}
+
+// The correction branch's A pass with the q8_1 image of its result fused in: tq [rank/32 blocks] = quantize_q8_1
+// of A xq (both bitwise the staged form: quantize_q8_1_rows of iq_mmvq(142, ncols = 1)'s output).
+void iq_corr_g128_aq(const void* a, const void* x_q8_1, int n_in, int rank, void* t_q8_1, void* stream) {
+    if (n_in <= 0 || n_in % 128 != 0 || rank <= 0 || rank % 32 != 0) {
+        std::fprintf(stderr, "iq_corr_g128_aq: bad shape n_in %d rank %d\n", n_in, rank);
+        std::exit(1);
+    }
+    corr_g128_aq_kernel<<<(unsigned) (rank / 32), 1024, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) a, (const block_q8_1*) x_q8_1, (block_q8_1*) t_q8_1, n_in, rank);
+    check("iq_corr_g128_aq");
 }
 
 // The correction branch's B pass at one row with the add folded in: out [n_out] = (or +=) B tq, tq the staged

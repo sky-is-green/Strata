@@ -164,6 +164,18 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "g128_corr: fused single-row B pass (add folded) vs the staged B + add: %s (bitwise)\n",
                  fused_out ? "equal" : "DIFFER");
 
+    // the A pass with its q8_1 image fused in (the q36 T=1 path) against the staged quantize of the A output
+    void* daq = nullptr;
+    CK(cudaMalloc(&daq, (size_t) T * rank / 32 * sizeof(Q81)), "aq");
+    for (int r = 0; r < T; ++r)
+        K::iq_corr_g128_aq(da, (const char*) dxq + (size_t) r * K::native_q8_1_bytes((int) n_in, 1), (int) n_in,
+                           (int) rank, (char*) daq + (size_t) r * K::native_q8_1_bytes((int) rank, 1), s);
+    CK(cudaStreamSynchronize(s), "sync3");
+    std::vector<Q81> aq((size_t) T * rank / 32);
+    CK(cudaMemcpy(aq.data(), daq, aq.size() * sizeof(Q81), cudaMemcpyDeviceToHost), "aq down");
+    const bool fused_aq = std::memcmp(aq.data(), tq.data(), aq.size() * sizeof(Q81)) == 0;
+    std::fprintf(stderr, "g128_corr: fused A+q vs the staged A + quantize: %s (bitwise)\n", fused_aq ? "equal" : "DIFFER");
+
     double errsum = 0, denom = 0, worst = 0;
     double a_errsum = 0, a_denom = 0, a_worst = 0;
     for (int r = 0; r < T; ++r) {
@@ -194,7 +206,7 @@ int main(int argc, char** argv) {
                  "%.4g, max %.4g; B %.4g, max %.4g\n",
                  (long long) layer, placement.c_str(), (long long) n_in, (long long) rank, (long long) rank,
                  (long long) n_out, T, a_mean_rel, a_max_rel, mean_rel, max_rel);
-    const bool pass = a_mean_rel < 1e-5 && mean_rel < 1e-5 && a_max_rel < 1e-4 && max_rel < 1e-4 && fused_out;
+    const bool pass = a_mean_rel < 1e-5 && mean_rel < 1e-5 && a_max_rel < 1e-4 && max_rel < 1e-4 && fused_out && fused_aq;
     std::fprintf(stderr, "g128_corr: %s (f32 summation-order noise only; fused passes bitwise)\n",
                  pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
