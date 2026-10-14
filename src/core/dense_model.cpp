@@ -308,6 +308,7 @@ struct DenseModel::Impl {
     // remaining FFN rows (and a packed input-column slice of down) and receives the rotated activation per layer.
     bool ffn_split = false;
     int ffn_r0 = 0;                                 // card 0's FFN row count; card 1 gets [ffn_r0, n_ff)
+    bool peer_ok = false;                           // direct GPU-to-GPU DMA is available (large-BAR + p2p)
     cudaStream_t stream1 = nullptr;
     cudaEvent_t ev_x = nullptr, ev_dx = nullptr;    // card0 -> card1 handoff, card1 -> card0 handoff
     float* stage_x = nullptr;                       // pinned, NC * n_embd floats
@@ -816,7 +817,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     }
     quantize(xsend, E, n, s);
     SDBG("s0 activation quantized (n=%d)", n);
-    cudaMemcpyAsync(stage_x, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
+    if (!peer_ok) cudaMemcpyAsync(stage_x, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
     cudaEventRecord(ev_x, s0);
     SDBG("s0 stage_x recorded: %s", cudaGetErrorString(cudaGetLastError()));
 
@@ -848,8 +849,9 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     cudaGetDevice(&prev);
     const cudaError_t sd = cudaSetDevice(1);
     SDBG("set device 1: %s (prev %d)", cudaGetErrorString(sd), prev);
-    const cudaError_t c1 = cudaMemcpyAsync(x1, stage_x, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream1);
-    SDBG("card1 x H2D: %s", cudaGetErrorString(c1));
+    if (peer_ok) cudaMemcpyPeerAsync(x1, 1, (const void*) xsend, 0, (size_t) n * E * 4, stream1);
+    else cudaMemcpyAsync(x1, stage_x, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream1);
+    SDBG("card1 x handoff: %s", cudaGetErrorString(cudaGetLastError()));
     native_quantize_q8_1(x1, q8_1_1, E, n, stream1);
     SDBG("card1 quantize: %s", cudaGetErrorString(cudaGetLastError()));
     native_mmvq(L.ffn_gate1.type, L.ffn_gate1.dev, q8_1_1, ffn_g1, E, r1, n, stream1);
@@ -865,7 +867,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     native_quantize_q8_1(hsend1, q8_1_1, r1, n, stream1);
     native_mmvq(L.ffn_down1.type, L.ffn_down1.dev, q8_1_1, mix1, r1, E, n, stream1);
     SDBG("card1 down: %s", cudaGetErrorString(cudaGetLastError()));
-    cudaMemcpyAsync(stage_dx, mix1, (size_t) n * E * 4, cudaMemcpyDeviceToHost, stream1);
+    if (!peer_ok) cudaMemcpyAsync(stage_dx, mix1, (size_t) n * E * 4, cudaMemcpyDeviceToHost, stream1);
     cudaEventRecord(ev_dx, stream1);
     const cudaError_t sxd = cudaEventSynchronize(ev_dx);
     SDBG("ev_dx synced: %s", cudaGetErrorString(sxd));
@@ -875,8 +877,9 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     SDBG("restored device: set=%s current=%d", cudaGetErrorString(sr), now);
 
     // card 0: sum card 1's partial and add the residual
-    const cudaError_t m2 = cudaMemcpyAsync(dx_dev, stage_dx, (size_t) n * E * 4, cudaMemcpyHostToDevice, s0);
-    SDBG("s0 dx H2D: %s", cudaGetErrorString(m2));
+    const cudaError_t m2 = peer_ok ? cudaMemcpyPeerAsync(dx_dev, 0, mix1, 1, (size_t) n * E * 4, s0)
+                                   : cudaMemcpyAsync(dx_dev, stage_dx, (size_t) n * E * 4, cudaMemcpyHostToDevice, s0);
+    SDBG("s0 dx handoff: %s", cudaGetErrorString(m2));
     {
         PScope ps(&prof, Prof::ADD, s);
         add_inplace(mix, dx_dev, (int64_t) n * E, s);
@@ -1528,8 +1531,17 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             }
             if (!ok) { err = "dense model: the FFN split could not allocate its scratch"; return false; }
             I.allocations.push_back(I.dx_dev);
-            std::fprintf(stderr, "strata-dense: FFN split ready (card0 %d rows, card1 %d rows)\n", I.ffn_r0,
-                         cfg_.n_ff - I.ffn_r0);
+            {
+                int can = 0;
+                I.peer_ok = cudaDeviceCanAccessPeer(&can, 1, 0) == cudaSuccess && can != 0;
+                if (I.peer_ok) {
+                    cudaSetDevice(1);
+                    I.peer_ok = cudaDeviceEnablePeerAccess(0, 0) == cudaSuccess;
+                    cudaSetDevice(prev);
+                }
+            }
+            std::fprintf(stderr, "strata-dense: FFN split ready (card0 %d rows, card1 %d rows, handoff: %s)\n", I.ffn_r0,
+                         cfg_.n_ff - I.ffn_r0, I.peer_ok ? "direct peer DMA" : "host-staged");
         }
         if (!ok) return false;
 
