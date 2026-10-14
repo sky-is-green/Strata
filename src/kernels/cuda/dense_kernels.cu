@@ -353,11 +353,29 @@ __global__ void rms_fwht_quant_kernel(float* __restrict__ x, const float* __rest
     float* orow = xn + (size_t) row * width;
     if (threadIdx.x < 256) {
         float acc = 0.0f;
+        if (width == 5120) {
+            // The dense pass's own width: exactly 20 elements per thread.  One register batch lets every load go
+            // out at once instead of four per round; the chain is pinned to __fmaf_rn, which is what the generic
+            // loop's `acc += v * v` compiles to here (v_fmac_f32), so the sum is the same bits in the same order.
+            float v[20];
+#pragma unroll
+            for (int k = 0; k < 20; ++k) v[k] = xr[threadIdx.x + 256 * k];
+            if (ar) {
+#pragma unroll
+                for (int k = 0; k < 20; ++k) {
+                    v[k] = v[k] + ar[threadIdx.x + 256 * k];
+                    xr[threadIdx.x + 256 * k] = v[k];
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < 20; ++k) acc = __fmaf_rn(v[k], v[k], acc);
+        } else {
 #pragma unroll 4
-        for (int i = threadIdx.x; i < width; i += 256) {
-            float v = xr[i];
-            if (ar) { v = v + ar[i]; xr[i] = v; }
-            acc += v * v;
+            for (int i = threadIdx.x; i < width; i += 256) {
+                float v = xr[i];
+                if (ar) { v = v + ar[i]; xr[i] = v; }
+                acc += v * v;
+            }
         }
         acc = warp_sum(acc);
         if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = acc;
