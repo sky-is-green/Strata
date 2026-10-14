@@ -3,6 +3,45 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-15 ~06:00 (end of session 12) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
+deepseek4:main - pushing is OK'd; GitHub = Indras-Mirror/Strata-DSV4.1).  READ FIRST: docs/ds4/V41_START_HERE.md
+section 5c block "Session 12" (newest), then only what a question needs.  Logs / scripts of that session:
+~/AI/v41-dev/s12/ (run1 mirror A/B, run2 serve turns + controls, run3/run6 the 64x16 false positive, run4 the
+arena-32 mirror control, run5 the chunk prof).
+
+STATE (RTX 4090 + 90 GB RAM), all committed + pushed, production build-ds4-gpu rebuilt:
+- Serve defaults UNCHANGED from session 11: route bias x0.5 + file 0.3 + --arena-adapt + arena 64 GiB, DSpark
+  (exact speculative sampling) + confidence trim 0.6, --kv-fp4, elastic state columns, batch-seeded DSpark tail,
+  chunk prefetch OFF, wave reader 32 threads x 8 parts, D3 file reads 32 x 32.
+- MEASURED AND CLOSED - do not redo: (a) the second-drive blob mirror (`--build-mirror` / `--check-mirror`,
+  STRATA_BLOB_MIRROR, 84 GiB on NVME1TB, share 0.28): the pattern is +33% in the rb2 microbench (6.22 -> 8.29 GB/s)
+  and does NOTHING in the engine, at arena 64 or in the arena-32 positive control - the file tier is not
+  bandwidth-bound; (b) warm_reseed (STRATA_WARM_RESEED, default OFF): inside the bench's spread and it seeds more
+  file-tier blobs; (c) wave reader 64 x 16: a FALSE POSITIVE (29.56 s in one run, 31.52 s repeated, vs 31.51/31.98
+  baselines).
+- The file tier is not the bottleneck in a batch turn: chunk prof (MIMO_CHUNK_PROF=1) gives the wave reader
+  5.2-5.3 GB/s over 22.7 GB with the caller waiting on reads for only 35-159 ms of a 30 s prompt; the "experts"
+  phase is the arena experts' PCIe DMA / prestage / device sum.  Levers that pay: VRAM slots (2.6 GiB = 10-20% of a
+  python verify pass) and the dense half.
+- **The 512K turn bench's run-to-run spread is 1.5-4.3%** (same config back to back; the later run is slower).  Any
+  A/B needs >= 3 runs a side - a single pair produced the 64 x 16 false positive.
+- OPEN, Mal's call: delete /media/mal/NVME1TB/Models/V41-Mirror/V41-GSQ.experts.mirror (84 GiB, drive ~97% full,
+  rebuilds in 81 s).  Untried: in-pass draft pruning, a smarter VRAM replacement than LRU, the VMM refactor for the
+  prompt state's 2.6 GiB, overlapping the file reads with the dense half of the same layer.
+- A FOREIGN headless Chrome (agent-browser, not ours) holds a 51 MiB CUDA context, so the harnesses' gpu_busy()
+  ("any compute app") never clears: gate on VRAM used instead (>= 2 GB = busy).
+- Relay: --name fix live (untracked, ~/AI/QuetzaCodetl/wrappers/tools/relay).  The hourly chronos nudge cron
+  (17 * * * * ds4-overnight-nudge.sh) is still installed - remove it if no overnight run is planned.
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes the GPU lock; never wrap it in
+flock); --serve runs NOT through memguard (engine.sh / ds41-engine.sh: flock + systemd-run scope).  Need >= 75 GB
+MemAvailable.  Kill by exact PID only; never pkill -f a pattern in your own command line.  Never rebuild a build
+dir while a run launches from it ("Permission denied").  ninja with an unknown target builds NOTHING.
+```
+
 ## RESUME PROMPT 2026-10-15 ~03:30 (end of session 11) - paste the block below into a new session
 
 ```

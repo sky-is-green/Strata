@@ -218,12 +218,23 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   10.75 / 11.12, +1001 16.88 vs 16.65 / 17.06, decode right after a batch 3.12 s / 192 file reads vs 2.76 / 144 -
   inside the spread, and the seed reads 48 MORE file-tier blobs, because the LRU set at release is largely the
   experts that just missed.  Do not build on it without a >= 3-run measurement.
-- **Wave-reader queue depth is the one lever that moved** (`STRATA_WAVE_THREADS` / `STRATA_WAVE_PARTS`): 64 x 16
-  (one run, vs the two baselines above) gave **fresh 8000-token batch 29.56 s (dense 10.15 + experts 19.33) vs
-  31.51 / 31.98 (experts 20.38 / 20.71)** = -7%/-8%, with +61 / +273 / +1001 unchanged inside the spread.  The
-  microbench agrees on the direction: rb (one blob at a time) 8 outstanding reads 4.72 GB/s, 16 -> 5.22; rb2
-  (32 workers x 8 parts = 256 outstanding) 6.22 GB/s.  `ds41-engine.sh` (the serve wrapper) now sets 64 x 16; the
-  code default stays 32 x 8.  **Re-measure with repeats before trusting it for the small turns.**
+- **Wave-reader queue depth** (`STRATA_WAVE_THREADS` / `STRATA_WAVE_PARTS`): 64 x 16 gave fresh 8000-token batch
+  **29.56 s** in one run against 31.51 / 31.98 baselines - and **31.52 s when repeated**, i.e. the -8% was a false
+  positive (the wrapper default is back to the code's 32 x 8; the lesson is the bench's single-run spread).  The
+  engine's own reader timer (`MIMO_CHUNK_PROF=1`, the `chunk prof` line, same one-shot 271-token prompt, 22.7 GB of
+  routed file tier) says why there was nothing to get: 64 x 16 = 22.7 GB in 4281 ms of reader time = **5.29 GB/s**,
+  32 x 8 = 4381 ms = **5.17 GB/s** (+2.3%), prompt wall 30.24 vs 30.34 s.  5.2-5.3 GB/s is what this pattern gets in
+  the engine (rb2, the same pattern with no GPU, no engram reads and no DSpark sidecar on the drive: 6.22), the
+  caller waits on reads for only 35 / 159 ms of a 30 s prompt, and the microbench's queue-depth effect (rb: 8
+  outstanding reads 4.72 GB/s, 16 -> 5.22; rb2 32 workers x 8 parts = 256 outstanding 6.22) is already saturated at
+  32 x 8.  Do not re-tune this without >= 3 runs a side.
+- **The batch turn's "experts" phase is NOT the file tier.**  `chunk prof` on the 271-token prompt: 40 run_chunk
+  calls, caller wall **589 ms** (waits on reads 35 + wave/copy waits 0 + final sync 18 + other host 536), reader
+  threads 5290 ms, GPU grouped kernels 14 ms - while the prompt's own "experts" timestamp reads 6.9-9.5 s.  The
+  reads run on the reader threads and the caller barely waits: what the experts phase actually spends its time on is
+  the arena experts' PCIe DMA / prestage / the device-side sum, i.e. the documented PCIe wall (~70 of ~130 ms a
+  python verify pass) - which is why VRAM slots (2.6 GiB = 10-20% of a pass) and the elastic columns, not the disk,
+  are the levers that have paid.
 - **O_DIRECT bounce + memcpy tax: 3%**, not worth a direct-read path (rb `bounce` 0/1: 4.72 / 4.58 GB/s at P=8,
   5.22 / 5.09 at P=16 - `read_direct` reads into a bounce buffer and memcpys because a blob's spans are only
   4K-aligned at the ends).

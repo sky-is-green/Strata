@@ -27,14 +27,5 @@ export STRATA_DSPARK_KEEP="${STRATA_DSPARK_KEEP:-$PWD/tools/v41/serve/dspark_exp
 export STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}"
 export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
-# A layer's file-tier "wave" reader: 64 threads x 16 parts (the code default is 32 x 8, `STRATA_WAVE_THREADS` /
-# `STRATA_WAVE_PARTS` in ds41_moe.cpp).  The 512K turn bench (s12 run3, one run vs two baselines of the same
-# config): fresh 8000-token batch 29.56 s (dense 10.15 + experts 19.33) vs 31.51 / 31.98 s (experts 20.38 / 20.71)
-# = -7%/-8%; +61 / +273 / +1001 turns and the decodes after them unchanged inside the bench's 1.5-4.3% spread.
-# Queue depth is the lever the microbench points at (rb: 8 outstanding reads 4.72 GB/s, 16 -> 5.22; rb2: 32 workers
-# x 8 parts = 256 outstanding -> 6.22 GB/s).  Only the big-read turn showed it, so RE-MEASURE with >= 3 runs before
-# trusting it for other turn sizes; unset both to go back to 32 x 8.
-export STRATA_WAVE_THREADS="${STRATA_WAVE_THREADS:-64}"
-export STRATA_WAVE_PARTS="${STRATA_WAVE_PARTS:-16}"
 exec flock "$LOCK" systemd-run --user --scope -q --unit="ds41-serve-$$" -p MemoryMax=84G -p MemorySwapMax=0 \
     "$PWD/build-ds4-gpu/ds41_generate" "$@"
