@@ -151,6 +151,25 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   | NVMe-only penalty (rb 0, rbf 0.6 / 1.2) | not run | - | 12.7 / 12.9, 13.9 / 15.2 (no faster than x0.25: the VRAM pull IS the speed) |
   Verdict: x0.5 + arena-adapt = coding at the best arm's level at 22-23 tok/s (one-shot DSpark); x0.75 = 28-35 tok/s
   with the first slip showing.  Through --serve today (no DSpark) x0.5 + arena-adapt is plain 18.4 / 15.6 tok/s.
+  **Lossless decode work at x0.5 + arena-adapt + DSpark (128 tok, tok/s docs / python; quality per the table above):**
+  | step | docs | python | gate |
+  |---|---|---|---|
+  | D3 without arena-adapt | 16.7 | 14.6 | - |
+  | + arena-adapt in D3 (976b76fe) | 22.3 | 22.9 | DS41_CHECK_ARENA 0 bad |
+  | + draft pruned `STRATA_DSPARK_KEEP=~/AI/v41-dev/s10/cnt_big.txt:64` (c0123208; 5.14 -> 2.91 GB) | 24.4-24.9 | 26.0-26.4 | exact routing: tokens identical |
+  | + `--arena-gib 68` (60 default) | verify 140 -> 138 ms (text shifted) | 27.0-28.4 | min MemAvailable 8 GiB |
+  | `--arena-gib 72` | - | 30.3 | min MemAvailable **4 GiB = memguard floor: NOT usable** |
+  Draft K below 64 on blocks 1/2 (64,48,48 / 64,40,32 / 64,32,32) cut docs acceptance 3.53 -> 2.98-3.10 despite
+  97%+ count coverage - keep 64 everywhere.  Counts: `cnt_big.txt` = 8 API fixture prompts + prose + code (DSpark
+  x0.5 runs, `STRATA_DSPARK_COUNT`); test prompts docs/python were held out.
+  **Measured, no gain (do not retry):** draft depth 5 (docs flat, python +7% ~noise); `STRATA_D3_PF` 2/4 (flat/worse);
+  persistent D3 reader pool (`ReadPool`, kept - neutral, no thread churn); D3 speculative NVMe reads
+  (`STRATA_D3_SPEC=n`, default OFF: catches ~30 of ~390 NVMe misses 2 layers ahead, extra predict graph -> -5%;
+  gates: exact tokens identical, arena check 0 bad); copy-stream DMA overlap NOT built (nsys: hit kernels before the
+  first DMA = 180 ms of a 4.2 s capture, ~4% max).  PCIe link is Gen4 x16 under load (21.6 GB/s pinned H2D; the
+  idle "Gen 1" is power saving).  nsys x0.5 (`~/AI/v41-dev/nsys/d3x05.*`): expert DMAs 38% of decode, NVMe ~20-24%,
+  GPU idle 38% (mostly the NVMe join).  The lever left = fewer bytes: VRAM / RAM for experts.
+  **Not reachable from Quetza yet:** --serve has no DSpark (plain x0.5 + arena-adapt serve = ~16-18 tok/s).
   Reading: the full-speed bias does NOT break tool calling / simple agentic loops, but it DOES cost coding correctness
   (~-19 pt HumanEval).  NEXT: x0.5 + arena-adapt (DSpark 22.3 / 22.9 tok/s, 81.6% agreement) on the same screen, and
   the file-penalty-only sweep, looking for a config at 30+ tok/s that keeps HumanEval near 20/21.

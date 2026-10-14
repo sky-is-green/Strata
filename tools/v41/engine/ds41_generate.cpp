@@ -577,6 +577,30 @@ int main(int argc, char ** argv) {
                     tier.prefetch_multi(l, pv_rank.data(), (int) pv_rank.size(), d3_pf);
                 }
             }
+            // D3 speculative NVMe reads (STRATA_D3_SPEC=n, default 0 = off; STRATA_D3_SPEC_AHEAD=k, default 2): the
+            // pass's routing for layer l+k predicted from the state entering l (predict_multi, bias included), its
+            // union ranked as above, and the NVMe-tier experts among the top n read into the stash by background
+            // readers while layers l..l+k-1 run - the verify pass otherwise waits on them (nsys x0.5: pthread_join
+            // 7.9 ms/token on the decode thread).  A wrong guess costs SSD bandwidth only.
+            static const int d3_spec = std::getenv("STRATA_D3_SPEC") ? std::atoi(std::getenv("STRATA_D3_SPEC")) : 0;
+            static const int d3_spec_ahead = std::getenv("STRATA_D3_SPEC_AHEAD") ? std::atoi(std::getenv("STRATA_D3_SPEC_AHEAD")) : 2;
+            if (rdev1 && !no_tier_batch && d3_spec > 0 && m <= Ds41MoeTier::kMaxMulti && l + d3_spec_ahead < n_layer) {
+                pv_pred.resize((size_t) m * 16);
+                if (dense.predict_multi(l + d3_spec_ahead, pv_pred.data())) {
+                    pv_score.clear();
+                    for (int t = 0; t < m; ++t)
+                        for (int i = 0; i < 16; ++i) {
+                            const int e = pv_pred[(size_t) t * 16 + i];
+                            if (e < 0) continue;
+                            auto it = std::find_if(pv_score.begin(), pv_score.end(), [&](const std::pair<int, int> & q) { return q.first == e; });
+                            if (it == pv_score.end()) pv_score.push_back({ e, 16 - i }); else it->second += 16 - i;
+                        }
+                    std::stable_sort(pv_score.begin(), pv_score.end(), [](const std::pair<int, int> & a, const std::pair<int, int> & b) { return a.second > b.second; });
+                    pv_rank.clear();
+                    for (const auto & q : pv_score) pv_rank.push_back(q.first);
+                    tier.spec_read(l + d3_spec_ahead, pv_rank.data(), std::min(d3_spec, (int) pv_rank.size()), true);
+                }
+            }
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
             lap(0);

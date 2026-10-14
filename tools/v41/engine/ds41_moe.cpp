@@ -26,6 +26,7 @@
 #include <deque>
 #include <mutex>
 #include <array>
+#include <functional>
 #include <thread>
 #include <utility>
 
@@ -151,6 +152,60 @@ struct Arena {
     }
 };
 
+/// A persistent pool for a call's file-tier reads: D3 spawned (and joined) up to 8 std::threads per call - nsys at
+/// x0.5 + arena-adapt: pthread_create 1.84 ms/token on the decode thread.  start() hands out task indices 0..n-1 to
+/// the workers; wait() returns when every task is done.  One batch at a time: every start() is followed by a wait()
+/// before the next start().
+struct ReadPool {
+    static constexpr int kThreads = 8;
+    std::vector<std::thread> th;
+    std::mutex mu;
+    std::condition_variable cv, cv_done;
+    std::function<void(size_t)> fn;
+    size_t tasks = 0;
+    std::atomic<size_t> nx{0};
+    int busy = 0;
+    uint64_t gen = 0;
+    bool stop = false;
+    ReadPool() {
+        for (int i = 0; i < kThreads; ++i)
+            th.emplace_back([this]() {
+                uint64_t seen = 0;
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] { return stop || gen != seen; });
+                        if (stop) return;
+                        seen = gen;
+                        ++busy;
+                    }
+                    for (size_t r; (r = nx.fetch_add(1)) < tasks;) fn(r);
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        if (--busy == 0) cv_done.notify_all();
+                    }
+                }
+            });
+    }
+    void start(size_t n, std::function<void(size_t)> f) {
+        std::lock_guard<std::mutex> lk(mu);
+        fn = std::move(f);
+        tasks = n;
+        nx = 0;
+        ++gen;
+        cv.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv_done.wait(lk, [&] { return busy == 0 && nx.load() >= tasks; });
+    }
+    ~ReadPool() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; }
+        cv.notify_all();
+        for (auto& t : th) t.join();
+    }
+};
+
 /// Decode speculative file-tier reads (Ds41MoeTier::spec_read): the experts the dense half predicts for a layer a few
 /// layers ahead that live only on NVMe are read (O_DIRECT, read_part split) into pinned slots by a persistent reader
 /// pool while the layers in between compute; gpu_run's file-miss path takes a matching slot instead of reading (waiting
@@ -253,6 +308,7 @@ struct SpecStash {
 struct Gpu {
     Arena arena;
     std::unique_ptr<SpecStash> spec;   ///< spec_read's stash (opened on first use)
+    std::unique_ptr<ReadPool> rpool;   ///< D3's file-tier readers (persistent; created on first use)
     std::unique_ptr<strata::core::ExpertCache> cache;
     strata::kernels::NativeExpertLayout gl;
     std::vector<strata::kernels::NativeExpertLayout> gll;   ///< per model layer (all == gl for a uniform geometry)
@@ -1621,10 +1677,12 @@ void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
     }
 }
 
-void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n) {
+void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
 #if defined(DS4_MOE_CUDA)
     Ds41MoeImpl& im = *im_;
-    if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || im.cfg.arena_adapt || !ids || n <= 0) return;
+    // d3: the caller is the verify pass, whose FILEG path takes stashed blobs under arena_adapt too (gpu_run's
+    // arena_adapt path reads into arena slots and never looks at the stash)
+    if (!im.inited || !im.gpu || !im.blobs || im.cfg.cpu_only || (im.cfg.arena_adapt && !d3) || !ids || n <= 0) return;
     if (layer <= im.run_layer || layer >= im.g.n_layers || !im.g.routed(layer)) return;
     Gpu& gp = *im.gpu;
     if (!gp.spec) {
@@ -2887,6 +2945,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     const int   NE = nt * (int) K;
     const double t0 = now_ms();
     Ds41MoeStats st;
+    ++im.run_seq;   // spec_read tags its stash slots with the call that will use them (one call per layer per pass)
+    im.run_layer = layer;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER gpu_run_n_ex layer=%lld nt=%d nact_multi_n=%zu nfmt=%zu kNativeActBytes=%d\n",
                                                   (long long) layer, nt, im.nact_multi_n.size(), im.nact_multi_act.size(), (int) cpu::kNativeActBytes);
     auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
@@ -2975,11 +3035,24 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     }
     if (nfg > 0 && !gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
     bool any_vic = false;
+    // a blob a spec_read (STRATA_D3_SPEC) already brought in sits in the stash: the DMA sources it there, and under
+    // arena_adapt it is copied into its victim slot after the DMAs are queued (fg_copy); the rest are read now
+    uint8_t* fg_copy[kMaxParts] = {};
+    int fread_b[kMaxParts], nfr = 0;
     for (int b = 0; b < nfg; ++b) {
         fg_vic[b] = adapt ? arena_victim(im, layer, (uint64_t) BLX(ue[fg_u[b]]), fg_vic, b) : -1;
-        fg_src[b] = fg_vic[b] >= 0
-            ? (const uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) gp.arena.slot_of[(size_t) (layer * im.g.n_experts + fg_vic[b])]]
-            : gp.h_fstage + (size_t) b * (size_t) B;
+        uint8_t* vslot = fg_vic[b] >= 0
+            ? (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) gp.arena.slot_of[(size_t) (layer * im.g.n_experts + fg_vic[b])]]
+            : nullptr;
+        const uint8_t* stashed = gp.spec ? gp.spec->take(layer, ue[fg_u[b]], im.run_seq) : nullptr;
+        if (stashed) {
+            ++im.st.spec_hits;
+            fg_src[b] = stashed;
+            fg_copy[b] = vslot;
+        } else {
+            fg_src[b] = vslot ? vslot : gp.h_fstage + (size_t) b * (size_t) B;
+            fread_b[nfr++] = b;
+        }
         any_vic = any_vic || fg_vic[b] >= 0;
     }
     if (any_vic) {   // nothing still in flight from an EARLIER call (a gpu_run decode skips its layer sync) reads or
@@ -2988,20 +3061,14 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         ck(cudaStreamSynchronize(gp.s), "d3 arena-adapt sync");
         if (gp.s_dc) ck(cudaStreamSynchronize(gp.s_dc), "d3 arena-adapt dc sync");
     }
-    std::vector<std::thread> frd;
-    std::atomic<size_t> fnx{0};
     const double tfg = nfg > 0 ? now_ms() : 0;
-    if (nfg > 0) {
-        const int parts = std::max(1, std::min(8, 8 / nfg));
-        const size_t tasks = (size_t) nfg * (size_t) parts;
-        const int nth = (int) std::min<size_t>(8, tasks);
-        for (int q = 0; q < nth; ++q)
-            frd.emplace_back([&, parts, tasks]() {
-                for (size_t r; (r = fnx.fetch_add(1)) < tasks;) {
-                    const int b = (int) (r / (size_t) parts);
-                    im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts, (uint8_t*) fg_src[b]);
-                }
-            });
+    if (nfr > 0) {
+        if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
+        const int parts = std::max(1, std::min(8, 8 / nfr));
+        gp.rpool->start((size_t) nfr * (size_t) parts, [&, parts](size_t r) {
+            const int b = fread_b[r / (size_t) parts];
+            im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts, (uint8_t*) fg_src[b]);
+        });
     }
     xmark(0);
     // ---- activations: q8_1 rows for the card (one per token); the pool's per-class quant runs with its jobs ----
@@ -3173,11 +3240,15 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         }
     }
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
-        for (auto& t : frd) t.join();
+        if (nfr > 0) gp.rpool->wait();
         im.st.file_tier += nfg;
         im.st.file_ms += now_ms() - tfg;
     }
     launch_site(PCIE);
+    // stashed FILEG blobs -> their arena_adapt victim slots, on the CPU while the card runs the DMAs (both only read
+    // the stash slot; the slot is not reissued before this call has returned)
+    for (int b = 0; b < nfg; ++b)
+        if (fg_copy[b]) std::memcpy(fg_copy[b], fg_src[b], (size_t) BLX(ue[fg_u[b]]));
     xmark(2);
     // ---- the pool on the CPU misses: one job per distinct expert, its class's fmt + per-(token,class) quant ----
     int nj = 0;

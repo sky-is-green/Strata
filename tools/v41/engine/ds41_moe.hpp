@@ -413,7 +413,7 @@ public:
     void advise_file(int64_t layer, const int32_t* ids, int n);
     /// Decode speculative reads: start O_DIRECT reads of `ids` (a later layer's predicted experts) that are neither
     /// VRAM-resident nor in the arena into a pinned stash; that layer's run takes them from there.  A hint only.
-    void spec_read(int64_t layer, const int32_t* ids, int n);
+    void spec_read(int64_t layer, const int32_t* ids, int n, bool d3 = false);
 
     /// out[i] = sum_k w6[k] * expert_{ids6[k]}(x)[i], with `x` on the host.  Synchronous.
     bool run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out);
