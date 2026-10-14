@@ -105,6 +105,13 @@ void dense_attn_decode_gate_fmt(const float* q, const void* k_cache, const void*
                                 const float* q_full, float* out, float* scratch, int n_head, int n_kv, int head_dim,
                                 int n_ctx, int max_ctx, float scale, void* stream);
 
+/// The graph-replay form: pos_slot is a DEVICE int32 holding this column's pos0 (a memcpy node in the captured
+/// pass refills it), and n_splits_grid is the captured grid's split count.  The kernels derive n_ctx from the slot.
+void dense_attn_decode_gate_dev_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt,
+                                    const float* q_full, float* out, float* scratch, int n_head, int n_kv,
+                                    int head_dim, int n_splits_grid, const int32_t* pos_slot, int col, int max_ctx,
+                                    float scale, void* stream);
+
 /// Bytes of scratch dense_attn_decode needs for a cache of `max_ctx` cells.
 uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx);
 
@@ -137,6 +144,10 @@ void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, 
 /// dense_kv_append_rows for any KV format: the caches are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
 void dense_kv_append_rows_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v,
                               int T, int pos0, int n_kv, int head_dim, int max_ctx, void* stream);
+
+/// The graph-replay form: the first row's cell position comes from a DEVICE int32 slot.
+void dense_kv_append_rows_dev_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v,
+                                  int T, const int32_t* pos_slot, int n_kv, int head_dim, int max_ctx, void* stream);
 
 /// Causal attention for T consecutive queries at positions pos0..pos0+T-1: one block per (head, token), the same
 /// warp-per-cell online softmax as dense_attn_decode, restricted to cells [0, pos0 + t].  q is [T, n_head, head_dim]

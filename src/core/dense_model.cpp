@@ -366,6 +366,14 @@ struct DenseModel::Impl {
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
     int64_t max_context = 0;
 
+    // ---- HIP graphs (STRATA_DENSE_GRAPH=1): the whole single-card decode pass is captured once per attention
+    // split count and replayed.  The token's embedding and position are staged in pinned host memory that the
+    // pass's own memcpy nodes read, so no launch argument changes between replays.  See run_graphed().
+    bool graph_on = false;
+    std::vector<cudaGraphExec_t> graph_exec;        // [bucket], bucket = splits_for(pos0 + 1); lazily captured
+    int32_t* pos_slot = nullptr;                    // device: this pass's pos0, read by rope/kv/attention
+    int32_t* pos_slot_host = nullptr;               // pinned source of the slot's memcpy node
+
     // ---- the batched prompt path (prefill_setup() / prefill()); see the block definitions below.
 #ifdef STRATA_DENSE_MMQ
     struct Pf {
@@ -646,24 +654,32 @@ struct DenseModel::Impl {
         return true;
     }
 
-    // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
-    bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst,
-                           std::string& err, float* stage = nullptr) {
-        float* st = stage ? stage : embd_stage;
-        if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
+    // The host half of the embedding lookup: n rows dequantized into the pinned stage (no device work).
+    bool embed_stage_rows(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* st, std::string& err) {
         for (int j = 0; j < n; ++j) {
             if (toks[j] < 0 || toks[j] >= n_vocab) { err = "dense model: token id outside the vocabulary"; return false; }
             const uint8_t* row = src.f.file->tensor_data(*src.f.tensor) + (size_t) toks[j] * src.row_bytes;
             if (!dequant_row(src.type, row, E, st + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
         }
-        cudaMemcpyAsync(dst, st, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream);
+        return true;
+    }
+    // The device half: stage -> dst, then R^T for a folded table.  The caller must not overwrite the stage until
+    // embed_done (recorded after this) has fired.
+    void enqueue_embed(const float* st, float* dst, int n, int E, void* s) {
+        cudaMemcpyAsync(dst, st, (size_t) n * E * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
         if (rot_inverse_embd) {
             // token_embd is stored folded too (inverse_weight_names): the lookup lands in the rotated basis, so
             // the table's output carries R^T = H/32 then the signs (Prism's fwht(x, inverse)).
-            const float* sg = ham_signs(E);
-            if (!sg) { err = "dense model: token_embd needs the E-wide prism.hadamard signs"; return false; }
-            dense_fwht_rows(dst, dst, sg, E, n, true, stream);
+            dense_fwht_rows(dst, dst, ham_signs(E), E, n, true, (cudaStream_t) s);
         }
+    }
+    // n embedding rows -> device, one copy; the pinned stage is reused only after the previous copy finished
+    bool upload_embeddings(const EmbdSrc& src, const int32_t* toks, int n, int E, int n_vocab, float* dst,
+                           std::string& err, float* stage = nullptr) {
+        float* st = stage ? stage : embd_stage;
+        if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
+        if (!embed_stage_rows(src, toks, n, E, n_vocab, st, err)) return false;
+        enqueue_embed(st, dst, n, E, stream);
         cudaEventRecord(embed_done, stream);
         return true;
     }
@@ -690,12 +706,19 @@ struct DenseModel::Impl {
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
     void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s);
     void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
-                    const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, uint16_t rot, void* s);
+                    const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
+                    const int32_t* pos_slot, uint16_t rot, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n,
                    uint16_t rot, void* s);
     void ffn_selfcheck(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s);
     void ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s);   // phase 1: FFN across GPUs
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
+
+    // ---- the HIP-graph path (STRATA_DENSE_GRAPH=1)
+    bool enqueue_pass(const DenseConfig& c, int n, int64_t pos0, Logits lg, bool keep_hidden, bool snapshot,
+                      const int32_t* pos_slot, void* s);
+    bool run_graphed(const DenseConfig& c, int32_t token, int64_t pos0, std::string& err);
+    bool capture_graph(const DenseConfig& c, int bucket, int64_t pos0, std::string& err);
 
 #ifdef STRATA_DENSE_MMQ
     // ---- the same blocks over a chunk of T tokens, reading and writing Pf instead of the NC-column buffers.
@@ -760,7 +783,7 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
 
 void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
                                   const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
-                                  uint16_t rot, void* s) {
+                                  const int32_t* pos_slot, uint16_t rot, void* s) {
     const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
     if (rot & (ROT_Q | ROT_K | ROT_V)) {
         fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
@@ -782,14 +805,27 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     rms_norm_weighted(kcur, kn, n * HK, D, c.rms_eps, s);
     // The position of a row is its column, computed inside the rope launch (rows / n_head for q, rows / n_kv for
     // k): no positions buffer, no two extra launches.  The prompt path keeps the explicit buffer.
-    native_rope_apply_rows(qcur, qcur, n * H, D, c.n_rot, rope, H, pos0, s);
-    native_rope_apply_rows(kcur, kcur, n * HK, D, c.n_rot, rope, HK, pos0, s);
-    dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
-    for (int j = 0; j < n; ++j) {
-        // The merge writes the gated output straight to attn32: the gate is row h's second half in q_full.
-        dense_attn_decode_gate_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, q_full + (size_t) j * H * 2 * D,
-                                   attn32 + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1,
-                                   (int) max_context, scale, s);
+    if (!pos_slot) {
+        native_rope_apply_rows(qcur, qcur, n * H, D, c.n_rot, rope, H, pos0, s);
+        native_rope_apply_rows(kcur, kcur, n * HK, D, c.n_rot, rope, HK, pos0, s);
+        dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
+        for (int j = 0; j < n; ++j) {
+            // The merge writes the gated output straight to attn32: the gate is row h's second half in q_full.
+            dense_attn_decode_gate_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, q_full + (size_t) j * H * 2 * D,
+                                       attn32 + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1,
+                                       (int) max_context, scale, s);
+        }
+    } else {
+        // The graph replay: this pass's pos0 lives in the device slot the captured pass refills, and the split
+        // grid is the capture bucket (the kernel still reads the real n_ctx from the slot).
+        native_rope_apply_rows_dev(qcur, qcur, n * H, D, c.n_rot, rope, H, pos_slot, s);
+        native_rope_apply_rows_dev(kcur, kcur, n * HK, D, c.n_rot, rope, HK, pos_slot, s);
+        dense_kv_append_rows_dev_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos_slot, HK, D, (int) max_context, s);
+        for (int j = 0; j < n; ++j) {
+            dense_attn_decode_gate_dev_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, q_full + (size_t) j * H * 2 * D,
+                                           attn32 + (size_t) j * H * D, attn_scratch, H, HK, D,
+                                           (pos0 + j + 1 + 255) / 256, pos_slot, j, (int) max_context, scale, s);
+        }
     }
     }
     if (rot & ROT_O) {
@@ -1192,7 +1228,7 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
     quantize(cat, 2 * E, n, s);
     gemv(M.eh_proj, x, n, s);                       // x = the block's input and its attention residual
     dense_rms_norm(x, M.attn_norm, xn, n, E, c.rms_eps, s);
-    attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, 0, s);   // the MTP block is never folded
+    attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, nullptr, 0, s);   // the MTP block is never folded
     add_inplace(x, mix, (int64_t) n * E, s);
     ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, 0, s);
     if (want_logits) {
@@ -1209,6 +1245,8 @@ DenseModel::DenseModel() : impl_(new Impl) {}
 DenseModel::~DenseModel() {
     if (!impl_) return;
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
+    for (cudaGraphExec_t& e : impl_->graph_exec) if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    if (impl_->pos_slot_host) { cudaFreeHost(impl_->pos_slot_host); impl_->pos_slot_host = nullptr; }
     if (impl_->stream1) {
         cudaSetDevice(1);
         cudaStreamDestroy(impl_->stream1);
@@ -1420,6 +1458,27 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (const char* e = std::getenv("STRATA_DENSE_PROF")) I.prof.enabled = e[0] && e[0] != '0';
         if (const char* e = std::getenv("STRATA_DENSE_FFN_TRACE")) I.split_trace = std::atoi(e);
         if (const char* e = std::getenv("STRATA_DENSE_FFN_SELFCHECK")) I.split_check = e[0] && e[0] != '0';
+        // STRATA_DENSE_GRAPH=1: capture the single-card decode pass into one HIP graph per attention split count
+        // (lazily, at the first token of each range) and replay it.  One card only: the split path has host waits
+        // in the middle of its pass that no capture can contain.
+        if (const char* e = std::getenv("STRATA_DENSE_GRAPH")) I.graph_on = e[0] && e[0] != '0';
+        if (I.graph_on && I.ffn_split) {
+            std::fprintf(stderr, "strata-dense: STRATA_DENSE_GRAPH=1 is off: the FFN split's pass is not capturable\n");
+            I.graph_on = false;
+        }
+        if (I.graph_on) {
+            const int buckets = (int) ((max_context + 255) / 256);
+            I.graph_exec.assign((size_t) buckets + 1, nullptr);
+            if (I.alloc(&I.pos_slot, 8, err, "graph position slot") &&
+                cudaHostAlloc((void**) &I.pos_slot_host, 8, cudaHostAllocDefault) == cudaSuccess) {
+                I.pos_slot_host[0] = 0;
+                cudaMemcpy(I.pos_slot, I.pos_slot_host, sizeof(int32_t), cudaMemcpyHostToDevice);
+                std::fprintf(stderr, "strata-dense: HIP graphs on: the decode pass is one graph per 256-cell context range\n");
+            } else {
+                std::fprintf(stderr, "strata-dense: STRATA_DENSE_GRAPH: position slot allocation failed, staying on launches\n");
+                I.graph_on = false;
+            }
+        }
         if (const char* e = std::getenv("STRATA_DENSE_MMVQ_FAST"))      // the multi-column layout that is faster but not bitwise equal to 1 column
             if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "strata-dense: multi-column GEMV: upstream layout\n"); }
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
@@ -1875,6 +1934,14 @@ void DenseModel::set_last_hidden(int col) {
 bool DenseModel::rollback(int keep_col, std::string& err) {
     if (!snap_valid_) { err = "dense model: rollback without a snapshot"; return false; }
     if (keep_col < 0 || keep_col >= snap_cols_ - 1) { err = "dense model: rollback column outside the snapshots"; return false; }
+    // A captured graph holds the state POINTERS the layers were launched with; the swap below changes them, so
+    // the graphs are dropped and recaptured against the new ones (the spec path is the only caller).
+    bool had_graph = false;
+    for (cudaGraphExec_t& e : impl_->graph_exec) if (e) had_graph = true;
+    if (had_graph) {
+        cudaStreamSynchronize(impl_->stream);
+        for (cudaGraphExec_t& e : impl_->graph_exec) { if (e) { cudaGraphExecDestroy(e); e = nullptr; } }
+    }
     for (Layer& L : impl_->layers) {
         if (L.attn) continue;
         std::swap(L.state, L.st_slots[(size_t) keep_col]);
@@ -1882,6 +1949,114 @@ bool DenseModel::rollback(int keep_col, std::string& err) {
     }
     pos_ = snap_pos0_ + keep_col + 1;
     snap_valid_ = false;
+    return true;
+}
+
+// The device half of one pass, from the embedding copy to the head, with no host-side work: the caller has already
+// dequantized the tokens into embd_stage.  pos_slot == nullptr runs the plain path (the layer blocks take pos0 as
+// an argument); a non-null slot is the graph path, where the pass's own memcpy fills the device position and the
+// kernels read it back.  Callable inside a stream capture.
+bool DenseModel::Impl::enqueue_pass(const DenseConfig& c, int n, int64_t pos0, Logits lg, bool keep_hidden,
+                                    bool snapshot, const int32_t* pos_slot, void* s) {
+    const int E = c.n_embd;
+    enqueue_embed(embd_stage, x, n, E, s);
+    if (pos_slot) cudaMemcpyAsync((void*) pos_slot, pos_slot_host, sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s);
+    const bool dbg = dbg_from >= 0 && pos0 < dbg_to && pos0 + n > dbg_from;
+    if (dbg) trace_vec("embed", pos0, -1, "", x, n * E, s);
+    for (int l = 0; l < c.n_layer; ++l) {
+        Layer& L = layers[(size_t) l];
+        {
+            PScope ps(&prof, Prof::RMS, s);
+            dense_rms_norm(x, L.attn_norm, xn, n, E, c.rms_eps, s);
+        }
+        if (!L.attn) gdn_block(c, L, n, snapshot, s);
+        else attn_block(c, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, pos_slot, L.rot, s);
+        {
+            PScope ps(&prof, Prof::ADD, s);
+            add_inplace(x, mix, (int64_t) n * E, s);
+        }
+        cur_layer = l;
+        // STRATA_DENSE_SPLIT_OFF=1: keep the split load (so ffn_r0 and the traces are the split's) but run the
+        // plain single-card FFN.  The reference side of the part-by-part comparison.
+        static const bool split_off = std::getenv("STRATA_DENSE_SPLIT_OFF") && std::getenv("STRATA_DENSE_SPLIT_OFF")[0] != '0';
+        if (ffn_split && !split_off) ffn_block_split(c, L, n, L.rot, s);
+        else ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
+        if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", x, n * E, s);
+    }
+    if (lg != Logits::None || keep_hidden) {
+        {
+            PScope ps(&prof, Prof::RMS, s);
+            dense_rms_norm(x, output_norm, hid, n, E, c.rms_eps, s);     // h_nextn: the post-norm hidden
+        }
+        if (lg == Logits::Last) {
+            const float* src = hid + (size_t) (n - 1) * E;
+            if (head_rot) { dense_fwht_rows(src, rot_scratch, ham_signs(E), E, 1, false, s); src = rot_scratch; }
+            quantize(src, E, 1, s);
+            gemv(head, logits, 1, s);
+        } else if (lg == Logits::All) {
+            const float* src = hid;
+            if (head_rot) { dense_fwht_rows(src, rot_scratch, ham_signs(E), E, n, false, s); src = rot_scratch; }
+            quantize(src, E, n, s);
+            gemv(head, logits, n, s);
+        }
+        if (dbg && lg != Logits::None) trace_logits(pos0 + n - 1, logits, c.n_vocab, s);
+    }
+    return true;
+}
+
+// Captures one pass into a graph for `bucket` (the split count of the attention decode at this pos0).  The pass
+// always computes the head, so the graph serves Logits::None calls too (they just ignore the logits).
+bool DenseModel::Impl::capture_graph(const DenseConfig& c, int bucket, int64_t pos0, std::string& err) {
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = std::string("dense model: graph begin capture: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    bool ok = true;
+    try {
+        enqueue_pass(c, 1, pos0, Logits::Last, true, false, pos_slot, stream);
+    } catch (const std::exception& e) {
+        ok = false;
+        err = std::string("dense model: graph capture: ") + e.what();
+    }
+    cudaGraph_t built = nullptr;
+    const cudaError_t end = cudaStreamEndCapture(stream, &built);
+    if (end != cudaSuccess) {
+        if (built) cudaGraphDestroy(built);
+        if (ok) err = std::string("dense model: graph end capture: ") + cudaGetErrorString(end);
+        return false;
+    }
+    if (!ok) { if (built) cudaGraphDestroy(built); return false; }
+    cudaGraphExec_t exec = nullptr;
+    if (cudaGraphInstantiate(&exec, built, nullptr, nullptr, 0) != cudaSuccess) {
+        err = std::string("dense model: graph instantiate: ") + cudaGetErrorString(cudaGetLastError());
+        cudaGraphDestroy(built);
+        return false;
+    }
+    cudaGraphDestroy(built);
+    graph_exec[(size_t) bucket] = exec;
+    return true;
+}
+
+// The graph entry: stages the token's embedding and position in pinned host memory, captures the bucket's graph on
+// first use, and replays it.  False with an empty err means the capture failed and the caller should run the plain
+// path (graph_on is off for good); false with an err is a real failure.
+bool DenseModel::Impl::run_graphed(const DenseConfig& c, int32_t token, int64_t pos0, std::string& err) {
+    if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
+    if (!embed_stage_rows(embd, &token, 1, c.n_embd, c.n_vocab, embd_stage, err)) return false;
+    pos_slot_host[0] = (int32_t) pos0;
+    const int64_t want = (pos0 + 1 + 255) / 256;
+    const int bucket = (int) std::min<int64_t>(want, (int64_t) graph_exec.size() - 1);
+    if (!graph_exec[(size_t) bucket] && !capture_graph(c, bucket, pos0, err)) {
+        graph_on = false;                          // stay on the plain path, whatever went wrong
+        for (cudaGraphExec_t& e : graph_exec) { if (e) { cudaGraphExecDestroy(e); e = nullptr; } }
+        err.clear();
+        return false;
+    }
+    if (cudaGraphLaunch(graph_exec[(size_t) bucket], stream) != cudaSuccess) {
+        err = std::string("dense model: graph launch: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    cudaEventRecord(embed_done, stream);
     return true;
 }
 
@@ -1894,56 +2069,35 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     const int E = cfg_.n_embd;
     const int64_t pos0 = pos_;
     const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
+    // The graph path serves the plain single-token pass.  A failed capture returns false with an empty err; the
+    // plain path below then runs the token.
+    if (I.graph_on && n == 1 && !snapshot && !dbg && !I.prof.enabled && !I.ffn_split) {
+        if (I.run_graphed(cfg_, tokens[0], pos0, err)) {
+            pos_ += 1;
+            snap_valid_ = false;
+            snap_pos0_ = pos0;
+            snap_cols_ = 1;
+            return true;
+        }
+        if (!err.empty()) return false;
+    }
     try {
         if (I.prof.enabled) I.prof.begin(s);
         {
             PScope ps(&I.prof, Prof::EMB, s);
-            if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
-        }
-        if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
-        for (int l = 0; l < cfg_.n_layer; ++l) {
-            Layer& L = I.layers[(size_t) l];
-            {
-                PScope ps(&I.prof, Prof::RMS, s);
-                dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            if (cudaEventSynchronize(I.embed_done) != cudaSuccess) {
+                err = "dense model: embedding event";
+                I.prof.on = false;
+                return false;
             }
-            if (!L.attn) I.gdn_block(cfg_, L, n, snapshot, s);
-            else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, L.rot, s);
-            {
-                PScope ps(&I.prof, Prof::ADD, s);
-                add_inplace(I.x, I.mix, (int64_t) n * E, s);
-            }
-            I.cur_layer = l;
-            // STRATA_DENSE_SPLIT_OFF=1: keep the split load (so ffn_r0 and the traces are the split's) but run the
-            // plain single-card FFN.  The reference side of the part-by-part comparison.
-            static const bool split_off = std::getenv("STRATA_DENSE_SPLIT_OFF") && std::getenv("STRATA_DENSE_SPLIT_OFF")[0] != '0';
-            if (I.ffn_split && !split_off) I.ffn_block_split(cfg_, L, n, L.rot, s);
-            else I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
-            if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
+            if (!I.embed_stage_rows(I.embd, tokens, n, E, cfg_.n_vocab, I.embd_stage, err)) { I.prof.on = false; return false; }
         }
+        I.enqueue_pass(cfg_, n, pos0, lg, keep_hidden, snapshot, nullptr, s);
+        cudaEventRecord(I.embed_done, (cudaStream_t) s);
         pos_ += n;
         snap_valid_ = snapshot && n > 1;
         snap_pos0_ = pos0;
         snap_cols_ = n;
-
-        if (lg != Logits::None || keep_hidden) {
-            {
-                PScope ps(&I.prof, Prof::RMS, s);
-                dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
-            }
-            if (lg == Logits::Last) {
-                const float* src = I.hid + (size_t) (n - 1) * E;
-                if (I.head_rot) { dense_fwht_rows(src, I.rot_scratch, I.ham_signs(E), E, 1, false, s); src = I.rot_scratch; }
-                I.quantize(src, E, 1, s);
-                I.gemv(I.head, I.logits, 1, s);
-            } else if (lg == Logits::All) {
-                const float* src = I.hid;
-                if (I.head_rot) { dense_fwht_rows(src, I.rot_scratch, I.ham_signs(E), E, n, false, s); src = I.rot_scratch; }
-                I.quantize(src, E, n, s);
-                I.gemv(I.head, I.logits, n, s);
-            }
-            if (dbg && lg != Logits::None) trace_logits(pos0 + n - 1, I.logits, cfg_.n_vocab, s);
-        }
         if (I.prof.on) I.prof.finish(s, n);
         return true;
     } catch (const std::exception& e) {

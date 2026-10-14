@@ -24,6 +24,10 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
 void native_rope_apply_rows(const float* x, float* out, int rows, int head_dim, int n_rot,
                             const RopeScaling& scaling, int heads, int pos0, void* stream);
 
+/// The same launch with pos0 read from a device slot instead of an argument (the graph path's staged position).
+void native_rope_apply_rows_dev(const float* x, float* out, int rows, int head_dim, int n_rot,
+                                const RopeScaling& scaling, int heads, const int32_t* pos_slot, void* stream);
+
 /// (#783 PR-f, stuchapin909) native_qsa_rms_norm_weighted + native_rope_apply in one launch, bit-identical to the pair
 /// (rope_parity check 6): x rows are `in_stride` apart (2 * head_dim reads a q row out of a q|gate row), out rows are
 /// head_dim apart, x may equal out when in_stride == head_dim. head_dim 128 or 256 and n_rot 64 only.

@@ -73,12 +73,13 @@ __global__ void apply(const float* x, float* out, int rows, int width,
 template <bool TAB>
 __global__ void apply_rows_kernel(const float* x, float* out, int rows, int width, int n_rot, float theta_scale,
                                   float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
-                                  const int* mtab, RopeTab rt, int pos0, int heads) {
+                                  const int* mtab, RopeTab rt, int pos0, int heads, const int32_t* pos_slot) {
     const int row = blockIdx.y;
     const int pair = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows || pair >= width / 2) return;
     const size_t start = size_t(row) * width;
-    const int pos = pos0 + row / heads;
+    // `pos_slot` (a graph replay's staged position) wins over the launch's pos0 when both are given.
+    const int pos = (pos_slot ? __ldg(pos_slot) : pos0) + row / heads;
     if (pair >= n_rot / 2) {
         if (x != out) {
             out[start + 2 * pair] = x[start + 2 * pair];
@@ -246,10 +247,12 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
-void native_rope_apply_rows(const float* x, float* out, int rows, int head_dim, int n_rot, const RopeScaling& scaling,
-                            int heads, int pos0, void* stream) {
+namespace {
+void apply_rows_launch(const float* x, float* out, int rows, int head_dim, int n_rot, const RopeScaling& scaling,
+                       int heads, int pos0, const int32_t* pos_slot, void* stream) {
     if (!x || !out || !stream || rows < 1 || rows > 65535 || heads < 1 || pos0 < 0 ||
         (head_dim != 128 && head_dim != 256) || n_rot != 64 ||
+        (pos_slot && (reinterpret_cast<uintptr_t>(pos_slot) % 4)) ||
         rope_scaling_invalid(scaling) != nullptr ||
         reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4) {
         throw std::invalid_argument("native RoPE (computed row positions) requires aligned F32 rows, width 128/256, "
@@ -265,13 +268,26 @@ void native_rope_apply_rows(const float* x, float* out, int rows, int head_dim, 
     if (rt.cos != nullptr)
         apply_rows_kernel<true><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
             x, out, rows, head_dim, n_rot, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt, pos0, heads);
+            k.attn_factor, mrope_table(), rt, pos0, heads, pos_slot);
     else
         apply_rows_kernel<false><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
             x, out, rows, head_dim, n_rot, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt, pos0, heads);
+            k.attn_factor, mrope_table(), rt, pos0, heads, pos_slot);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+}  // namespace
+
+void native_rope_apply_rows(const float* x, float* out, int rows, int head_dim, int n_rot, const RopeScaling& scaling,
+                            int heads, int pos0, void* stream) {
+    apply_rows_launch(x, out, rows, head_dim, n_rot, scaling, heads, pos0, nullptr, stream);
+}
+
+// The graph-replay form: the position lives in a device slot the pass's own memcpy node refills, so no launch
+// argument changes between replays.
+void native_rope_apply_rows_dev(const float* x, float* out, int rows, int head_dim, int n_rot,
+                                const RopeScaling& scaling, int heads, const int32_t* pos_slot, void* stream) {
+    apply_rows_launch(x, out, rows, head_dim, n_rot, scaling, heads, 0, pos_slot, stream);
 }
 
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,

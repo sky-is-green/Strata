@@ -342,7 +342,11 @@ template <int KF, int VF>
 __global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* __restrict__ K,
                                     const uint8_t* __restrict__ V, float* __restrict__ part_acc,
                                     float* __restrict__ part_ml, int n_head, int n_kv, int head_dim, int n_ctx,
-                                    int max_ctx, float scale, int n_splits) {
+                                    int max_ctx, float scale, int n_splits, const int32_t* pos_slot, int col) {
+    if (pos_slot) {                                   // a graph replay: the pass's position slot decides the range
+        n_ctx = (int) __ldg(pos_slot) + col + 1;
+        n_splits = (n_ctx + kChunk - 1) / kChunk;
+    }
     const int h = blockIdx.x, split = blockIdx.y;
     const int kvh = h / (n_head / n_kv);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -448,7 +452,8 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const floa
 template <int VF>
 __global__ void attn_merge_gate_kernel(const float* __restrict__ part_acc, const float* __restrict__ part_ml,
                                        const float* __restrict__ q_full, float* __restrict__ out, int head_dim,
-                                       int n_splits) {
+                                       int n_splits, const int32_t* pos_slot, int col) {
+    if (pos_slot) n_splits = ((int) __ldg(pos_slot) + col + 1 + kChunk - 1) / kChunk;
     __shared__ float so[kMaxHeadDim];
     const int h = blockIdx.x;
     float gm = -FLT_MAX;
@@ -509,10 +514,13 @@ __global__ void positions_kernel(int32_t* dst, int rows, int heads, int32_t pos0
 // wants the 256 threads of a 256-wide head.
 template <int KF, int VF>
 __global__ void kv_append_rows_kernel(uint8_t* __restrict__ kc, uint8_t* __restrict__ vc, const float* __restrict__ k,
-                                      const float* __restrict__ v, int pos0, int n_kv, int head_dim, int max_ctx) {
+                                      const float* __restrict__ v, int pos0, int n_kv, int head_dim, int max_ctx,
+                                      const int32_t* pos_slot) {
     __shared__ float buf[kMaxHeadDim];
     const int h = blockIdx.x, t = blockIdx.y;
-    const size_t cell = (size_t) h * max_ctx + pos0 + t;
+    // `pos_slot` (a graph replay's staged position) wins over the launch's pos0 when both are given.
+    const int p = pos_slot ? __ldg(pos_slot) : pos0;
+    const size_t cell = (size_t) h * max_ctx + p + t;
     const float* kh = k + ((size_t) t * n_kv + h) * head_dim;
     const float* vh = v + ((size_t) t * n_kv + h) * head_dim;
     buf[threadIdx.x] = kh[threadIdx.x];
@@ -1171,7 +1179,7 @@ void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_ca
     const dim3 grid(n_head, n_splits);
 #define STRATA_ATT(KF, VF)                                                                                      \
     attn_partial_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, part_acc, part_ml, n_head, n_kv,         \
-                                                              head_dim, n_ctx, max_ctx, scale, n_splits)
+                                                              head_dim, n_ctx, max_ctx, scale, n_splits, nullptr, 0)
     switch (k_fmt * 3 + v_fmt) {
         case 0: STRATA_ATT(kF16, kF16); break;
         case 1: STRATA_ATT(kF16, kQ8); break;
@@ -1214,7 +1222,7 @@ void dense_attn_decode_gate_fmt(const float* q, const void* k_cache, const void*
     const dim3 grid(n_head, n_splits);
 #define STRATA_ATTG(KF, VF)                                                                                     \
     attn_partial_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, part_acc, part_ml, n_head, n_kv,         \
-                                                              head_dim, n_ctx, max_ctx, scale, n_splits)
+                                                              head_dim, n_ctx, max_ctx, scale, n_splits, nullptr, 0)
     switch (k_fmt * 3 + v_fmt) {
         case 0: STRATA_ATTG(kF16, kF16); break;
         case 1: STRATA_ATTG(kF16, kQ8); break;
@@ -1228,9 +1236,49 @@ void dense_attn_decode_gate_fmt(const float* q, const void* k_cache, const void*
     }
 #undef STRATA_ATTG
     check("dense_attn_partial");
-    if (v_fmt == kQ4) attn_merge_gate_kernel<kQ4><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits);
-    else attn_merge_gate_kernel<kF16><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits);
+    if (v_fmt == kQ4) attn_merge_gate_kernel<kQ4><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits, nullptr, 0);
+    else attn_merge_gate_kernel<kF16><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits, nullptr, 0);
     check("dense_attn_merge_gate");
+}
+
+// The graph-replay form: the position lives in a device slot (a memcpy node in the captured pass refills it), so
+// the launch arguments stay fixed.  `n_splits_grid` is the captured grid's split count -- the bucket of the graph.
+void dense_attn_decode_gate_dev_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt,
+                                    const float* q_full, float* out, float* scratch, int n_head, int n_kv,
+                                    int head_dim, int n_splits_grid, const int32_t* pos_slot, int col, int max_ctx,
+                                    float scale, void* stream) {
+    if (!pos_slot) throw std::runtime_error("dense_attn_decode_gate_dev: no position slot");
+    if (n_splits_grid < 1 || n_splits_grid > splits_for(max_ctx))
+        throw std::runtime_error("dense_attn_decode_gate_dev: split count outside the scratch");
+    if (head_dim % 32 != 0 || head_dim > kMaxHeadDim || n_head % n_kv != 0)
+        throw std::runtime_error("dense_attn_decode_gate_dev: head_dim must be a multiple of 32 up to 256 and n_head a multiple of n_kv");
+    check_kv_formats("dense_attn_decode_gate_dev", k_fmt, v_fmt, head_dim);
+    const int max_splits = splits_for(max_ctx);
+    float* part_acc = scratch;
+    float* part_ml = scratch + (size_t) n_head * max_splits * head_dim;
+    const cudaStream_t st = (cudaStream_t) stream;
+    const uint8_t* K = (const uint8_t*) k_cache;
+    const uint8_t* V = (const uint8_t*) v_cache;
+    const dim3 grid(n_head, n_splits_grid);
+#define STRATA_ATTGD(KF, VF)                                                                                    \
+    attn_partial_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, part_acc, part_ml, n_head, n_kv,         \
+                                                              head_dim, 0, max_ctx, scale, n_splits_grid, pos_slot, col)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_ATTGD(kF16, kF16); break;
+        case 1: STRATA_ATTGD(kF16, kQ8); break;
+        case 2: STRATA_ATTGD(kF16, kQ4); break;
+        case 3: STRATA_ATTGD(kQ8, kF16); break;
+        case 4: STRATA_ATTGD(kQ8, kQ8); break;
+        case 5: STRATA_ATTGD(kQ8, kQ4); break;
+        case 6: STRATA_ATTGD(kQ4, kF16); break;
+        case 7: STRATA_ATTGD(kQ4, kQ8); break;
+        default: STRATA_ATTGD(kQ4, kQ4); break;
+    }
+#undef STRATA_ATTGD
+    check("dense_attn_partial_dev");
+    if (v_fmt == kQ4) attn_merge_gate_kernel<kQ4><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits_grid, pos_slot, col);
+    else attn_merge_gate_kernel<kF16><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits_grid, pos_slot, col);
+    check("dense_attn_merge_gate_dev");
 }
 
 // ============================================================================ the batched prompt path
@@ -1264,7 +1312,7 @@ void dense_kv_append_rows_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt
     uint8_t* kc = (uint8_t*) k_cache;
     uint8_t* vc = (uint8_t*) v_cache;
 #define STRATA_KVROWS(K, V) \
-    kv_append_rows_kernel<K, V><<<dim3(n_kv, T), head_dim, 0, st>>>(kc, vc, k, v, pos0, n_kv, head_dim, max_ctx)
+    kv_append_rows_kernel<K, V><<<dim3(n_kv, T), head_dim, 0, st>>>(kc, vc, k, v, pos0, n_kv, head_dim, max_ctx, nullptr)
     switch (k_fmt * 3 + v_fmt) {
         case 0: STRATA_KVROWS(kF16, kF16); break;
         case 1: STRATA_KVROWS(kF16, kQ8); break;
@@ -1283,6 +1331,32 @@ void dense_kv_append_rows_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt
 void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, const float* v, int T, int pos0,
                           int n_kv, int head_dim, int max_ctx, void* stream) {
     dense_kv_append_rows_fmt(k_cache, v_cache, kF16, kF16, k, v, T, pos0, n_kv, head_dim, max_ctx, stream);
+}
+
+// The graph-replay form: the cell position comes from a device slot instead of an argument.
+void dense_kv_append_rows_dev_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v,
+                                  int T, const int32_t* pos_slot, int n_kv, int head_dim, int max_ctx, void* stream) {
+    if (T < 1) throw std::runtime_error("dense_kv_append_rows_dev: no rows");
+    if (!pos_slot) throw std::runtime_error("dense_kv_append_rows_dev: no position slot");
+    check_kv_formats("dense_kv_append_rows_dev", k_fmt, v_fmt, head_dim);
+    const cudaStream_t st = (cudaStream_t) stream;
+    uint8_t* kc = (uint8_t*) k_cache;
+    uint8_t* vc = (uint8_t*) v_cache;
+#define STRATA_KVROWSD(K, V) \
+    kv_append_rows_kernel<K, V><<<dim3(n_kv, T), head_dim, 0, st>>>(kc, vc, k, v, 0, n_kv, head_dim, max_ctx, pos_slot)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_KVROWSD(kF16, kF16); break;
+        case 1: STRATA_KVROWSD(kF16, kQ8); break;
+        case 2: STRATA_KVROWSD(kF16, kQ4); break;
+        case 3: STRATA_KVROWSD(kQ8, kF16); break;
+        case 4: STRATA_KVROWSD(kQ8, kQ8); break;
+        case 5: STRATA_KVROWSD(kQ8, kQ4); break;
+        case 6: STRATA_KVROWSD(kQ4, kF16); break;
+        case 7: STRATA_KVROWSD(kQ4, kQ8); break;
+        default: STRATA_KVROWSD(kQ4, kQ4); break;
+    }
+#undef STRATA_KVROWSD
+    check("dense_kv_append_rows_dev");
 }
 
 void dense_fwht_rows(const float* x, float* y, const float* signs, int width, int rows, bool inverse, void* stream) {
