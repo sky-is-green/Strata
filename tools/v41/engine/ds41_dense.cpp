@@ -954,6 +954,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         L.eslot = G.engram_slot(l);
     }
     // persistent state
+    if (cfg.kv_fp4 && (!cfg.act_quant || im.cpu || im.DH % 64 || im.ID % 32)) {
+        err = "--kv-fp4 needs act_quant (the FP4 grids), the CUDA backend, d_head % 64 == 0 and idx_dim % 32 == 0";
+        return false;
+    }
     const ggml_type kvt = cfg.kv_type >= 0 ? (ggml_type) cfg.kv_type : cfg.act_quant ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     ggml_init_params sp = { ggml_tensor_overhead() * 512, nullptr, true };
     im.sctx = ggml_init(sp);
@@ -983,8 +987,12 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         L.raw_snap = T(kvt, { im.DH, im.RAW });
         L.rbias = T(GGML_TYPE_F32, { im.NE });   // zeroed with the buffer
         if (L.kv_src) {
-            L.comp = T(kvt, { im.DH, im.cmax[L.ratio] + 1 });
-            L.idxk = T(kvt, { im.ID, im.cmax[L.ratio] + 1 });
+            // STRATA_KV_FP4_ONLY=comp|idx (bisect tap): pack only one of the two caches
+            static const char * only = std::getenv("STRATA_KV_FP4_ONLY");
+            const bool fc = cfg.kv_fp4 && !(only && std::string(only) == "idx");
+            const bool fi = cfg.kv_fp4 && !(only && std::string(only) == "comp");
+            L.comp = T(fc ? GGML_TYPE_NVFP4 : kvt, { im.DH, im.cmax[L.ratio] + 1 });
+            L.idxk = T(fi ? GGML_TYPE_MXFP4 : kvt, { im.ID, im.cmax[L.ratio] + 1 });
             if (L.ratio == 2) {
                 L.st_kv = T(GGML_TYPE_F32, { im.DH, 2 });
                 L.st_sc = T(GGML_TYPE_F32, { im.DH, 2 });
@@ -1520,6 +1528,15 @@ bool Ds41Dense::read_state(std::vector<float> & x, std::vector<float> & pre) {
     pre.resize((size_t) (im.HC * im.n));
     ggml_backend_tensor_get(im.x_state, x.data(), 0, x.size() * 4);
     ggml_backend_tensor_get(im.pre_state, pre.data(), 0, pre.size() * 4);
+    return true;
+}
+
+bool Ds41Dense::read_state_cols(int c0, int n, std::vector<float> & x) {
+    Impl & im = *p_;
+    if (c0 < 0 || n < 1 || c0 + n > im.NC) { im.err = "read_state_cols: bad range"; return false; }
+    const size_t col = (size_t) (im.D * im.HC) * sizeof(float);   // x_state [D, HC, NC]: a column is contiguous
+    x.resize((size_t) (im.D * im.HC * n));
+    ggml_backend_tensor_get(im.x_state, x.data(), (size_t) c0 * col, (size_t) n * col);
     return true;
 }
 

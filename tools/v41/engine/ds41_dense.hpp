@@ -49,6 +49,10 @@ struct Ds41DenseConfig {
     int     kv_type = -1;
     /// model.py's activation rounding (ds41_ops.hpp): window K FP8, compressed KV FP4/E4M3, indexer q/k FP4.
     bool    act_quant = true;
+    /// --kv-fp4 (needs act_quant, CUDA): the compressed KV as NVFP4 and the indexer keys as MXFP4 - their fake-quant
+    /// grids exactly (e2m1 x E4M3 per 16 / x 2^k per 32), packed bit for bit by the vendored ggml-cuda's set_rows
+    /// (cpy-utils.cuh *_ds41_block): 4.5 / 4.25 bits a value instead of BF16's 16 - ~3.5x less KV VRAM at long ctx.
+    bool    kv_fp4 = false;
 };
 
 class Ds41Dense {
@@ -142,6 +146,9 @@ public:
     int snapshot_pos() const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
+    /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
+    /// after finish_span (the serve DSpark seed reads its main_hidden there instead of re-running the tail as passes).
+    bool read_state_cols(int c0, int n, std::vector<float> & x);
     /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
     /// and their visibility mask; empty for other layers.
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);

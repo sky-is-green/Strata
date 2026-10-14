@@ -157,9 +157,11 @@ struct Arena {
 /// the workers; wait() returns when every task is done.  One batch at a time: every start() is followed by a wait()
 /// before the next start().
 struct ReadPool {
-    // STRATA_D3_READERS: worker count (default 8).  NVMe queue depth = readers x (each pread's 128 KiB commands)
+    // STRATA_D3_READERS: worker count (default 32).  NVMe queue depth = readers x (each pread's 128 KiB commands):
+    // s11 (2026-10-14, PM9A1 Gen4 x4): 8 x 8 parts -> 32 x 32 cut file-tier ms per blob ~17% (code 1925 -> 1606 ms
+    // for the same 647 blobs), decode +4-5%; 64 was slower in the O_DIRECT microbench
     static int n_threads() {
-        static const int n = std::getenv("STRATA_D3_READERS") ? std::max(1, std::min(64, std::atoi(std::getenv("STRATA_D3_READERS")))) : 8;
+        static const int n = std::getenv("STRATA_D3_READERS") ? std::max(1, std::min(64, std::atoi(std::getenv("STRATA_D3_READERS")))) : 32;
         return n;
     }
     std::vector<std::thread> th;
@@ -3072,8 +3074,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     const double tfg = nfg > 0 ? now_ms() : 0;
     if (nfr > 0) {
         if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
-        // STRATA_D3_PARTS: a call's read budget in parts (default 8, split over its blobs)
-        static const int d3_parts = std::getenv("STRATA_D3_PARTS") ? std::max(1, std::atoi(std::getenv("STRATA_D3_PARTS"))) : 8;
+        // STRATA_D3_PARTS: a call's read budget in parts (default 32 = the readers, split over its blobs)
+        static const int d3_parts = std::getenv("STRATA_D3_PARTS") ? std::max(1, std::atoi(std::getenv("STRATA_D3_PARTS"))) : 32;
         const int parts = std::max(1, std::min(d3_parts, d3_parts / nfr));
         gp.rpool->start((size_t) nfr * (size_t) parts, [&, parts](size_t r) {
             const int b = fread_b[r / (size_t) parts];

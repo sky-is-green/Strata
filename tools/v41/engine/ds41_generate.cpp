@@ -6,7 +6,7 @@
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
-//                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--serve] [--quiet]
+//                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
@@ -78,7 +78,7 @@ struct Args {
     uint64_t seed = 1;
     std::vector<int> stop;
     bool ppl = false, serve = false, quiet = false, vram_lru = true, arena_adapt = false, chunk_mmq = true;
-    bool act_quant = true, chunk_prefetch = true;
+    bool act_quant = true, chunk_prefetch = true, kv_fp4 = false;
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
@@ -131,6 +131,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--stop") a.stop = parse_csv(next());
         else if (k == "--ppl") a.ppl = true;
         else if (k == "--no-actquant") a.act_quant = false;
+        else if (k == "--kv-fp4") a.kv_fp4 = true;
         else if (k == "--serve") a.serve = true;
         else if (k == "--prune") a.prune = next();
         else if (k == "--prune-penalty") a.prune_penalty = (float) std::atof(next().c_str());
@@ -284,6 +285,9 @@ int main(int argc, char ** argv) {
     int64_t ER = enc_skip ? (int64_t) a.enc_replay : 0;
     dc.engram_dirs = a.engram;
     dc.act_quant = a.act_quant;
+    // --kv-fp4 / STRATA_KV_FP4=1: the compressed KV + indexer keys packed to their exact FP4 grids (Ds41DenseConfig::kv_fp4)
+    dc.kv_fp4 = a.kv_fp4 || (std::getenv("STRATA_KV_FP4") && std::getenv("STRATA_KV_FP4")[0] == '1');
+    if (dc.kv_fp4) std::fprintf(stderr, "kv: compressed KV NVFP4 + indexer keys MXFP4 (--kv-fp4, exact)\n");
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
@@ -776,6 +780,8 @@ int main(int argc, char ** argv) {
         if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
         return true;
     };
+    int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
+    std::vector<float> bcap_vh;    // [bcap_n][3 * n_embd], as pass_v's vh
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
@@ -833,6 +839,24 @@ int main(int argc, char ** argv) {
                     for (int s = d0; s < B; s += SB) {
                         const int sn = std::min(SB, B - s);
                         if (!dense.finish_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                    }
+                    // serve DSpark seed (bcap_n > 0): the main_hidden rows of the batch's last bcap_n tokens - pass_v's
+                    // HC-mean of the state leaving dm_layers[j] - read here, so the tail need not re-run as passes
+                    if (bcap_n > 0 && c0 + B == n) {
+                        for (int j = 0; j < 3; ++j) {
+                            if (l != dm_layers[j]) continue;
+                            const int cn = std::min(bcap_n, B);
+                            bcap_got = cn;
+                            if (!dense.read_state_cols(B - cn, cn, vx)) { ferr = dense.last_error(); return false; }
+                            const size_t HC = vx.size() / ((size_t) cn * n_embd);
+                            for (int t = 0; t < cn; ++t) {
+                                float * dst = bcap_vh.data() + (size_t) (bcap_n - cn + t) * 3 * n_embd + (size_t) j * n_embd;
+                                for (size_t h = 0; h < HC; ++h) {
+                                    const float * xs = vx.data() + ((size_t) t * HC + h) * n_embd;
+                                    for (int64_t d = 0; d < n_embd; ++d) dst[d] += xs[d] / (float) HC;
+                                }
+                            }
+                        }
                     }
                 }
                 fd_dense += now_ms() - t0;
@@ -1016,8 +1040,15 @@ int main(int argc, char ** argv) {
                 sp_tail = std::min(128, delta);
             }
 #endif
-            const int dh = delta - sp_tail;   // the part the passes / batch feed
+            int dh = delta - sp_tail;   // the part the passes / batch feed
             const bool by_step = defer_vram && dh >= 1 && dh <= step_max;
+            // STRATA_SERVE_BATCH_TAIL (default on, =0 the old way): a turn that runs as a layer-major batch anyway takes
+            // its DSpark tail INTO the batch and the seed rows are read off the batch's state (bcap_vh) - the tail as
+            // 16-token exact passes was half of every turn (s11 2026-10-15: +273 tokens 33.5 s = batch 17.1 + tail 15.8).
+            // DSpark drafts are verified, so only the seed's numerics (batch vs pass kernels) change, never the output.
+            static const bool batch_tail = !(std::getenv("STRATA_SERVE_BATCH_TAIL") && std::getenv("STRATA_SERVE_BATCH_TAIL")[0] == '0');
+            int bcap = 0;
+            if (batch_tail && sp_tail > 0 && !by_step && dh >= 2 && PB > 1) { bcap = sp_tail; dh = delta; }
             if (by_step && !cache_open) {
                 if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
                 cache_open = true;
@@ -1060,19 +1091,42 @@ int main(int argc, char ** argv) {
             static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
             tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
             tail_logits.clear();
+            const double tph0 = now_ms();
+            bcap_n = bcap; bcap_got = 0;
+            if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
+            bcap_n = 0;
+            double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
             int sp_t = -1;   // DSpark: the first decode token (sampled from the last prompt row), its drafts in sp_ids
             int sp_ids[5] = {0}, sp_tmp[5];
             float sp_conf[5];
 #if defined(DS41_HAVE_DSPARK)
             if (ok && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
+                const double to0 = now_ms();
                 if (defer_vram && !cache_open) {
                     if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
                     else cache_open = true;
                 }
+                ph_open = now_ms() - to0;
                 if (ok) { bias_now = pass_bias; apply_bias(); }
+                const double tt0 = now_ms();
                 std::vector<int> spos;
-                for (int i0 = total - sp_tail; ok && i0 < total; i0 += 16) {
+                if (bcap > 0) {   // the seed rows came off the batch (bcap_vh, its last bcap_got tokens): DSpark steps only
+                    const int c0s = total - bcap_got;
+                    for (int i0 = c0s; ok && i0 < total; i0 += 16) {
+                        const int m = std::min(16, total - i0);
+                        spos.resize((size_t) m);
+                        for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
+                        const bool last = i0 + m == total;
+                        if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // the batch's last row
+                        if (!dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                                       last ? sp_ids : sp_tmp, sp_conf)) {
+                            ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
+                        }
+                    }
+                    if (bcap_got < 1) { ferr = "DSpark batch seed captured nothing"; ok = false; }
+                }
+                for (int i0 = total - sp_tail; ok && bcap == 0 && i0 < total; i0 += 16) {
                     const int m = std::min(16, total - i0);
                     if (!pass_v(ids.data() + i0, m, i0)) { ok = false; break; }
                     spos.resize((size_t) m);
@@ -1087,9 +1141,13 @@ int main(int argc, char ** argv) {
                     }
                 }
                 if (ok) { bias_now = true; apply_bias(); }
+                ph_tail = now_ms() - tt0;
                 pp(delta);
             }
 #endif
+            std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s) + DSpark tail %d%s (cache open %.2f s, seed %.2f s)\n",
+                         delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0, bcap > 0 ? bcap_got : sp_tail,
+                         bcap > 0 ? " from the batch" : " as passes", ph_open / 1000.0, ph_tail / 1000.0);
             if (tail_keep > 0 && ok) {   // the quality scorer's rows: req%03d.tail.f32, [tail_keep x n_vocab], last prompt row last
                 if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {
                     char nb[40];
