@@ -65,6 +65,12 @@ uint64_t dense_kv_cell_bytes(int fmt, int head_dim);
 /// [rows, width] row-major, width a multiple of 1024; x == y is allowed (in place).
 void dense_fwht_rows(const float* x, float* y, const float* signs, int width, int rows, bool inverse, void* stream);
 
+/// dense_fwht_rows + native_quantize_q8_1 in one launch, bit-identical to the pair: q8_out = q8_1(R x) with the
+/// same 1/32, signs and butterfly.  `hd`/`nk`/`rep` non-zero applies dense_permute_gdn_v's gather at the load
+/// (hd * nk * rep must equal width); `rot_out`, when non-null, also receives R x in f32 (the FFN trace path).
+void dense_fwht_quantize_rows(const float* x, void* q8_out, float* rot_out, const float* signs, int width, int rows,
+                              int hd, int nk, int rep, void* stream);
+
 /// Prism's grouped GDN V layout: gather every row's [hd, nk, rep] tiled view into the [hd, rep, nk] order the
 /// ssm_out rotation uses (llama-graph.cpp's reshape/permute/reshape on the activation).
 void dense_permute_gdn_v(const float* x, float* y, int width, int rows, int hd, int nk, int rep, void* stream);

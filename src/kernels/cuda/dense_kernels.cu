@@ -1,5 +1,6 @@
 // src/kernels/cuda/dense_kernels.cu - see include/strata/kernels/dense_kernels.hpp.
 #include "strata/kernels/dense_kernels.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -200,6 +201,57 @@ __global__ void fwht1024_kernel(const float* __restrict__ x, float* __restrict__
     float o = buf[t];
     if (inverse) o *= sg[t];
     y[(size_t) row * width + (size_t) blk * 1024 + t] = o;
+}
+
+// The q8_1 activation block, the same 36-byte layout native_mmvq.cu's Q81Block has (asserted there).
+struct Q81Twin {
+    half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q81Twin) == 36 && alignof(Q81Twin) == 4, "q8_1 block layout");
+
+// dense_fwht_rows + native_quantize_q8_1 in one launch.  The butterfly is fwht1024_kernel's word for word; then
+// warp w of the block quantizes the q8_1 block (blk * 32 + w) with the warp_max/warp_sum/q8_1_* calls of
+// native_quantize_q8_1_kernel.  Every q8_1 block lies inside one 1024-block, so the two kernels' outputs are
+// bit-identical.  `hd != 0` selects the grouped GDN V gather at the load (dense_permute_gdn_v's map): the
+// destination j reads x at [hd][nk][rep]'s source index, and the signs are the destination row's, as in the
+// permute-then-fwht pair.  `rot_out`, when non-null, also receives the transformed f32 row (the trace path).
+__global__ void fwht_quant_kernel(const float* __restrict__ x, Q81Twin* __restrict__ y,
+                                  const float* __restrict__ signs, int width, int hd, int nk, int rep,
+                                  float* __restrict__ rot_out) {
+    __shared__ float buf[1024];
+    const int t = threadIdx.x;
+    const int blk = blockIdx.x, row = blockIdx.y;
+    const size_t j = (size_t) blk * 1024 + t;
+    size_t src = j;
+    if (hd) {                                              // the [hd][nk][rep] -> [hd][rep][nk] gather
+        const int h = (int) (j % (unsigned) hd), rest = (int) (j / (unsigned) hd);
+        const int r = rest % rep, k = rest / rep;
+        src = (size_t) (h + hd * k + hd * nk * r);
+    }
+    float v = x[(size_t) row * width + src] * (1.0f / 32.0f);
+    v *= signs[j];
+    buf[t] = v;
+    for (int len = 1; len < 1024; len <<= 1) {
+        __syncthreads();
+        const float a = buf[t], b = buf[t ^ len];
+        __syncthreads();
+        buf[t] = (t & len) ? (b - a) : (a + b);
+    }
+    const float xi = buf[t];
+    if (rot_out) rot_out[(size_t) row * width + j] = xi;
+    // native_quantize_q8_1_kernel, warp for warp: the block's 32 warps own the 32 q8_1 blocks of this 1024-block.
+    const int warp = t >> 5, lane = t & 31;
+    float amax = fabsf(xi);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    float sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = q8_1_finite(amax / 127.0f);
+    Q81Twin* dst = y + (size_t) row * (width / 32) + blk * 32 + warp;
+    dst->qs[lane] = q8_1_quant(xi, d, amax);
+    if (lane == 0) dst->ds = q8_1_ds(d, sum);
 }
 
 // [hd][nk][rep] -> [hd][rep][nk] along the feature axis of every row (the source index of destination j)
@@ -1134,6 +1186,20 @@ void dense_fwht_rows(const float* x, float* y, const float* signs, int width, in
     const dim3 grid((unsigned) (width / 1024), (unsigned) rows);
     fwht1024_kernel<<<grid, 1024, 0, (cudaStream_t) stream>>>(x, y, signs, width, inverse ? 1 : 0);
     check("dense_fwht_rows");
+}
+
+void dense_fwht_quantize_rows(const float* x, void* q8_out, float* rot_out, const float* signs, int width, int rows,
+                              int hd, int nk, int rep, void* stream) {
+    if (rows < 1) return;
+    if (!signs) throw std::runtime_error("dense_fwht_quantize_rows: no sign vector for this width");
+    if (!q8_out) throw std::runtime_error("dense_fwht_quantize_rows: no q8_1 output");
+    if (width <= 0 || width % 1024 != 0) throw std::runtime_error("dense_fwht_quantize_rows: width must be a multiple of 1024");
+    if (hd && (hd <= 0 || nk <= 0 || rep <= 0 || (int64_t) hd * nk * rep != width))
+        throw std::runtime_error("dense_fwht_quantize_rows: bad permute geometry");
+    const dim3 grid((unsigned) (width / 1024), (unsigned) rows);
+    fwht_quant_kernel<<<grid, 1024, 0, (cudaStream_t) stream>>>(x, (Q81Twin*) q8_out, signs, width, hd, nk, rep,
+                                                               rot_out);
+    check("dense_fwht_quantize_rows");
 }
 
 void dense_permute_gdn_v(const float* x, float* y, int width, int rows, int hd, int nk, int rep, void* stream) {

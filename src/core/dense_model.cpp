@@ -679,6 +679,13 @@ struct DenseModel::Impl {
         PScope ps(&prof, Prof::QUANT, s);
         native_quantize_q8_1(x, q8_1, n_in, n, s);
     }
+    // The folded-basis rotation and its q8_1 quantization as one launch (bit-identical to the pair).  Booked as
+    // QUANT; `rot_out` keeps the FFN trace's rotated row alive when it is on.
+    void fwht_quantize(const float* x, int width, int n, const float* signs, float* rot_out, int hd, int nk, int rep,
+                       void* s) {
+        PScope ps(&prof, Prof::QUANT, s);
+        dense_fwht_quantize_rows(x, q8_1, rot_out, signs, width, n, hd, nk, rep, s);
+    }
 
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
     void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s);
@@ -721,8 +728,7 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     }
     // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not
     if (L.rot & (ROT_QKV | ROT_Z)) {
-        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
-        quantize(rot_scratch, E, n, s);
+        fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
     }
     gemv(L.qkv, qkv, n, s);
     gemv(L.z, z, n, s);
@@ -743,15 +749,9 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     dense_gdn_rec_chunk(L.state, h, gate, beta, z, L.ssm_norm, c.rms_eps, y, KH, VH, n, snaps, s);
     }
     if (L.rot & ROT_SSM_OUT) {
-        const float* sg = ham_signs(V);
-        if (rot_gdn_v_grouped) {
-            // Prism's grouped V layout: [hd, nk, rep] rows -> [hd, rep, nk], then the same transform
-            dense_permute_gdn_v(y, rot_scratch, V, n, V / VH, KH, VH / KH, s);
-            dense_fwht_rows(rot_scratch, rot_scratch, sg, V, n, false, s);
-        } else {
-            dense_fwht_rows(y, rot_scratch, sg, V, n, false, s);
-        }
-        quantize(rot_scratch, V, n, s);
+        // Prism's grouped V layout: [hd, nk, rep] rows -> [hd, rep, nk] at the load of the same transform.
+        if (rot_gdn_v_grouped) fwht_quantize(y, V, n, ham_signs(V), nullptr, V / VH, KH, VH / KH, s);
+        else fwht_quantize(y, V, n, ham_signs(V), nullptr, 0, 0, 0, s);
     } else {
         quantize(y, V, n, s);
     }
@@ -763,8 +763,7 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
                                   uint16_t rot, void* s) {
     const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
     if (rot & (ROT_Q | ROT_K | ROT_V)) {
-        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
-        quantize(rot_scratch, E, n, s);
+        fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
     } else {
         quantize(xn, E, n, s);
     }
@@ -795,8 +794,7 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     dense_gate_apply(attn, q_full, attn32, n * H, H, D, s);
     }
     if (rot & ROT_O) {
-        dense_fwht_rows(attn32, rot_scratch, ham_signs(H * D), H * D, n, false, s);
-        quantize(rot_scratch, H * D, n, s);
+        fwht_quantize(attn32, H * D, n, ham_signs(H * D), nullptr, 0, 0, 0, s);
     } else {
         quantize(attn32, H * D, n, s);
     }
@@ -812,8 +810,7 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
         dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
     }
     if (rot & (ROT_FFN_GATE | ROT_FFN_UP)) {
-        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
-        quantize(rot_scratch, E, n, s);
+        fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
     } else {
         quantize(xn, E, n, s);
     }
@@ -827,9 +824,8 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     }
     if (trb) trace_vec("ffn_h", -1, cur_layer, "single", ffn_h, c.n_ff, s);
     if (rot & ROT_FFN_DOWN) {
-        dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), c.n_ff, n, false, s);
+        fwht_quantize(ffn_h, c.n_ff, n, ham_signs(c.n_ff), trb ? rot_scratch : nullptr, 0, 0, 0, s);
         if (trb) trace_vec("ffn_hrot", -1, cur_layer, "single", rot_scratch, c.n_ff, s);
-        quantize(rot_scratch, c.n_ff, n, s);
     } else {
         quantize(ffn_h, c.n_ff, n, s);
     }
