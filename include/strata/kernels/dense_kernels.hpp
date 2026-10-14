@@ -22,7 +22,9 @@
 namespace strata::kernels {
 
 /// out[r, :] = x[r, :] * rsqrt(mean(x[r, :]^2) + eps) * w        (w NOT shifted: the GGUF already holds 1 + w)
-void dense_rms_norm(const float* x, const float* w, float* out, int rows, int cols, float eps, void* stream);
+/// `add` (optional) is added into x first, in the same launch; it must not overlap x.
+void dense_rms_norm(const float* x, const float* w, float* out, int rows, int cols, float eps, void* stream,
+                    const float* add = nullptr);
 
 /// The GDN output norm of a DENSE qwen35 model: y[h, :] = rms_norm(o[h, :]) * w * SiLU(z[h, :]) for each of `heads`
 /// value heads of `cols` (= state_size) values.  llama.cpp's build_norm_gated for qwen35 uses SiLU; the MoE

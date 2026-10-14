@@ -56,6 +56,36 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
     for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * scale * w[i];
 }
 
+// rms_norm_kernel with an elementwise add in front: x[i] += add[i], then the sum-of-squares and the weighted
+// write are the same rows, strides and expressions, so the result equals add_inplace followed by the plain
+// kernel.  The caller guarantees x and add do not overlap.
+__global__ void rms_norm_add_kernel(float* __restrict__ x, const float* __restrict__ add,
+                                    const float* __restrict__ w, float* __restrict__ out, int cols, float eps) {
+    const int row = blockIdx.x;
+    float* xr = x + (size_t) row * cols;
+    const float* ar = add + (size_t) row * cols;
+    float* orow = out + (size_t) row * cols;
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        const float v = xr[i] + ar[i];
+        xr[i] = v;
+        acc += v * v;
+    }
+    acc = warp_sum(acc);
+    __shared__ float part[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    __shared__ float scale;
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < (int) (blockDim.x >> 5); ++i) s += part[i];
+        scale = rsqrtf(s / (float) cols + eps);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) orow[i] = xr[i] * scale * w[i];
+}
+
 // One block per value head: rms over `cols`, then * w[i] * silu(z[i]).
 __global__ void gdn_out_norm_kernel(const float* __restrict__ o, const float* __restrict__ z,
                                     const float* __restrict__ w, float* __restrict__ y, int cols, float eps) {
@@ -1122,9 +1152,16 @@ __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
 
 }  // namespace
 
-void dense_rms_norm(const float* x, const float* w, float* out, int rows, int cols, float eps, void* stream) {
-    rms_norm_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(x, w, out, cols, eps);
-    check("dense_rms_norm");
+void dense_rms_norm(const float* x, const float* w, float* out, int rows, int cols, float eps, void* stream,
+                    const float* add) {
+    if (add) {
+        // add_inplace's store and rms_norm_kernel's sum in one launch: x += add, then the same row reduction.
+        rms_norm_add_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>((float*) x, add, w, out, cols, eps);
+        check("dense_rms_norm_add");
+    } else {
+        rms_norm_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(x, w, out, cols, eps);
+        check("dense_rms_norm");
+    }
 }
 
 void dense_gdn_out_norm(const float* o, const float* z, const float* w, float* y, int heads, int cols, float eps,

@@ -709,9 +709,10 @@ struct DenseModel::Impl {
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
                     const int32_t* pos_slot, uint16_t rot, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n,
-                   uint16_t rot, void* s);
+                   uint16_t rot, void* s, const float* pre_add = nullptr);
     void ffn_selfcheck(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s);
-    void ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s);   // phase 1: FFN across GPUs
+    void ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s,
+                         const float* pre_add = nullptr);   // phase 1: FFN across GPUs
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
 
     // ---- the HIP-graph path (STRATA_DENSE_GRAPH=1)
@@ -841,11 +842,11 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
 
 // x += ffn(rms_norm(x, post_norm)), for n columns
 void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
-                                 int n, uint16_t rot, void* s) {
+                                 int n, uint16_t rot, void* s, const float* pre_add) {
     const int E = c.n_embd;
     {
         PScope ps(&prof, Prof::RMS, s);
-        dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
+        dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s, pre_add);
     }
     if (rot & (ROT_FFN_GATE | ROT_FFN_UP)) {
         fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
@@ -928,7 +929,8 @@ void DenseModel::Impl::ffn_selfcheck(const DenseConfig& c, const Layer& L, int n
 // holds the rest (gate/up row slices and a packed input-column slice of down).  Card 0 rotates the activation
 // and sends it; card 1 returns its partial down output; card 0 sums and adds the residual.  Both cards work in
 // parallel: card 0 issues its share on the main stream and card 1 on stream1.
-void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s) {
+void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s,
+                                       const float* pre_add) {
     const int E = c.n_embd, r0 = ffn_r0, r1 = c.n_ff - ffn_r0;
     const cudaStream_t s0 = (cudaStream_t) s;
     const bool dbg = [] { const char* e = std::getenv("STRATA_DENSE_FFN_DEBUG"); return e && e[0] != '0'; }();
@@ -936,7 +938,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
 #define SDBG(...) do { if (dbg) { std::fprintf(stderr, "[ffn-split] " __VA_ARGS__); std::fprintf(stderr, "\n"); std::fflush(stderr); } } while (0)
     {
         PScope ps(&prof, Prof::RMS, s);
-        dense_rms_norm(x, L.post_norm, xn, n, E, c.rms_eps, s);
+        dense_rms_norm(x, L.post_norm, xn, n, E, c.rms_eps, s, pre_add);
     }
     // card 0: the (rotated) activation, quantized for its own gate/up and staged for card 1
     const float* xsend = xn;
@@ -1115,7 +1117,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     // path.  Card 1's weights are row slices, so there is no way to give it a share without the doorbell; the
     // honest fallback is the plain block.
     if (trb) std::fprintf(stderr, "dbg layer=%d split fallback (peer path off)\n", cur_layer);
-    ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s);
+    ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s, pre_add);
 #undef SDBG
 }
 
@@ -1979,16 +1981,14 @@ bool DenseModel::Impl::enqueue_pass(const DenseConfig& c, int n, int64_t pos0, L
         }
         if (!L.attn) gdn_block(c, L, n, snapshot, s);
         else attn_block(c, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, pos_slot, L.rot, s);
-        {
-            PScope ps(&prof, Prof::ADD, s);
-            add_inplace(x, mix, (int64_t) n * E, s);
-        }
         cur_layer = l;
+        // The mixed block's residual add rides in the FFN's input rms (the only reader of mix before the FFN's
+        // own down GEMV overwrites it), one launch instead of two.
         // STRATA_DENSE_SPLIT_OFF=1: keep the split load (so ffn_r0 and the traces are the split's) but run the
         // plain single-card FFN.  The reference side of the part-by-part comparison.
         static const bool split_off = std::getenv("STRATA_DENSE_SPLIT_OFF") && std::getenv("STRATA_DENSE_SPLIT_OFF")[0] != '0';
-        if (ffn_split && !split_off) ffn_block_split(c, L, n, L.rot, s);
-        else ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
+        if (ffn_split && !split_off) ffn_block_split(c, L, n, L.rot, s, mix);
+        else ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s, mix);
         if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", x, n * E, s);
     }
     if (lg != Logits::None || keep_hidden) {
