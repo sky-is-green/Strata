@@ -1169,7 +1169,7 @@ struct Engine {
     bool time_decode = false;
     cudaEvent_t ev_step[2] = {};
     std::vector<cudaEvent_t> ev_cls;   // [layer][class][start/stop]
-    static constexpr int kTimeCls = 9;
+    static constexpr int kTimeCls = 12;
     double t_step_ms = 0, t_cls_ms[kTimeCls] = {};
     long long t_steps = 0;
     bool use_graph = true;
@@ -1535,7 +1535,7 @@ struct Engine {
             if (!xq_hot) prep(h, N, T, xq);
             mm_pair(L.qkv, qkv_b, L.zg, z, T);
             tick(0, false);
-            tick(1, true);   // the GDN core: alpha/beta, the conv, the delta rule, the norm
+            tick(1, true);   // alpha/beta (or the attention prep)
             if (T <= kGemmT) {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
@@ -1544,12 +1544,16 @@ struct Engine {
                 f32mm(L.beta, h, be_b, N, HV, T);
                 k_gdn_gb<<<grid1((int64_t) HV * T), kThreads, 0, st>>>(al_b, L.dt, L.ssm_a, be_b, HV, T);
             }
+            tick(1, false);
+            tick(2, true);   // the conv
             // one token, a window or a chunk: the same kernels (every token in one launch each), so a decode step and a
             // verify window compute bitwise the same rows and the MTP's greedy text is the plain greedy text.  (Strata's
             // fused single-token kernels are not used here: fused_gdn_conv_l2's 4-tap sum contracts into FMAs
             // differently from k_conv_seq's, a 1-ulp difference in h that the Q8_1 activation rounding can turn into a
             // flipped near-tie later; with them the KL is the same, 1.05x / 0.81x the floor, but MTP would not be exact.)
             k_conv_seq<<<C / 128, 128, 0, st>>>(conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, T, !verify);
+            tick(2, false);
+            tick(3, true);   // the delta rule and the norm
             if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
                 k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
                                                                                                   be_b, gdn_y, HK, HV, T);
@@ -1558,24 +1562,26 @@ struct Engine {
                 k_gdn_seq<<<HV, dim3(128, 4), 0, st>>>(S[li], hc_b, C, al_b, be_b, z, L.ssm_norm, m->eps, gdn_y, HK, HV,
                                                        T, !verify);
             }
-            tick(1, false);
-            tick(2, true);   // the out projection
+            tick(3, false);
+            tick(4, true);   // the out projection
             mm(L.ssm_out, gdn_y, y, T);
-            tick(2, false);
-            tick(3, true);   // the out-projection correction
+            tick(4, false);
+            tick(5, true);   // the out-projection correction
             if (L.corr_a.d) {   // mm()'s prep just staged q8_1 of the same input in `q8` (T <= 8)
                 if (T <= kGemmT) corr_branch_staged(L.corr_a, L.corr_b, T, q8, y, true);
                 else corr_add(L.corr_a, L.corr_b, T, gdn_y, y, N);
             }
-            tick(3, false);
+            tick(5, false);
         } else {
             if (!xq_hot) prep(h, N, T, xq);
             apply(L.wq, xq, qg, T);
             mm_pair(L.wk, kx, L.wv, vx, T);
             tick(0, false);
-            tick(1, true);   // the attention core: prep + scores/values + the gate
+            tick(1, true);   // the attention prep (rope, q/k norms, the cache write)
             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, kc[li], vc[li], H,
                                                               HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps);
+            tick(1, false);
+            tick(2, true);   // the scores / values (either path) and the output gate
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -1630,18 +1636,20 @@ struct Engine {
                     k_attn_merge<<<nt * H, HD, 0, st>>>(pacc, pm, pl, gate, dpos, t0, H, n_chunk, att);
                 }
             }
-            tick(1, false);
-            tick(2, true);   // the out projection
-            mm(L.wo, att, y, T);
             tick(2, false);
-            tick(3, true);   // the out-projection correction
+            tick(3, true);   // GDN-only class: nothing on an attention layer (an empty pair keeps the read valid)
+            tick(3, false);
+            tick(4, true);   // the out projection
+            mm(L.wo, att, y, T);
+            tick(4, false);
+            tick(5, true);   // the out-projection correction
             if (L.corr_a.d) {   // mm()'s prep just staged q8_1 of the same input in `q8` (T <= 8)
                 if (T <= kGemmT) corr_branch_staged(L.corr_a, L.corr_b, T, q8, y, true);
                 else corr_add(L.corr_a, L.corr_b, T, att, y, N);
             }
-            tick(3, false);
+            tick(5, false);
         }
-        tick(4, true);   // the post-attention norm, the router (with its correction) and top-k
+        tick(6, true);   // the post-attention norm, the router (with its correction) and top-k
         k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps, (T <= kGemmT) ? (Q81Block*) xq : nullptr);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
@@ -1660,8 +1668,8 @@ struct Engine {
             corr_router(L, T, h, one ? (int) g.n_expert + 1 : (int) g.n_expert);
         }
         K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
-        tick(4, false);
-        tick(5, true);   // the routed experts
+        tick(6, false);
+        tick(7, true);   // the routed experts
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
@@ -1707,23 +1715,24 @@ struct Engine {
             k_group_quant<<<1 + qblocks, kThreads, 0, st>>>(
                 ids, (int) n_ent, Kp, (int) g.n_expert, L.blobs, L.stride, grp_ptr, grp_start, n_groups, ent_dst,
                 ent_tok, h, (Q81Block*) xq, (int) (N * T));
-            tick(5, false);
-            tick(6, true);
+            tick(7, false);
+            tick(8, true);
             K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                                      std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st, 0, one);
-            tick(6, false);
+            tick(8, false);
             native_experts = true;
         }
         if (!native_experts) {
-            tick(5, false);   // the other arms' setup and compute in one span
-            tick(6, true);
+            tick(7, false);   // the other arms' setup and compute in one span
+            tick(8, true);
         }
-        tick(6, false);
-        tick(7, true);   // the shared expert
+        tick(8, false);
+        tick(9, true);   // the shared expert's gate/up pair
         // the shared expert, scaled by sigmoid(w . h)
         if (T > kGemmT) k_to_f16<<<grid1((int64_t) N * T), kThreads, 0, st>>>(h, x16, (int64_t) N * T);
-        apply(L.sh_gate, xq, sg, T);
-        apply(L.sh_up, xq, su, T);
+        mm_pair(L.sh_gate, sg, L.sh_up, su, T);
+        tick(9, false);
+        tick(10, true);   // SwiGLU, the down projection and the shared gate
         if (T <= kGemmT) {   // SwiGLU and its q8_1 image in one launch
             K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);
             mmq(L.sh_down, q8, sy, T);
@@ -1733,10 +1742,10 @@ struct Engine {
         }
         if (!one) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
+        tick(10, false);
         // the MoE block's correction branch (from the normalized FFN input, the same addend the fork adds to
         // the block output), then the combine, the shared expert's gate, the residual add and the next norm
-        tick(7, false);
-        tick(8, true);   // the MoE-branch correction, the combine and the next norm
+        tick(11, true);   // the MoE-branch correction, the combine and the next norm
         if (L.moe_corr_a.d && !mixed) {
             // the native expert path staged q8_1(h) in `xq` for the shared expert: the MoE branch reads the
             // same h, so its own quantize is the same blocks - reuse them, one node fewer
@@ -1747,7 +1756,7 @@ struct Engine {
                                           N, m->eps, L.moe_corr_a.d ? corr : nullptr,
                                           (wn != nullptr && T <= kGemmT) ? (Q81Block*) xq : nullptr);
         xq_staged = wn != nullptr && T <= kGemmT;   // xq now holds q8_1(hout) for the next layer's mixer
-        tick(8, false);
+        tick(11, false);
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
@@ -2053,8 +2062,9 @@ struct Engine {
                             t_cls_ms[c] += cm;
                         }
                 if (++t_steps % 64 == 0) {
-                    static const char* kNames[kTimeCls] = {"mix-qkv",  "mix-core", "mix-out", "out-corr", "router+topk",
-                                                           "exp-setup", "experts",  "shared",  "moe+combine"};
+                    static const char* kNames[kTimeCls] = {"mix-qkv",  "mix-ab",   "mix-conv", "mix-rec", "mix-out",
+                                                           "out-corr", "router+topk", "exp-setup", "experts", "shared",
+                                                           "sh-down",  "moe+combine"};
                     std::fprintf(stderr, "strata-q36: decode %lld steps: %.2f ms/step (T=1)", t_steps,
                                  t_step_ms / 64.0);
                     if (!use_graph)
