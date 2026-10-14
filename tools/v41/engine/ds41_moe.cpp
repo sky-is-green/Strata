@@ -1888,6 +1888,69 @@ double g_prof[9] = {};
 int64_t g_prof_n = 0;
 const char* const g_prof_name[9] = {"split", "activation", "gpu launch", "cpu pool", "layer sync", "d2h parts",
                                     "sum", "admission", "pcie budget"};
+/// arena_adapt: expert `e`'s bytes now sit in `victim`'s arena slot - hand the slot over (returns the slot).
+/// arena_check_swap, DS41_CHECK_ARENA=1: the swapped-in expert's arena bytes AND the next slot's owner (what an overrun
+/// would corrupt) against the file, byte for byte.  Shared by gpu_run (pool path) and gpu_run_n_ex (D3 FILEG path).
+/// Publish ALL of a call's swaps before checking any (arena_check_swap): two victims in adjacent slots would otherwise
+/// make the neighbour check read the second one's NEW bytes against its old owner - a false BAD.
+int32_t arena_publish_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t victim) {
+    Gpu& gp = *im.gpu;
+    const int64_t NX = im.g.n_experts;
+    const int32_t slot = gp.arena.slot_of[(size_t) (layer * NX + victim)];
+    gp.arena.slot_of[(size_t) (layer * NX + victim)] = -1;
+    gp.arena.slot_of[(size_t) (layer * NX + e)] = slot;
+    ++im.st.arena_swaps;
+    return slot;
+}
+
+void arena_check_swap(Ds41MoeImpl& im, int64_t layer, int32_t e, int32_t slot) {
+    Gpu& gp = *im.gpu;
+    const int64_t NX = im.g.n_experts;
+    static const bool check_arena = std::getenv("DS41_CHECK_ARENA") != nullptr;
+    if (!check_arena) return;
+    static int64_t n_chk = 0, n_bad = 0;
+    std::vector<uint8_t> ref((size_t) im.blob);
+    im.blobs->read(layer, e, ref.data());
+    bool ok = std::memcmp((const uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot], ref.data(),
+                          (size_t) im.bl[(size_t) im.g.cls(layer, e)]) == 0;
+    const int64_t total = (int64_t) gp.arena.slot_of.size();
+    for (int64_t k = 0; k < total; ++k) {
+        if (gp.arena.slot_of[(size_t) k] != slot + 1) continue;
+        const int64_t nl = k / NX, ne = k % NX;
+        im.blobs->read(nl, ne, ref.data());
+        const bool okn = std::memcmp((const uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot + 1], ref.data(),
+                                     (size_t) im.bl[(size_t) im.g.cls(nl, ne)]) == 0;
+        if (!okn) std::fprintf(stderr, "[arena-chk] L%lld e%d -> slot %d: NEIGHBOUR L%lld e%lld CORRUPT\n", (long long) layer, e, slot,
+                               (long long) nl, (long long) ne);
+        ok = ok && okn;
+        break;
+    }
+    ++n_chk; n_bad += !ok;
+    if (!ok) std::fprintf(stderr, "[arena-chk] L%lld e%d slot %d BAD\n", (long long) layer, e, slot);
+    if (n_chk % 200 == 0) std::fprintf(stderr, "[arena-chk] %lld swaps checked, %lld bad\n", (long long) n_chk, (long long) n_bad);
+}
+
+/// arena_adapt: the layer's least-recently-used arena expert whose slot holds `need` bytes, not routed by this call
+/// (last_use < tick) and not in `taken` - or -1.
+int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_t* taken, int ntaken) {
+    Gpu& gp = *im.gpu;
+    const int64_t NX = im.g.n_experts;
+    int32_t victim = -1;
+    int64_t best = INT64_MAX;
+    for (int64_t v = 0; v < NX; ++v) {
+        const int32_t vs = gp.arena.slot_of[(size_t) (layer * NX + v)];
+        if (vs < 0) continue;
+        if (gp.arena.off[(size_t) vs + 1] - gp.arena.off[(size_t) vs] < need) continue;
+        const int64_t u = im.last_use[(size_t) (layer * NX + v)];
+        if (u >= im.tick) continue;   // routed now
+        bool t = false;
+        for (int r = 0; r < ntaken && !t; ++r) t = taken[r] == (int32_t) v;
+        if (t) continue;
+        if (u < best) { best = u; victim = (int32_t) v; }
+    }
+    return victim;
+}
+
 bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x_host,
              const void* x_dev, float* out, void* out_dev = nullptr) {
     static const bool prof = std::getenv("DS4_TIER_PROF") != nullptr;
@@ -2367,22 +2430,10 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             for (size_t q = 0; q < fi.size(); ++q) {
                 fdst[q] = im.ftmp.data() + (size_t) fi[q] * (size_t) im.blob;
                 if (!direct) continue;
-                int64_t victim = -1, best = INT64_MAX;
                 // The victim's SLOT must hold the incoming blob: arena slots are packed at each seeded expert's own blob
                 // size, and DS4's 9 format classes differ in size - without this a larger blob read into a smaller slot
                 // ran over into the next slot and corrupted that expert (garbage output under --arena-adapt).
-                const uint64_t need = (uint64_t) BLX(ids6[cpu_keep[fi[q]]]);
-                for (int64_t v = 0; v < NX; ++v) {
-                    const int32_t vs = gp.arena.slot_of[(size_t) (layer * NX + v)];
-                    if (vs < 0) continue;
-                    if (gp.arena.off[(size_t) vs + 1] - gp.arena.off[(size_t) vs] < need) continue;
-                    const int64_t u = im.last_use[(size_t) (layer * NX + v)];
-                    if (u >= im.tick) continue;   // routed now, or already this call's victim
-                    bool taken = false;
-                    for (size_t r = 0; r < q && !taken; ++r) taken = fvic[r] == (int32_t) v;
-                    if (taken) continue;
-                    if (u < best) { best = u; victim = v; }
-                }
+                const int32_t victim = arena_victim(im, layer, (uint64_t) BLX(ids6[cpu_keep[fi[q]]]), fvic.data(), (int) q);
                 if (victim < 0) continue;
                 fvic[q] = (int32_t) victim;
                 fdst[q] = (uint8_t*) gp.arena.base +
@@ -2453,38 +2504,11 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             return false;
         st.cpu_ms = now_ms() - c0;
         // arena_adapt: the blobs read above already sit in their victims' slots - publish the swaps
-        for (size_t q = 0; q < fi.size(); ++q) {
-            if (fvic[q] < 0) continue;
-            const int32_t e = ids6[cpu_keep[fi[q]]];
-            const int32_t slot = gp.arena.slot_of[(size_t) (layer * NX + fvic[q])];
-            gp.arena.slot_of[(size_t) (layer * NX + fvic[q])] = -1;
-            gp.arena.slot_of[(size_t) (layer * NX + e)] = slot;
-            ++im.st.arena_swaps;
-            // DS41_CHECK_ARENA=1: the swapped-in expert's arena bytes AND the next slot's owner (what an overrun would
-            // corrupt) against the file, byte for byte
-            static const bool check_arena = std::getenv("DS41_CHECK_ARENA") != nullptr;
-            if (check_arena) {
-                static int64_t n_chk = 0, n_bad = 0;
-                std::vector<uint8_t> ref((size_t) im.blob);
-                im.blobs->read(layer, e, ref.data());
-                bool ok = std::memcmp((const uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot], ref.data(), (size_t) BLX(e)) == 0;
-                const int64_t total = (int64_t) gp.arena.slot_of.size();
-                for (int64_t k = 0; k < total; ++k) {
-                    if (gp.arena.slot_of[(size_t) k] != slot + 1) continue;
-                    const int64_t nl = k / NX, ne = k % NX;
-                    im.blobs->read(nl, ne, ref.data());
-                    const bool okn = std::memcmp((const uint8_t*) gp.arena.base + gp.arena.off[(size_t) slot + 1], ref.data(),
-                                                 (size_t) im.bl[(size_t) im.g.cls(nl, ne)]) == 0;
-                    if (!okn) std::fprintf(stderr, "[arena-chk] L%lld e%d -> slot %d: NEIGHBOUR L%lld e%lld CORRUPT\n", (long long) layer, e, slot,
-                                           (long long) nl, (long long) ne);
-                    ok = ok && okn;
-                    break;
-                }
-                ++n_chk; n_bad += !ok;
-                if (!ok) std::fprintf(stderr, "[arena-chk] L%lld e%d slot %d BAD\n", (long long) layer, e, slot);
-                if (n_chk % 200 == 0) std::fprintf(stderr, "[arena-chk] %lld swaps checked, %lld bad\n", (long long) n_chk, (long long) n_bad);
-            }
-        }
+        std::vector<int32_t> fslot(fi.size(), -1);
+        for (size_t q = 0; q < fi.size(); ++q)
+            if (fvic[q] >= 0) fslot[q] = arena_publish_swap(im, layer, ids6[cpu_keep[fi[q]]], fvic[q]);
+        for (size_t q = 0; q < fi.size(); ++q)
+            if (fvic[q] >= 0) arena_check_swap(im, layer, ids6[cpu_keep[fi[q]]], fslot[q]);
     }
 
     if (nfg > 0) {   // the file-tier blobs are home: up to the card, one grouped launch behind the hits / PCIe share
@@ -2931,15 +2955,43 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // (DS41_PROF_X: 1.6 ms of a 2.9 ms call).  STRATA_FILE_GPU=0: the pool computes them (the old path).
     static const bool file_gpu = !(std::getenv("STRATA_FILE_GPU") && std::getenv("STRATA_FILE_GPU")[0] == '0');
     int fg_u[kMaxParts], nfg = 0;
-    if (file_gpu && !im.cfg.arena_adapt) {
+    if (file_gpu) {
         for (int u = 0; u < nu; ++u)
             if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u]) && nfg < kMaxParts) { cls[u] = FILEG; fg_u[nfg++] = u; }   // h_fstage: kMaxParts blobs
+    }
+    // arena_adapt (as gpu_run): every lookup is a use; each FILEG blob is read STRAIGHT into the arena slot of the
+    // layer's least-recently-used arena expert not routed now (its slot big enough) - the DMA then sources it there,
+    // and the slot changes hands at the end of the call.  The arena is pinned, so the DMA is the same as from
+    // h_fstage.  No copy of this call writes a victim slot: the vram_lru demotions D2H into the slot of an expert
+    // routed NOW (never a victim), and FILEG experts are not LRU-admitted.
+    const bool adapt = im.cfg.arena_adapt && gp.arena.base;
+    const uint8_t* fg_src[kMaxParts];
+    int32_t fg_vic[kMaxParts];
+    if (im.cfg.arena_adapt) {
+        const int64_t NXA = im.g.n_experts;
+        if (im.last_use.empty()) im.last_use.assign((size_t) (im.g.n_layers * NXA), -1);
+        ++im.tick;
+        for (int u = 0; u < nu; ++u) im.last_use[(size_t) (layer * NXA + ue[u])] = im.tick;
+    }
+    if (nfg > 0 && !gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
+    bool any_vic = false;
+    for (int b = 0; b < nfg; ++b) {
+        fg_vic[b] = adapt ? arena_victim(im, layer, (uint64_t) BLX(ue[fg_u[b]]), fg_vic, b) : -1;
+        fg_src[b] = fg_vic[b] >= 0
+            ? (const uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) gp.arena.slot_of[(size_t) (layer * im.g.n_experts + fg_vic[b])]]
+            : gp.h_fstage + (size_t) b * (size_t) B;
+        any_vic = any_vic || fg_vic[b] >= 0;
+    }
+    if (any_vic) {   // nothing still in flight from an EARLIER call (a gpu_run decode skips its layer sync) reads or
+                     // writes a victim slot while the reader threads below fill it from the CPU
+        if (gp.s_pf) ck(cudaStreamSynchronize(gp.s_pf), "d3 arena-adapt pf sync");
+        ck(cudaStreamSynchronize(gp.s), "d3 arena-adapt sync");
+        if (gp.s_dc) ck(cudaStreamSynchronize(gp.s_dc), "d3 arena-adapt dc sync");
     }
     std::vector<std::thread> frd;
     std::atomic<size_t> fnx{0};
     const double tfg = nfg > 0 ? now_ms() : 0;
     if (nfg > 0) {
-        if (!gp.h_fstage) ck(cudaMallocHost((void**) &gp.h_fstage, (size_t) kMaxParts * (size_t) B), "h_fstage");
         const int parts = std::max(1, std::min(8, 8 / nfg));
         const size_t tasks = (size_t) nfg * (size_t) parts;
         const int nth = (int) std::min<size_t>(8, tasks);
@@ -2947,8 +2999,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             frd.emplace_back([&, parts, tasks]() {
                 for (size_t r; (r = fnx.fetch_add(1)) < tasks;) {
                     const int b = (int) (r / (size_t) parts);
-                    im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts,
-                                        gp.h_fstage + (size_t) b * (size_t) B);
+                    im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts, (uint8_t*) fg_src[b]);
                 }
             });
     }
@@ -3053,10 +3104,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                     const int32_t e = ue[u];
                     const int64_t BL = BLX(e);
                     const uint8_t* src = gp.arena.ptr(layer, e);
-                    if (cls[u] == FILEG) {   // its staging slot = its index in fg_u
+                    if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
                         int b = 0;
                         while (fg_u[b] != u) ++b;
-                        src = gp.h_fstage + (size_t) b * (size_t) B;
+                        src = fg_src[b];
                     }
                     // LRU admission (arena-held PCIe misses only, as gpu_run)
                     int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
@@ -3266,6 +3317,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             ++im.admitted;
         }
     }
+    // arena_adapt: the stream is synced above (every DMA out of a victim slot is done) - the slots change hands
+    int32_t fg_slot[kMaxParts];
+    for (int b = 0; b < nfg; ++b)
+        if (fg_vic[b] >= 0) fg_slot[b] = arena_publish_swap(im, layer, ue[fg_u[b]], fg_vic[b]);
+    for (int b = 0; b < nfg; ++b)
+        if (fg_vic[b] >= 0) arena_check_swap(im, layer, ue[fg_u[b]], fg_slot[b]);
     for (int j = 0; j < NE; ++j) {
         const int c = cls[ent_u[j]];
         if (c == HIT) ++st.hits; else if (c == PCIE || c == FILEG) ++st.pcie; else ++st.cpu;

@@ -80,8 +80,11 @@ def score(cases_path, out):
     tail = rj['tail']
     groups = {}
     allr = []
+    # req files are numbered by row of the cases file the run used; map by case id so a subset (short34) can score a
+    # superset run (short)
+    req_of = {m['id']: m['req'] for m in rj.get('meta', [])}
     for i, c in enumerate(cases):
-        f = f'{out}/req{i:03d}.tail.f32'
+        f = f'{out}/req{req_of.get(c["id"], i):03d}.tail.f32'
         if not os.path.exists(f):
             continue
         T = np.fromfile(f, dtype=np.float32).reshape(-1, NV)
