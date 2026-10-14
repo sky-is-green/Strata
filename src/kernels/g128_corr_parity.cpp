@@ -11,6 +11,7 @@
 // lora_corr_parity's f16 reference, this checks the g128 container's decode and the two-pass chain.
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/lora_corr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_fp16.h>
@@ -176,6 +177,66 @@ int main(int argc, char** argv) {
     const bool fused_aq = std::memcmp(aq.data(), tq.data(), aq.size() * sizeof(Q81)) == 0;
     std::fprintf(stderr, "g128_corr: fused A+q vs the staged A + quantize: %s (bitwise)\n", fused_aq ? "equal" : "DIFFER");
 
+    // the mixed f16/g128 pair (q36's T=1 router + MoE corrections in one launch each) against the standalone
+    // kernels, bitwise: the same x rows for both (the layer's h is both the MoE A input and the router input)
+    const std::string ran = "blk." + std::to_string(layer) + ".ffn_gate_inp.weight.lora_a";
+    const std::string rbn = "blk." + std::to_string(layer) + ".ffn_gate_inp.weight.lora_b";
+    const strata::TensorInfo *tra = nullptr, *trb = nullptr;
+    for (const auto& t : gguf.tensors()) {
+        if (t.name == ran) tra = &t;
+        if (t.name == rbn) trb = &t;
+    }
+    bool mixed_ok = true;
+    if (tra && trb) {
+        const int64_t rr = tra->shape[1], ne = trb->shape[1];
+        const uint64_t nba = strata::tensor_payload_bytes(*tra), nbb = strata::tensor_payload_bytes(*trb);
+        void *dra = nullptr, *drb = nullptr, *dtq_r = nullptr, *dtq_m = nullptr;
+        uint16_t *dt16_r = nullptr, *dt16_m = nullptr;
+        float *dout_r = nullptr, *dout_m = nullptr, *dlg_r = nullptr, *dlg_m = nullptr;
+        CK(cudaMalloc(&dra, nba), "router a");
+        CK(cudaMalloc(&drb, nbb), "router b");
+        CK(cudaMemcpy(dra, gguf.tensor_data(*tra), nba, cudaMemcpyHostToDevice), "router a up");
+        CK(cudaMemcpy(drb, gguf.tensor_data(*trb), nbb, cudaMemcpyHostToDevice), "router b up");
+        CK(cudaMalloc(&dtq_r, (size_t) T * K::native_q8_1_bytes((int) rank, 1)), "tq ref");
+        CK(cudaMalloc(&dtq_m, (size_t) T * K::native_q8_1_bytes((int) rank, 1)), "tq mixed");
+        CK(cudaMalloc(&dt16_r, (size_t) T * rr * 2), "t16 ref");
+        CK(cudaMalloc(&dt16_m, (size_t) T * rr * 2), "t16 mixed");
+        CK(cudaMalloc(&dout_r, (size_t) T * n_out * 4), "moe ref");
+        CK(cudaMalloc(&dout_m, (size_t) T * n_out * 4), "moe mixed");
+        CK(cudaMalloc(&dlg_r, (size_t) T * ne * 4), "logits ref");
+        CK(cudaMalloc(&dlg_m, (size_t) T * ne * 4), "logits mixed");
+        CK(cudaMemset(dlg_r, 0, (size_t) T * ne * 4), "logits ref zero");
+        CK(cudaMemset(dlg_m, 0, (size_t) T * ne * 4), "logits mixed zero");
+        for (int r = 0; r < T; ++r) {
+            const char* x = (const char*) dx + (size_t) r * n_in * 4;
+            const char* xq_r = (const char*) dxq + (size_t) r * K::native_q8_1_bytes((int) n_in, 1);
+            const int n_router = (int) tra->shape[0];   // the router's own input width (N), not the placement's
+            K::iq_corr_g128_aq(da, xq_r, (int) n_in, (int) rank, (char*) dtq_r + (size_t) r * K::native_q8_1_bytes((int) rank, 1), s);
+            K::iq_corr_g128_b(db, (char*) dtq_r + (size_t) r * K::native_q8_1_bytes((int) rank, 1), (int) rank, (int) n_out,
+                              dout_r + (size_t) r * n_out, 0, s);
+            strata::kernels::lora_corr_router((const uint16_t*) dra, (const uint16_t*) drb, (const float*) x, dt16_r + (size_t) r * rr,
+                                              dlg_r + (size_t) r * ne, n_router, rr, ne, s);
+            K::iq_corr_mixed_a(da, xq_r, (int) n_in, (int) rank,
+                               (char*) dtq_m + (size_t) r * K::native_q8_1_bytes((int) rank, 1), dra, (const float*) x,
+                               n_router, (int) rr, dt16_m + (size_t) r * rr, s);
+            K::iq_corr_mixed_b(db, (char*) dtq_m + (size_t) r * K::native_q8_1_bytes((int) rank, 1), (int) rank, (int) n_out,
+                               dout_m + (size_t) r * n_out, drb, dt16_m + (size_t) r * rr, (int) rr, (int) ne,
+                               dlg_m + (size_t) r * ne, s);
+        }
+        CK(cudaStreamSynchronize(s), "sync mixed");
+        std::vector<float> mo(T * n_out), mm(T * n_out), lg(T * ne), lm(T * ne);
+        CK(cudaMemcpy(mo.data(), dout_r, mo.size() * 4, cudaMemcpyDeviceToHost), "moe ref down");
+        CK(cudaMemcpy(mm.data(), dout_m, mm.size() * 4, cudaMemcpyDeviceToHost), "moe mixed down");
+        CK(cudaMemcpy(lg.data(), dlg_r, lg.size() * 4, cudaMemcpyDeviceToHost), "logits ref down");
+        CK(cudaMemcpy(lm.data(), dlg_m, lm.size() * 4, cudaMemcpyDeviceToHost), "logits mixed down");
+        mixed_ok = std::memcmp(mo.data(), mm.data(), mo.size() * 4) == 0 &&
+                   std::memcmp(lg.data(), lm.data(), lg.size() * 4) == 0;
+        std::fprintf(stderr, "g128_corr: mixed pair vs the standalone kernels (MoE + router): %s (bitwise)\n",
+                     mixed_ok ? "equal" : "DIFFER");
+    } else {
+        std::fprintf(stderr, "g128_corr: no f16 router factors on layer %lld; mixed pair not checked\n", (long long) layer);
+    }
+
     double errsum = 0, denom = 0, worst = 0;
     double a_errsum = 0, a_denom = 0, a_worst = 0;
     for (int r = 0; r < T; ++r) {
@@ -206,7 +267,8 @@ int main(int argc, char** argv) {
                  "%.4g, max %.4g; B %.4g, max %.4g\n",
                  (long long) layer, placement.c_str(), (long long) n_in, (long long) rank, (long long) rank,
                  (long long) n_out, T, a_mean_rel, a_max_rel, mean_rel, max_rel);
-    const bool pass = a_mean_rel < 1e-5 && mean_rel < 1e-5 && a_max_rel < 1e-4 && max_rel < 1e-4 && fused_out && fused_aq;
+    const bool pass = a_mean_rel < 1e-5 && mean_rel < 1e-5 && a_max_rel < 1e-4 && max_rel < 1e-4 && fused_out && fused_aq &&
+                      mixed_ok;
     std::fprintf(stderr, "g128_corr: %s (f32 summation-order noise only; fused passes bitwise)\n",
                  pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;

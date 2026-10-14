@@ -7,6 +7,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_dot8.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.cuh"
 
@@ -1972,6 +1974,113 @@ __global__ void __launch_bounds__(128) corr_g128_b_kernel(const uint8_t* __restr
     if (lane == 0) out[row] = accumulate ? __fadd_rn(out[row], s) : s;
 }
 
+// ---------------------------------------------------------------- the mixed f16/g128 correction pair (T = 1)
+// The router delta (f16 pairs) and the MoE output delta (g128) are independent work; one launch each runs
+// both.  Every row's dot is its standalone kernel's code - mmvq's g128 mapping (32 rows per block, one warp
+// each, the 32 outputs quantized by one warp as corr_g128_aq) and the f16 quarter split / warp-strided
+// reduction of lora_corr.cu - so the pair is bitwise the four calls.  A: 8 f16 rows per block, four warps per
+// row over one shared x16 row.  B: 8 g128 rows per block and 8 f16 outputs per block.  Shapes: n_moe a
+// multiple of 128, rank_moe / rank_router of 32, n_router of 32 and <= 4096, rank_router / n_out_moe /
+// n_out_router of 8.
+__global__ void __launch_bounds__(1024) corr_mixed_a_kernel(const uint8_t* __restrict__ a_moe,
+                                                            const block_q8_1* __restrict__ xq_moe, int n_moe,
+                                                            int rank_moe, block_q8_1* __restrict__ tq_moe,
+                                                            const uint16_t* __restrict__ a_router,
+                                                            const float* __restrict__ h, int n_router, int rank_router,
+                                                            uint16_t* __restrict__ t16_router) {
+    __shared__ float ts[32];
+    __shared__ __align__(16) uint16_t xs[4096];
+    __shared__ float part[8][4];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g_blocks = rank_moe / 32;
+    if ((int) blockIdx.x < g_blocks) {
+        const int row = (int) blockIdx.x * 32 + warp;
+        float s = 0.0f;
+        if (row < rank_moe) {
+            const int nb = n_moe / 128;
+            const uint8_t* wr = a_moe + (size_t) row * ((size_t) (n_moe / 128) * sizeof(block_pq2_0));
+            for (int k = lane; k < nb; k += 32) {
+                const Split<142>::W w = Split<142>::load(wr, k, 0);
+                s += Split<142>::apply(w, xq_moe + k * 4, 0);
+            }
+            s = warp_sum(s);
+        }
+        if (lane == 0) ts[warp] = s;   // zero for a row past the end (rank_moe % 32 == 0 makes that unused)
+        __syncthreads();
+        if (warp == 0) {
+            const float xi = ts[lane];
+            float amax = fabsf(xi), sum = xi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            const float d = q8_1_finite(amax / 127.0f);
+            const int8_t q = q8_1_quant(xi, d, amax);
+            tq_moe[blockIdx.x].qs[lane] = q;
+            if (lane == 0) tq_moe[blockIdx.x].ds = q8_1_ds(d, sum);
+        }
+        return;
+    }
+    const int rg = warp >> 2;                          // the row group: 8 rows per block
+    const int rb = ((int) blockIdx.x - g_blocks) * 8 + rg;
+    const int wg = warp & 3;                           // the warp's quarter within its row
+    for (int j = threadIdx.x; j < n_router; j += 1024) xs[j] = f16_from_f32(h[j]);
+    __syncthreads();
+    const int64_t n8 = n_router / 8;
+    const uint4* rp = reinterpret_cast<const uint4*>(a_router + (size_t) rb * n_router);
+    const uint4* xp = reinterpret_cast<const uint4*>(xs);
+    const int64_t q0 = (n8 * wg) / 4, q1 = (n8 * (wg + 1)) / 4;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    int64_t k = q0 + lane;
+    for (; k + 96 < q1; k += 128) {
+        acc0 += f16_dot8(rp[k], xp[k]);
+        acc1 += f16_dot8(rp[k + 32], xp[k + 32]);
+        acc2 += f16_dot8(rp[k + 64], xp[k + 64]);
+        acc3 += f16_dot8(rp[k + 96], xp[k + 96]);
+    }
+    for (; k < q1; k += 32) acc0 += f16_dot8(rp[k], xp[k]);
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) part[rg][wg] = acc;
+    __syncthreads();
+    if (wg == 0 && lane == 0)
+        t16_router[rb] = f16_from_f32(((part[rg][0] + part[rg][1]) + part[rg][2]) + part[rg][3]);
+}
+
+__global__ void __launch_bounds__(256) corr_mixed_b_kernel(const uint8_t* __restrict__ b_moe,
+                                                           const block_q8_1* __restrict__ tq_moe, int rank_moe,
+                                                           int n_out_moe, float* __restrict__ out_moe,
+                                                           const uint16_t* __restrict__ b_router,
+                                                           const uint16_t* __restrict__ t16_router, int rank_router,
+                                                           int n_out_router, float* __restrict__ out_router) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g_blocks = n_out_moe / 8;
+    if ((int) blockIdx.x < g_blocks) {
+        const int row = (int) blockIdx.x * 8 + warp;
+        const int nb = rank_moe / 128;
+        const uint8_t* wr = b_moe + (size_t) row * ((size_t) (rank_moe / 128) * sizeof(block_pq2_0));
+        float s = 0.0f;
+        for (int k = lane; k < nb; k += 32) {
+            const Split<142>::W w = Split<142>::load(wr, k, 0);
+            s += Split<142>::apply(w, tq_moe + k * 4, 0);
+        }
+        s = warp_sum(s);
+        if (lane == 0) out_moe[row] = s;
+        return;
+    }
+    const int o = ((int) blockIdx.x - g_blocks) * 8 + warp;
+    const int64_t n8 = rank_router / 8;
+    const uint4* rp = reinterpret_cast<const uint4*>(b_router + (size_t) o * rank_router);
+    const uint4* tp = reinterpret_cast<const uint4*>(t16_router);
+    float acc = 0.0f;
+    for (int64_t k = lane; k < n8; k += 32) acc += f16_dot8(rp[k], tp[k]);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) out_router[o] += acc;   // one row: the logits' shared-gate slot is not touched
+}
+
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
 // [grp_start[0], grp_start[*n_groups]) (a call's entries are contiguous; the verify window's PCIe call starts after
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
@@ -3301,6 +3410,38 @@ void iq_corr_g128_b(const void* b, const void* t_q8_1, int rank, int n_out, floa
     corr_g128_b_kernel<<<(unsigned) ((n_out + 3) / 4), dim3(32, 4), 0, (cudaStream_t) stream>>>(
         (const uint8_t*) b, (const block_q8_1*) t_q8_1, out, rank, n_out, accumulate);
     check("iq_corr_g128_b");
+}
+
+// The mixed T=1 pair (see corr_mixed_a_kernel / corr_mixed_b_kernel): the MoE's g128 delta and the router's f16
+// delta in one launch each, bitwise the four standalone calls.
+void iq_corr_mixed_a(const void* a_moe, const void* xq_moe, int n_moe, int rank_moe, void* tq_moe,
+                     const void* a_router, const float* h, int n_router, int rank_router, void* t16_router,
+                     void* stream) {
+    if (n_moe <= 0 || n_moe % 128 != 0 || rank_moe <= 0 || rank_moe % 32 != 0 || n_router <= 0 || n_router % 32 != 0 ||
+        n_router > 4096 || rank_router <= 0 || rank_router % 8 != 0) {
+        std::fprintf(stderr, "iq_corr_mixed_a: bad shape n_moe %d rank_moe %d n_router %d rank_router %d\n", n_moe,
+                     rank_moe, n_router, rank_router);
+        std::exit(1);
+    }
+    corr_mixed_a_kernel<<<(unsigned) (rank_moe / 32 + rank_router / 8), 1024, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) a_moe, (const block_q8_1*) xq_moe, n_moe, rank_moe, (block_q8_1*) tq_moe,
+        (const uint16_t*) a_router, h, n_router, rank_router, (uint16_t*) t16_router);
+    check("iq_corr_mixed_a");
+}
+
+void iq_corr_mixed_b(const void* b_moe, const void* tq_moe, int rank_moe, int n_out_moe, float* out_moe,
+                     const void* b_router, const void* t16_router, int rank_router, int n_out_router, float* out_router,
+                     void* stream) {
+    if (rank_moe <= 0 || rank_moe % 128 != 0 || n_out_moe <= 0 || n_out_moe % 8 != 0 || rank_router <= 0 ||
+        rank_router % 32 != 0 || n_out_router <= 0 || n_out_router % 8 != 0) {
+        std::fprintf(stderr, "iq_corr_mixed_b: bad shape rank_moe %d n_out_moe %d rank_router %d n_out_router %d\n",
+                     rank_moe, n_out_moe, rank_router, n_out_router);
+        std::exit(1);
+    }
+    corr_mixed_b_kernel<<<(unsigned) (n_out_moe / 8 + n_out_router / 8), 256, 0, (cudaStream_t) stream>>>(
+        (const uint8_t*) b_moe, (const block_q8_1*) tq_moe, rank_moe, n_out_moe, out_moe, (const uint16_t*) b_router,
+        (const uint16_t*) t16_router, rank_router, n_out_router, out_router);
+    check("iq_corr_mixed_b");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {

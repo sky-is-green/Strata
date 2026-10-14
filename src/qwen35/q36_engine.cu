@@ -148,7 +148,7 @@ __global__ void k_rms_ld(const float* x, int ldx, const float* w, float* out, in
     const float r = rsqrtf(s / (float) n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * r * w[i];
 }
-__global__ void k_add_rms(float* x, const float* y, const float* w, float* h, int n, float eps) {
+__global__ void k_add_rms(float* x, const float* y, const float* w, float* h, int n, float eps, Q81Block* hq) {
     __shared__ float sh[kThreads];
     float* xr = x + (size_t) blockIdx.x * n;
     const float* yr = y + (size_t) blockIdx.x * n;
@@ -161,7 +161,19 @@ __global__ void k_add_rms(float* x, const float* y, const float* w, float* h, in
     }
     s = block_sum(s, sh);
     const float r = rsqrtf(s / (float) n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) hr[i] = xr[i] * r * w[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i] * r * w[i];
+        hr[i] = v;
+        if (hq != nullptr) {   // the experts, the shared expert and both correction A passes read q8_1(h)
+            const float amax = warp_max32(fabsf(v));
+            const float sum = warp_sum32(v);
+            const float d = K::q8_1_finite(amax / 127.0f);
+            const int8_t q = K::q8_1_quant(v, d, amax);
+            const size_t b = (size_t) blockIdx.x * (n / 32) + i / 32;
+            hq[b].qs[i % 32] = q;
+            if (i % 32 == 0) hq[b].ds = K::q8_1_ds(d, sum);
+        }
+    }
 }
 /// The MoE block's end for one token row (block per row): x += sum_k w_k part_k (in pick order, FMA after the first
 /// product, as native_moe_combine) + sigmoid(sgate) * shared + the correction branch (an extra addend, the fork's
@@ -1623,12 +1635,23 @@ struct Engine {
             tick(3, false);
         }
         tick(4, true);   // the post-attention norm, the router (with its correction) and top-k
-        k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps);
+        k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps, (T <= kGemmT) ? (Q81Block*) xq : nullptr);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         if (one) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, 1);
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
-        if (L.router_corr_a.d) corr_router(L, T, h, one ? (int) g.n_expert + 1 : (int) g.n_expert);
+        // the router delta (f16) and the MoE delta (g128) are independent; at one row they run as one launch
+        // each - k_add_rms staged q8_1(h) above, which the g128 pass reads, and the f16 pass rounds h itself
+        bool mixed = false;
+        if (one && L.moe_corr_a.d && L.router_corr_a.d && L.moe_corr_a.n_in == N && L.moe_corr_b.n_out == N) {
+            K::iq_corr_mixed_a(L.moe_corr_a.d, xq, L.moe_corr_a.n_in, L.moe_corr_a.n_out, corr_tq,
+                               L.router_corr_a.d, h, (int) g.n_embd, (int) L.router_corr_a.n_out, corr_t16, st);
+            K::iq_corr_mixed_b(L.moe_corr_b.d, corr_tq, L.moe_corr_b.n_in, L.moe_corr_b.n_out, corr,
+                               L.router_corr_b.d, corr_t16, (int) L.router_corr_b.n_in, (int) g.n_expert, logits_r, st);
+            mixed = true;
+        } else if (L.router_corr_a.d) {
+            corr_router(L, T, h, one ? (int) g.n_expert + 1 : (int) g.n_expert);
+        }
         K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         tick(4, false);
         tick(5, true);   // the routed experts
@@ -1672,8 +1695,9 @@ struct Engine {
             if (lhy(li)) stream_done();
             prow = rinv;
         } else {
-            // the group tables and the q8_1 image of h in one node (k_group_quant: block 0 groups, the rest quantize)
-            k_group_quant<<<1 + (unsigned) (((int64_t) N * T + kThreads - 1) / kThreads), kThreads, 0, st>>>(
+            // the group tables (and, past the first row, the q8_1 image of h: k_add_rms staged it for T <= 8)
+            const unsigned qblocks = (T <= kGemmT) ? 0 : (unsigned) (((int64_t) N * T + kThreads - 1) / kThreads);
+            k_group_quant<<<1 + qblocks, kThreads, 0, st>>>(
                 ids, (int) n_ent, Kp, (int) g.n_expert, L.blobs, L.stride, grp_ptr, grp_start, n_groups, ent_dst,
                 ent_tok, h, (Q81Block*) xq, (int) (N * T));
             tick(5, false);
@@ -1706,7 +1730,7 @@ struct Engine {
         // the block output), then the combine, the shared expert's gate, the residual add and the next norm
         tick(7, false);
         tick(8, true);   // the MoE-branch correction, the combine and the next norm
-        if (L.moe_corr_a.d) {
+        if (L.moe_corr_a.d && !mixed) {
             // the native expert path staged q8_1(h) in `xq` for the shared expert: the MoE branch reads the
             // same h, so its own quantize is the same blocks - reuse them, one node fewer
             if (native_experts && L.moe_corr_a.n_in == N) corr_branch_staged(L.moe_corr_a, L.moe_corr_b, T, xq, corr, false);

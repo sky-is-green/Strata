@@ -23,6 +23,7 @@
 #include "strata/kernels/lora_corr.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_dot8.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -46,29 +47,6 @@ constexpr int WARPS = THREADS / 32;
 // `lora_corr_parity`'s reference.
 constexpr int A_WARPS = 4;
 
-/// The A pass's 8-element product: the f16 pairs convert with one hardware instruction per pair and the
-/// eight products accumulate left to right in element order (f32).  The host reference writes the same
-/// eight `+=` statements against `f32_from_f16` values; keep the shapes in step.
-__device__ __forceinline__ float dot8(const uint4 av, const uint4 xv) {
-    const float2 a0 = __half22float2(*reinterpret_cast<const __half2*>(&av.x));
-    const float2 a1 = __half22float2(*reinterpret_cast<const __half2*>(&av.y));
-    const float2 a2 = __half22float2(*reinterpret_cast<const __half2*>(&av.z));
-    const float2 a3 = __half22float2(*reinterpret_cast<const __half2*>(&av.w));
-    const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(&xv.x));
-    const float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(&xv.y));
-    const float2 x2 = __half22float2(*reinterpret_cast<const __half2*>(&xv.z));
-    const float2 x3 = __half22float2(*reinterpret_cast<const __half2*>(&xv.w));
-    float s = a0.x * x0.x;
-    s += a0.y * x0.y;
-    s += a1.x * x1.x;
-    s += a1.y * x1.y;
-    s += a2.x * x2.x;
-    s += a2.y * x2.y;
-    s += a3.x * x3.x;
-    s += a3.y * x3.y;
-    return s;
-}
-
 __global__ void lora_round_kernel(const float* __restrict__ x, uint16_t* __restrict__ x16, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x16[i] = f16_from_f32(x[i]);
@@ -90,12 +68,12 @@ __global__ void lora_a_kernel(const uint16_t* __restrict__ a, const uint16_t* __
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     int64_t k = q0 + lane;
     for (; k + 96 < q1; k += 128) {
-        acc0 += dot8(rp[k], xp[k]);
-        acc1 += dot8(rp[k + 32], xp[k + 32]);
-        acc2 += dot8(rp[k + 64], xp[k + 64]);
-        acc3 += dot8(rp[k + 96], xp[k + 96]);
+        acc0 += f16_dot8(rp[k], xp[k]);
+        acc1 += f16_dot8(rp[k + 32], xp[k + 32]);
+        acc2 += f16_dot8(rp[k + 64], xp[k + 64]);
+        acc3 += f16_dot8(rp[k + 96], xp[k + 96]);
     }
-    for (; k < q1; k += 32) acc0 += dot8(rp[k], xp[k]);
+    for (; k < q1; k += 32) acc0 += f16_dot8(rp[k], xp[k]);
     float acc = (acc0 + acc1) + (acc2 + acc3);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -119,7 +97,7 @@ __global__ void lora_b_kernel(const uint16_t* __restrict__ b, const uint16_t* __
     const uint4* rp = reinterpret_cast<const uint4*>(b + (size_t) o * rank);
     const uint4* tp = reinterpret_cast<const uint4*>(t16 + (size_t) tok * rank);
     float acc = 0.0f;
-    for (int64_t k = lane; k < n8; k += 32) acc += dot8(rp[k], tp[k]);
+    for (int64_t k = lane; k < n8; k += 32) acc += f16_dot8(rp[k], tp[k]);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) out[(size_t) tok * n_out + o] += acc;
@@ -145,12 +123,12 @@ __global__ void lora_a_round_kernel(const uint16_t* __restrict__ a, const float*
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     int64_t k = q0 + lane;
     for (; k + 96 < q1; k += 128) {
-        acc0 += dot8(rp[k], xp[k]);
-        acc1 += dot8(rp[k + 32], xp[k + 32]);
-        acc2 += dot8(rp[k + 64], xp[k + 64]);
-        acc3 += dot8(rp[k + 96], xp[k + 96]);
+        acc0 += f16_dot8(rp[k], xp[k]);
+        acc1 += f16_dot8(rp[k + 32], xp[k + 32]);
+        acc2 += f16_dot8(rp[k + 64], xp[k + 64]);
+        acc3 += f16_dot8(rp[k + 96], xp[k + 96]);
     }
-    for (; k < q1; k += 32) acc0 += dot8(rp[k], xp[k]);
+    for (; k < q1; k += 32) acc0 += f16_dot8(rp[k], xp[k]);
     float acc = (acc0 + acc1) + (acc2 + acc3);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);

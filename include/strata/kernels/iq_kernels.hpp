@@ -33,6 +33,17 @@ void iq_corr_g128_aq(const void* a, const void* x_q8_1, int n_in, int rank, void
 /// image of t.  Bitwise iq_mmvq(142, ncols = 1) + the f32 add.  rank is a multiple of 128.
 void iq_corr_g128_b(const void* b, const void* t_q8_1, int rank, int n_out, float* out, int accumulate, void* stream);
 
+/// The mixed T=1 correction pair: the MoE's g128 delta and the router's f16 delta in one launch each, bitwise
+/// the four standalone calls (iq_corr_g128_aq + iq_corr_g128_b + the f16 router pair).  `h` is the f32 router
+/// input (rounded in-kernel), `xq_moe` the staged q8_1 image of the same h for the g128 pass.  See the kernels
+/// for the shape requirements.
+void iq_corr_mixed_a(const void* a_moe, const void* xq_moe, int n_moe, int rank_moe, void* tq_moe,
+                     const void* a_router, const float* h, int n_router, int rank_router, void* t16_router,
+                     void* stream);
+void iq_corr_mixed_b(const void* b_moe, const void* tq_moe, int rank_moe, int n_out_moe, float* out_moe,
+                     const void* b_router, const void* t16_router, int rank_router, int n_out_router, float* out_router,
+                     void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);
