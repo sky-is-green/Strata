@@ -74,7 +74,11 @@ void dense_permute_gdn_v(const float* x, float* y, int width, int rows, int hd, 
 /// behind a system fence (ordered behind the stream's earlier writes); poll() spins with a cache-bypassing
 /// load until the peer's bell has reached `seq`.  Both are one tiny kernel on the calling stream.
 void dense_split_ring(uint32_t* bell, uint32_t seq, void* stream);
-void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream);/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
+void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream);
+
+/// dst[j * dst_stride + dst_off + k] = src[j * w + k] for k < w, j < n.  One kernel, used to place a
+/// card's own rotated FFN half into the full activation buffer and to scatter the pulled peer half.
+void dense_split_copy(const float* src, float* dst, int w, int n, int dst_stride, int dst_off, void* stream);/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
 void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
                          int n_kv, int head_dim, int max_ctx, void* stream);
 

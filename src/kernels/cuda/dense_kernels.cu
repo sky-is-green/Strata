@@ -1348,5 +1348,21 @@ void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream) {
     split_poll_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(bell, seq);
     check("dense_split_poll");
 }
+__global__ void split_copy_kernel(const float* __restrict__ src, float* __restrict__ dst, int w, int n,
+                                  int dst_stride, int dst_off) {
+    const int64_t total = (int64_t) w * n;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t j = i / w, k = i - j * w;
+        dst[j * dst_stride + dst_off + k] = src[i];
+    }
+}
+void dense_split_copy(const float* src, float* dst, int w, int n, int dst_stride, int dst_off, void* stream) {
+    if (w <= 0 || n <= 0) return;
+    const int64_t total = (int64_t) w * n;
+    const unsigned blocks = (unsigned) std::min<int64_t>((total + 255) / 256, 4096);
+    split_copy_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, dst, w, n, dst_stride, dst_off);
+    check("dense_split_copy");
+}
 
 }  // namespace strata::kernels
