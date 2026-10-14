@@ -163,8 +163,10 @@ struct DenseGdnSnap {
     int n = 0;                      ///< how many slots are live; 0 asks for no snapshots
 };
 
+/// `l2_channels > 0` folds dense_gdn_l2_norm's call pair (q rows at base 0, k rows at base 2*128*k_heads) for the
+/// leading channels into the same launch, bit-identical: channels and l2_channels must be multiples of 256.
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
-                          const DenseGdnSnap& snap = {}, void* stream = nullptr);
+                          int l2_channels = 0, float eps = 0.0f, const DenseGdnSnap& snap = {}, void* stream = nullptr);
 
 /// In-place L2 norm of the q and k heads of every token of a chunk: row (t, r) of the norm lives at
 /// h + t*channels + base + r*cols, cols = 128 (the heads of one token are contiguous inside the token's C channels).
@@ -184,5 +186,12 @@ void dense_gdn_gates(const float* alpha, const float* dt, const float* ssm_a, fl
 void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const float* beta, const float* z,
                          const float* gamma, float eps, float* y, int k_heads, int v_heads, int T,
                          const DenseGdnSnap& snap = {}, void* stream = nullptr);
+
+/// dense_gdn_gates + dense_gdn_rec_chunk in one launch, bit-identical to the pair: the block computes its own
+/// head's gate/beta per token with the gates kernel's expressions.  `beta` is the raw ssm_beta projection.
+void dense_gdn_rec_gates_chunk(float* state, const float* h, const float* alpha, const float* dt,
+                               const float* ssm_a, const float* beta, const float* z, const float* gamma, float eps,
+                               float* y, int k_heads, int v_heads, int T, const DenseGdnSnap& snap = {},
+                               void* stream = nullptr);
 
 }  // namespace strata::kernels

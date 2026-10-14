@@ -67,6 +67,35 @@ __global__ void apply(const float* x, float* out, int rows, int width,
     out[start + pair + n_rot / 2] = a * s + b * c;
 }
 
+// apply with the position of every row computed in place: a [rows, width] tensor whose rows come in groups of
+// `heads` consecutive positions gets pos0 + row / heads -- exactly the value dense_positions_i32 wrote into the
+// buffer before the plain kernel read it, so the two paths are bit-identical.  The body is apply's, word for word.
+template <bool TAB>
+__global__ void apply_rows_kernel(const float* x, float* out, int rows, int width, int n_rot, float theta_scale,
+                                  float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
+                                  const int* mtab, RopeTab rt, int pos0, int heads) {
+    const int row = blockIdx.y;
+    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || pair >= width / 2) return;
+    const size_t start = size_t(row) * width;
+    const int pos = pos0 + row / heads;
+    if (pair >= n_rot / 2) {
+        if (x != out) {
+            out[start + 2 * pair] = x[start + 2 * pair];
+            out[start + 2 * pair + 1] = x[start + 2 * pair + 1];
+        }
+        return;
+    }
+    float c, s;
+    if (!(TAB && rope_tab_cs(rt, mrope_pos(mtab, pos, pair), pair, c, s))) {
+        const float theta_extrap = mrope_pos(mtab, pos, pair) * powf(theta_scale, float(pair));
+        rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
+    }
+    const float a = x[start + pair], b = x[start + pair + n_rot / 2];
+    out[start + pair] = a * c - b * s;
+    out[start + pair + n_rot / 2] = a * s + b * c;
+}
+
 template <bool TAB>
 __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __restrict__ gamma, float* out,
                                  int n_cols, int n_rot, float epsilon, float theta_scale,
@@ -213,6 +242,34 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     else
         apply<false><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(x, out, rows, head_dim, n_rot, theta_scale,
             k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_rope_apply_rows(const float* x, float* out, int rows, int head_dim, int n_rot, const RopeScaling& scaling,
+                            int heads, int pos0, void* stream) {
+    if (!x || !out || !stream || rows < 1 || rows > 65535 || heads < 1 || pos0 < 0 ||
+        (head_dim != 128 && head_dim != 256) || n_rot != 64 ||
+        rope_scaling_invalid(scaling) != nullptr ||
+        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4) {
+        throw std::invalid_argument("native RoPE (computed row positions) requires aligned F32 rows, width 128/256, "
+                                    "rotation 64, a nonnegative pos0, a valid base/scaling and an explicit stream");
+    }
+    const size_t bytes = size_t(rows) * head_dim * sizeof(float);
+    if (x != out && overlaps(x, bytes, out, bytes)) throw std::invalid_argument("native RoPE buffers partially overlap");
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / n_rot);
+    const RopeKernelArgs k = scaling.kernel_args(n_rot);
+    const RopeTab rt = rope_table_for(scaling);
+    const unsigned threads = (x == out && n_rot == 64 && native_norm_rope_usable(head_dim, n_rot)) ? 32u : 128u;
+    const dim3 grid(threads == 32u ? 1u : unsigned((head_dim / 2 + 127) / 128), rows);
+    if (rt.cos != nullptr)
+        apply_rows_kernel<true><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, out, rows, head_dim, n_rot, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, mrope_table(), rt, pos0, heads);
+    else
+        apply_rows_kernel<false><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, out, rows, head_dim, n_rot, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, mrope_table(), rt, pos0, heads);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

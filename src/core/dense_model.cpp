@@ -742,11 +742,11 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
         snaps.n = n - 1;
         snapc.n = n - 1;
     }
-    dense_gdn_conv_chunk(L.conv_state, qkv, L.conv_w, h, C, n, snapc, s);
-    dense_gdn_l2_norm(h, n, C, 0, KH, S, c.rms_eps, s);
-    dense_gdn_l2_norm(h, n, C, qk, KH, S, c.rms_eps, s);
-    dense_gdn_gates(alpha, L.dt, L.ssm_a, gate, beta, VH, n, s);
-    dense_gdn_rec_chunk(L.state, h, gate, beta, z, L.ssm_norm, c.rms_eps, y, KH, VH, n, snaps, s);
+    // conv + the q/k L2 norms + gates + the recurrence, in two launches: the conv kernel normalizes its own
+    // 128-wide head rows and the recurrence computes its own per-token gate/beta, both with the separate
+    // kernels' expressions in the same order.
+    dense_gdn_conv_chunk(L.conv_state, qkv, L.conv_w, h, C, n, 2 * qk, c.rms_eps, snapc, s);
+    dense_gdn_rec_gates_chunk(L.state, h, alpha, L.dt, L.ssm_a, beta, z, L.ssm_norm, c.rms_eps, y, KH, VH, n, snaps, s);
     }
     if (L.rot & ROT_SSM_OUT) {
         // Prism's grouped V layout: [hd, nk, rep] rows -> [hd, rep, nk] at the load of the same transform.
@@ -1131,7 +1131,7 @@ void DenseModel::Impl::pf_gdn_block(const DenseConfig& c, Layer& L, int64_t T, v
         // conv + SiLU over the chunk (the 3-value history carries over), the L2 norm of the q and k heads of every
         // token, the per-head gates, then the delta-rule recurrence walking the chunk with the output norm folded in.
         // {} = no rollback snapshots: a prompt chunk is never partially undone.
-        dense_gdn_conv_chunk(L.conv_state, pf->qkv, L.conv_w, pf->h, C, (int) T, {}, s);
+        dense_gdn_conv_chunk(L.conv_state, pf->qkv, L.conv_w, pf->h, C, (int) T, 0, 0.0f, {}, s);
         dense_gdn_l2_norm(pf->h, (int) T, C, 0, KH, S, c.rms_eps, s);
         dense_gdn_l2_norm(pf->h, (int) T, C, S * KH, KH, S, c.rms_eps, s);
         dense_gdn_gates(pf->alpha, L.dt, L.ssm_a, pf->gate, pf->beta, VH, (int) T, s);

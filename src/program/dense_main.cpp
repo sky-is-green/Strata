@@ -315,7 +315,7 @@ int selftest() {
             }
             snaps.n = T - 1;
             snapc.n = T - 1;
-            dense_gdn_conv_chunk(d_hist_b, d_qkv, d_cw, d_h_b, C, T, snapc, st);
+            dense_gdn_conv_chunk(d_hist_b, d_qkv, d_cw, d_h_b, C, T, 0, 0.0f, snapc, st);
             dense_gdn_l2_norm(d_h_b, T, C, 0, KH, S, 1e-6f, st);
             dense_gdn_l2_norm(d_h_b, T, C, qk, KH, S, 1e-6f, st);
             dense_gdn_gates(d_alpha, d_dt, d_as, d_gate_b, d_beta, VH, T, st);

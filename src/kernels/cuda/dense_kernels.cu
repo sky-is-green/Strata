@@ -868,13 +868,22 @@ __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* _
 // One thread per conv channel, walking the chunk inside the launch (the decode path's conv_silu with a token loop).
 // The thread owns its channel's whole 4-tap window, so a snapshot of the history after column j is three stores from
 // registers it already has: that is how a speculative pass gets its rollback points without a copy per column.
+//
+// `l2_channels` > 0 folds gdn_l2_norm_kernel's two launches (the q rows at base 0 and the k rows at base
+// 2 * 128 * k_heads) into this one: the leading channels are whole 128-wide head rows and each block of 256
+// threads covers exactly two of them, so for every token the block reduces its two rows with the l2 kernel's
+// four-warp sum order and rewrites the values in place.  channels must be a multiple of 256 for the block-local
+// row assumption; the launcher checks it.
 __global__ void gdn_conv_chunk_kernel(float* __restrict__ history, const float* __restrict__ qkv,
                                       const float* __restrict__ weights, float* __restrict__ h, int channels, int T,
-                                      DenseGdnSnap snap) {
+                                      int l2_channels, float eps, DenseGdnSnap snap) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     float v[4] = {history[c * 3], history[c * 3 + 1], history[c * 3 + 2], 0.0f};
     const float* w = weights + (size_t) c * 4;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const bool l2 = l2_channels > 0 && (blockIdx.x + 1) * blockDim.x <= (unsigned) l2_channels;
+    __shared__ float red[2][4];    // the two rows' per-warp sums of squares: [row][warp within the row]
     for (int t = 0; t < T; ++t) {
         v[3] = qkv[(size_t) t * channels + c];
         float sum = 0.0f;
@@ -882,7 +891,21 @@ __global__ void gdn_conv_chunk_kernel(float* __restrict__ history, const float* 
         for (int tap = 0; tap < 4; ++tap) sum += v[tap] * w[tap];
         // __expf, not expf: the decode path's conv_silu is compiled with --use_fast_math, which turns its expf
         // into this intrinsic.  Matching it keeps a chunk's conv output as close as possible to the token loop's.
-        h[(size_t) t * channels + c] = sum / (1.0f + __expf(-sum));
+        const float val = sum / (1.0f + __expf(-sum));
+        if (!l2) {
+            h[(size_t) t * channels + c] = val;
+        } else {
+            const int row = threadIdx.x >> 7;               // threads 0..127 are the first row, 128..255 the second
+            float partial = val * val;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffffu, partial, o);
+            if (lane == 0) red[row][warp & 3] = partial;
+            __syncthreads();
+            const float total = red[row][0] + red[row][1] + red[row][2] + red[row][3];
+            const float scale = rsqrtf(total / 128.0f + eps / 128.0f);
+            h[(size_t) t * channels + c] = scale * val * (1.0f / sqrtf(128.0f));
+            __syncthreads();                                // red is rewritten by the next token
+        }
 #pragma unroll
         for (int tap = 0; tap < 3; ++tap) v[tap] = v[tap + 1];
         if (t < snap.n) {
@@ -931,12 +954,19 @@ __global__ void gdn_gates_kernel(const float* __restrict__ alpha, const float* _
 // 32 threads (the rows a warp owns stay in registers), the T tokens walked in order, and the output norm
 // rms_norm(o) * gamma * SiLU(z) folded in - SiLU, which is what qwen35 does and the MoE path's sigmoid does not.
 // The readout is scaled by 1/sqrt(128) exactly as native_gdn_step's `scale`, so the norm sees the same values.
+//
+// GATES_IN folds gdn_gates_kernel into this launch: the block computes its own head's per-token gate and beta with
+// the gates kernel's own expressions (softplus, ssm_a and the sigmoid) and keeps them in shared memory.  The result
+// is bit-identical to the separate launch; the prompt path still uses the two-launch form (GATES_IN = false).
+template <bool GATES_IN>
 __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
         float* __restrict__ state, const float* __restrict__ h, const float* __restrict__ gate,
-        const float* __restrict__ beta, const float* __restrict__ z, const float* __restrict__ gamma, float eps,
+        const float* __restrict__ beta, const float* __restrict__ alpha, const float* __restrict__ dt,
+        const float* __restrict__ ssm_a, const float* __restrict__ z, const float* __restrict__ gamma, float eps,
         float* __restrict__ y, int k_heads, int v_heads, int T, DenseGdnSnap snap) {
     constexpr int W = 128, RG = 4, RPG = W / RG;
     __shared__ float sq[W], sk[W], red[RG][W], wsum[16];
+    __shared__ float sg_s, sb_s;
     const int head = blockIdx.x, col = threadIdx.x, rg = threadIdx.y, tid = rg * W + col;
     const int qh = head % k_heads;
     float s[RPG];
@@ -954,8 +984,16 @@ __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
             sq[tid] = ht[qh * W + tid];
             sk[tid] = ht[k_heads * W + qh * W + tid];
         }
+        if (GATES_IN && tid == 0) {                     // the gates kernel's expressions, its head's token t
+            const size_t i = (size_t) t * v_heads + head;
+            const float value = alpha[i] + dt[head];
+            const float softplus = value > 20.0f ? value : __logf(1.0f + __expf(value));
+            sg_s = __expf(softplus * ssm_a[head]);      // the decode step's fast-math expf
+            sb_s = 1.0f / (1.0f + __expf(-beta[i]));
+        }
         __syncthreads();
-        const float g = __expf(gate[(size_t) t * v_heads + head]);   // the decode step's fast-math expf
+        const float g = GATES_IN ? sg_s : __expf(gate[(size_t) t * v_heads + head]);
+        const float bt = GATES_IN ? sb_s : beta[(size_t) t * v_heads + head];
         float kv = 0.0f;
         // The expressions are native_gdn_step's, written the same way, so the compiler contracts them the same way
         // (native_gdn.cu is compiled with --use_fast_math like this file): a chunk lands on the same bits as the
@@ -965,7 +1003,7 @@ __global__ void __launch_bounds__(128 * 4) gdn_rec_chunk_kernel(
         red[rg][col] = kv;
         __syncthreads();
         const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
-        const float delta = (ht[2 * k_heads * W + head * W + col] - g * kv_col) * beta[(size_t) t * v_heads + head];
+        const float delta = (ht[2 * k_heads * W + head * W + col] - g * kv_col) * bt;
         float o = 0.0f;
 #pragma unroll
         for (int r = 0; r < RPG; ++r) {
@@ -1330,14 +1368,17 @@ void dense_gemv_f32_rows_pair(const float* Wa, const float* Wb, const float* X, 
 }
 
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
-                          const DenseGdnSnap& snap, void* stream) {
+                          int l2_channels, float eps, const DenseGdnSnap& snap, void* stream) {
     if (T < 1) return;
     if (snap.n > DenseGdnSnap::kMaxSlots || snap.n > T)
         throw std::runtime_error("dense_gdn_conv_chunk: snapshot slots outside the chunk");
     for (int j = 0; j < snap.n; ++j)
         if (!snap.slot[j]) throw std::runtime_error("dense_gdn_conv_chunk: a snapshot slot is null");
+    // The fused l2 pass assumes each 256-thread block covers whole 128-wide head rows.
+    if (l2_channels > 0 && (channels % 256 != 0 || l2_channels % 256 != 0 || l2_channels > channels))
+        throw std::runtime_error("dense_gdn_conv_chunk: the fused l2 rows need 256-aligned channels");
     gdn_conv_chunk_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
-        history, qkv, conv_w, h, channels, T, snap);
+        history, qkv, conv_w, h, channels, T, l2_channels, eps, snap);
     check("dense_gdn_conv_chunk");
 }
 
@@ -1371,9 +1412,24 @@ void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const 
     for (int j = 0; j < snap.n; ++j)
         if (!snap.slot[j]) throw std::runtime_error("dense_gdn_rec_chunk: a snapshot slot is null");
     const dim3 block(128, 4);
-    gdn_rec_chunk_kernel<<<v_heads, block, 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y,
-                                                                       k_heads, v_heads, T, snap);
+    gdn_rec_chunk_kernel<false><<<v_heads, block, 0, (cudaStream_t) stream>>>(
+        state, h, gate, beta, nullptr, nullptr, nullptr, z, gamma, eps, y, k_heads, v_heads, T, snap);
     check("dense_gdn_rec_chunk");
+}
+
+void dense_gdn_rec_gates_chunk(float* state, const float* h, const float* alpha, const float* dt,
+                               const float* ssm_a, const float* beta, const float* z, const float* gamma, float eps,
+                               float* y, int k_heads, int v_heads, int T, const DenseGdnSnap& snap, void* stream) {
+    if (T < 1 || k_heads < 1 || v_heads < 1 || v_heads % k_heads != 0)
+        throw std::runtime_error("dense_gdn_rec_gates_chunk: T >= 1 and v_heads a positive multiple of k_heads");
+    if (snap.n > DenseGdnSnap::kMaxSlots || snap.n > T)
+        throw std::runtime_error("dense_gdn_rec_gates_chunk: snapshot slots outside the chunk");
+    for (int j = 0; j < snap.n; ++j)
+        if (!snap.slot[j]) throw std::runtime_error("dense_gdn_rec_gates_chunk: a snapshot slot is null");
+    const dim3 block(128, 4);
+    gdn_rec_chunk_kernel<true><<<v_heads, block, 0, (cudaStream_t) stream>>>(
+        state, h, nullptr, beta, alpha, dt, ssm_a, z, gamma, eps, y, k_heads, v_heads, T, snap);
+    check("dense_gdn_rec_gates_chunk");
 }
 
 // ---- two-GPU handoff doorbells (used by ffn_block_split in src/core/dense_model.cpp) -------------------

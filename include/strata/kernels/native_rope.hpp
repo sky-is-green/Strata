@@ -18,6 +18,12 @@ bool native_rope_enabled();
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream);
 
+/// The same apply with the position of each row computed in place: row r of a [rows, width] tensor whose rows come
+/// in groups of `heads` consecutive positions rotates at pos0 + r / heads -- the value dense_positions_i32 writes,
+/// without the extra launch.  Bit-identical to native_rope_apply over that buffer.
+void native_rope_apply_rows(const float* x, float* out, int rows, int head_dim, int n_rot,
+                            const RopeScaling& scaling, int heads, int pos0, void* stream);
+
 /// (#783 PR-f, stuchapin909) native_qsa_rms_norm_weighted + native_rope_apply in one launch, bit-identical to the pair
 /// (rope_parity check 6): x rows are `in_stride` apart (2 * head_dim reads a q row out of a q|gate row), out rows are
 /// head_dim apart, x may equal out when in_stride == head_dim. head_dim 128 or 256 and n_rot 64 only.
