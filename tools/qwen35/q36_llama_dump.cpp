@@ -102,6 +102,10 @@ int main(int argc, char** argv) {
     cp.cb_eval_user_data = &cap;
     llama_context* ctx = llama_init_from_model(mdl, cp);
     if (!ctx) { std::fprintf(stderr, "cannot create the context\n"); return 1; }
+    // enable the model's embedded adapter (single-file releases): the common CLI enables it through
+    // common_set_adapter_lora; the raw API context does not see it until this call.  Q36_DUMP_NO_ADAPTER=1
+    // is the base-model measurement arm.
+    if (std::getenv("Q36_DUMP_NO_ADAPTER") == nullptr) llama_set_adapters_lora(ctx, nullptr, 0, nullptr);
     FILE* fl = dump_layers.empty() ? nullptr : std::fopen(dump_layers.c_str(), "wb");
     FILE* fg = dump_logits.empty() ? nullptr : std::fopen(dump_logits.c_str(), "wb");
     FILE* ff = dump_full.empty() ? nullptr : std::fopen(dump_full.c_str(), "wb");

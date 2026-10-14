@@ -20,6 +20,7 @@
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/lora_corr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
@@ -143,11 +144,12 @@ __global__ void k_add_rms(float* x, const float* y, const float* w, float* h, in
     for (int i = threadIdx.x; i < n; i += blockDim.x) hr[i] = xr[i] * r * w[i];
 }
 /// The MoE block's end for one token row (block per row): x += sum_k w_k part_k (in pick order, FMA after the first
-/// product, as native_moe_combine) + sigmoid(sgate) * shared; then, with `wn`, h = rms(x) * wn (the next layer's
-/// attention norm).  Replaces combine + gate + add + rms.
+/// product, as native_moe_combine) + sigmoid(sgate) * shared + the correction branch (an extra addend, the fork's
+/// `cur += branch`; null without corrections); then, with `wn`, h = rms(x) * wn (the next layer's attention norm).
+/// Replaces combine + gate + add + rms.
 __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, const float* wts, int K_,
                           const float* shared, const float* sgate, int sg_stride, const float* wn, float* h, int n,
-                          float eps) {
+                          float eps, const float* branch) {
     __shared__ float sh[kThreads];
     __shared__ const float* pk[16];
     const int t = blockIdx.x;
@@ -162,6 +164,7 @@ __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, con
         float acc = wr[0] * pk[0][i];
         for (int k = 1; k < K_; ++k) acc = fmaf(wr[k], pk[k][i], acc);
         acc += gs * shared[(size_t) t * n + i];
+        if (branch != nullptr) acc += branch[(size_t) t * n + i];
         const float v = xr[i] + acc;
         xr[i] = v;
         s += v * v;
@@ -170,6 +173,14 @@ __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, con
     s = block_sum(s, sh);
     const float r = rsqrtf(s / (float) n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) h[(size_t) t * n + i] = xr[i] * r * wn[i];
+}
+/// dst[t][ld_dst] += src[t][n]: the correction branch's B output into its destination (y or the router logits,
+/// whose row stride is n + 1 in the one-row decode where the shared expert's gate shares the row).
+__global__ void k_corr_add(float* dst, const float* src, int ld_dst, int n, int64_t total) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int64_t t = i / n, o = i % n;
+    dst[t * ld_dst + o] += src[i];
 }
 /// GDN alpha and beta for T <= 8 rows in one launch, their epilogues applied: rows [0, HV) of the output are
 /// softplus(alpha . x + dt) * ssm_a, rows [HV, 2 HV) sigmoid(beta . x).  Warp per row (grid (ceil(2 HV / 8), T)).
@@ -752,6 +763,13 @@ struct Layer {
     size_t src_gsz = 0, src_dsz = 0;
     uint8_t* hblobs = nullptr;  // hybrid mode: every expert's blob in host memory, `stride` apart
     int n_slots = 0;            // hybrid mode: the experts resident in VRAM
+    // the embedded corrections (the Scion release; absent from base files).  `corr_*` is this layer's output
+    // projection (ssm_out on GDN layers, attn_output on attention layers), `moe_corr_*` the MoE block output
+    // and `router_corr_*` the router delta; a = [in, rank], b = [rank, out].  The projection and MoE factors
+    // are type 43 (the g128 34-byte block, loaded as PQ2_0), the router pairs f16.
+    Mat corr_a, corr_b;
+    Mat moe_corr_a, moe_corr_b;
+    Mat router_corr_a, router_corr_b;
 };
 
 struct Model {
@@ -891,6 +909,29 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         return w;
     };
     auto L = [](int64_t l, const char* s) { return "blk." + std::to_string(l) + "." + s; };
+    // the embedded corrections (optional): a raw device copy per factor.  Type 43 is the same 34-byte g128
+    // block as PQ2_0, so it is loaded as 142 (the fork's own import rule) and multiplies the q8_1 image; the
+    // router pairs stay f16 and take x's f16 rounding.  Absent tensors leave a zero Mat and the branch is off.
+    // STRATA_Q36_NO_CORR=1 is the measurement arm: the base model's path, no correction kernels at all.
+    const bool no_corr = std::getenv("STRATA_Q36_NO_CORR") != nullptr;
+    if (no_corr) std::fprintf(stderr, "strata-q36: STRATA_Q36_NO_CORR: the embedded corrections are skipped\n");
+    auto corr = [&](const std::string& name) -> Mat {
+        if (no_corr) return {};
+        size_t s = 0;
+        const strata::TensorInfo* t = gm.find(name, &s);
+        if (t == nullptr) return {};
+        Mat w;
+        w.type = (int) t->type == 43 ? 142 : (int) t->type;
+        w.n_in = (int) t->shape[0];
+        w.n_out = (int) t->shape[1];
+        const uint64_t nb = strata::tensor_payload_bytes(*t);
+        uint8_t* d = nullptr;
+        CK(cudaMalloc(&d, nb));
+        CK(cudaMemcpy(d, gm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+        bytes += nb;
+        w.d = d;
+        return w;
+    };
     m.layers.resize((size_t) g.n_layers);
     // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
@@ -954,6 +995,19 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         y.src_d = gm.shard(sd).tensor_data(*td);
         y.src_gsz = gsz;
         y.src_dsz = dsz;
+        // the embedded corrections: the MoE block output and the router delta on every layer, the output
+        // projection on the layer's kind (ssm_out on GDN layers, attn_output on attention layers)
+        y.moe_corr_a = corr(L(l, "ffn_moe_out.weight.lora_a"));
+        y.moe_corr_b = corr(L(l, "ffn_moe_out.weight.lora_b"));
+        y.router_corr_a = corr(L(l, "ffn_gate_inp.weight.lora_a"));
+        y.router_corr_b = corr(L(l, "ffn_gate_inp.weight.lora_b"));
+        if (!y.attn) {
+            y.corr_a = corr(L(l, "ssm_out.weight.lora_a"));
+            y.corr_b = corr(L(l, "ssm_out.weight.lora_b"));
+        } else {
+            y.corr_a = corr(L(l, "attn_output.weight.lora_a"));
+            y.corr_b = corr(L(l, "attn_output.weight.lora_b"));
+        }
     }
     if (m.has_mtp) {
         const int64_t l = g.n_layers;
@@ -1044,6 +1098,11 @@ struct Engine {
     void *mq_x = nullptr, *mq_hq = nullptr;
     float *mq_gu = nullptr, *mq_h = nullptr;
     __half* x16 = nullptr;
+    // the embedded corrections' scratch: the A pass's output t [tmax][rank], the branch [tmax][N], their q8_1
+    // images, and the f16 round-trip scratch the f16 router pairs use (lora_corr_apply)
+    float *corr_t = nullptr, *corr = nullptr;
+    void *corr_xq = nullptr, *corr_tq = nullptr;
+    uint16_t *corr_x16 = nullptr, *corr_t16 = nullptr;
     bool use_graph = true;
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
 
@@ -1125,6 +1184,12 @@ struct Engine {
         const int max_in = (int) std::max<int64_t>({2 * g.n_embd, g.ssm_value_dim, g.n_head * g.head_dim, g.n_ff_shexp});
         CK(cudaMalloc(&q8, K::native_q8_1_bytes(max_in, 1) * T));
         CK(cudaMalloc(&xq, K::native_q8_1_bytes((int) N, 1) * T));
+        corr_t = dalloc(T * (size_t) strata::kernels::kLoraCorrMaxRank);
+        corr = dalloc(T * N);
+        CK(cudaMalloc(&corr_xq, K::native_q8_1_bytes(max_in, 1) * T));
+        CK(cudaMalloc(&corr_tq, K::native_q8_1_bytes((int) strata::kernels::kLoraCorrMaxRank, 1) * T));
+        corr_x16 = dalloc_t<uint16_t>(std::min<size_t>(T, (size_t) strata::kernels::kLoraCorrRoundRows) * N);
+        corr_t16 = dalloc_t<uint16_t>(T * (size_t) strata::kernels::kLoraCorrMaxRank);
         x16 = dalloc_t<__half>(T * (size_t) max_in);
         if (cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(blas, st) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "strata-q36: cuBLAS handle failed\n");
@@ -1303,6 +1368,34 @@ struct Engine {
         }
     }
 
+    /// dst [T][n_out] = B (A x): one g128 correction branch (the out-projection and the MoE block output).
+    /// The factors are type 43, the PQ2_0 block - the same 34 bytes per 128 as the experts - so both passes run
+    /// on the q8_1 image of their input, the fork's mul_mat path for that container: the A pass writes f32 t,
+    /// the B pass reads t's own q8_1 image.
+    void corr_branch(const Mat& a, const Mat& b, int T, const float* x, float* dst) {
+        quant(x, a.n_in, T, corr_xq);
+        K::iq_mmvq(142, a.d, corr_xq, corr_t, a.n_in, a.n_out, T, st);
+        quant(corr_t, b.n_in, T, corr_tq);
+        K::iq_mmvq(142, b.d, corr_tq, dst, b.n_in, b.n_out, T, st);
+    }
+    /// out [T][ld_out] += B (A x): the branch through `corr`, then the f32 add (the fork's ggml_add).
+    void corr_add(const Mat& a, const Mat& b, int T, const float* x, float* out, int ld_out) {
+        corr_branch(a, b, T, x, corr);
+        k_corr_add<<<grid1((int64_t) T * b.n_out), kThreads, 0, st>>>(out, corr, ld_out, b.n_out,
+                                                                      (int64_t) T * b.n_out);
+    }
+    /// The router delta (f16 pairs): logits [T][ld_logits] += B (A x) with the repo's f16 round-trip rule
+    /// (lora_corr_apply - round x to f16, t16 = f16(A x), out += B t16), the rule the fork's F16 matmuls apply.
+    void corr_router(const Layer& L, int T, const float* x, int ld_logits) {
+        const auto& g = m->g;
+        const int64_t n = (int64_t) T * g.n_expert;
+        CK(cudaMemsetAsync(corr, 0, (size_t) n * 4, st));
+        strata::kernels::lora_corr_apply((const uint16_t*) L.router_corr_a.d, (const uint16_t*) L.router_corr_b.d,
+                                         x, corr_x16, corr_t16, corr, T, (int) g.n_embd, (int) L.router_corr_a.n_out,
+                                         (int) g.n_expert, st);
+        k_corr_add<<<grid1(n), kThreads, 0, st>>>(logits_r, corr, ld_logits, (int) g.n_expert, n);
+    }
+
     /// One layer for T rows: x (the residual) += mixer(h); then MoE; x += moe; `hout` = rms(x) * wn (the next norm).
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
@@ -1344,6 +1437,7 @@ struct Engine {
                                                        T, !verify);
             }
             mm(L.ssm_out, gdn_y, y, T);
+            if (L.corr_a.d) corr_add(L.corr_a, L.corr_b, T, gdn_y, y, N);
         } else {
             prep(h, N, T, xq);
             apply(L.wq, xq, qg, T);
@@ -1406,12 +1500,14 @@ struct Engine {
                 }
             }
             mm(L.wo, att, y, T);
+            if (L.corr_a.d) corr_add(L.corr_a, L.corr_b, T, att, y, N);
         }
         k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
         if (one) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, 1);
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        if (L.router_corr_a.d) corr_router(L, T, h, one ? (int) g.n_expert + 1 : (int) g.n_expert);
         K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
@@ -1471,9 +1567,11 @@ struct Engine {
         }
         if (!one) f32mm(L.sh_gate_inp, h, sgate, N, 1, T);
         if (hy_rows) moe_hybrid_cpu(li, T);   // the CPU pool's experts (while the GPU runs the rest), merged
-        // the combine, the shared expert's gate, the residual add and the next norm in one launch
+        // the MoE block's correction branch (from the normalized FFN input, the same addend the fork adds to
+        // the block output), then the combine, the shared expert's gate, the residual add and the next norm
+        if (L.moe_corr_a.d) corr_branch(L.moe_corr_a, L.moe_corr_b, T, h, corr);
         k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, ewts, Kp, sy, one ? logits_r + g.n_expert : sgate, 1, wn, hout,
-                                          N, m->eps);
+                                          N, m->eps, L.moe_corr_a.d ? corr : nullptr);
     }
 
     /// The main model over T rows (device `tok`, positions p0 .. p0 + T - 1, also at *pos0): hmain gets every row's
