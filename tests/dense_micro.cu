@@ -104,6 +104,15 @@ int main() {
     std::printf("gdn rec+gates   (VH=48,T=1):   %7.2f us\n", us_per(2000, [&] {
         strata::kernels::dense_gdn_rec_gates_chunk(cstate, ch, calpha, cdt, ca, cbeta, cz, cgamma, 1e-6f, cy, KH, VH, 1,
                                                    {}, st); }));
+    {
+        float *fwa = nullptr, *fwb = nullptr, *fy = nullptr, *fz2 = nullptr;
+        cudaMalloc(&fwa, (size_t) E * VH * 4);
+        cudaMalloc(&fwb, (size_t) E * VH * 4);
+        cudaMalloc(&fy, (size_t) VH * 4);
+        cudaMalloc(&fz2, (size_t) VH * 4);
+        std::printf("gdn f32 pair    (5120->48):    %7.2f us\n", us_per(2000, [&] {
+            strata::kernels::dense_gemv_f32_rows_pair(fwa, fwb, x, fy, fz2, E, VH, 1, st); }));
+    }
     std::printf("kv append rows  (4x1 F16):     %7.2f us\n", us_per(2000, [&] {
         strata::kernels::dense_kv_append_rows_fmt(kc, vc, 0, 0, qq, qq, 1, 0, 4, D, MCTX, st); }));
     std::printf("attn part+merge (ctx=64):      %7.2f us\n", us_per(500, [&] {

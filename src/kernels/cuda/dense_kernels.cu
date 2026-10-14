@@ -1764,7 +1764,9 @@ __global__ void gemv_f32_rows_pair_kernel(const float* __restrict__ Wa, const fl
     float aa = 0.0f, ab = 0.0f;
     // The one-warp-per-row shape is global-latency bound at n_in 5120 (~33 us/call): unrolling keeps several
     // iterations' loads in flight.  The accumulation stays aa/ab serial in the same i order (no fast-math here).
-#pragma unroll 4
+    // More iterations per round keep more of the 24-48 loads in flight; the order of the fma chain is the source
+    // order either way.
+#pragma unroll 16
     for (int i = lane; i < n_in; i += 32) {
         const float x = xr[i];
         aa += wa[i] * x;
