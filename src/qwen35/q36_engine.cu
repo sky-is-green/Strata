@@ -691,7 +691,8 @@ __global__ void __launch_bounds__(128) k_conv_seq(float* hist, const float* qkv,
 /// registers across the tokens.  h (T, C) = q | k | v, gate / beta (T, HV), z / y (T, ZV).
 __global__ void __launch_bounds__(512) k_gdn_seq(float* state, const float* h, int C, const float* gate,
                                                  const float* beta, const float* z, const float* gamma, float eps,
-                                                 float* y, int h_k, int h_v, int T, bool write) {
+                                                 float* y, int h_k, int h_v, int T, bool write,
+                                                 Q81Block* hq = nullptr) {
     constexpr int S = 128, RG = 4, RPG = 32;
     __shared__ float sk[S], sq[S];
     __shared__ float red_kv[RG][S];
@@ -737,7 +738,20 @@ __global__ void __launch_bounds__(512) k_gdn_seq(float* state, const float* h, i
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
             const float scale = rsqrtf(ss / (float) S + eps);
             const float zz = z[(size_t) t * ZV + head * S + col];
-            y[(size_t) t * ZV + head * S + col] = oc * scale * gamma[col] * (zz / (1.0f + __expf(-zz)));
+            const float yv = oc * scale * gamma[col] * (zz / (1.0f + __expf(-zz)));
+            y[(size_t) t * ZV + head * S + col] = yv;
+            if (hq != nullptr) {   // the q8_1 image of y, the standalone quantizer's bits (the warp's trees)
+                float amax = fabsf(yv), sum = yv;
+                for (int o2 = 16; o2 > 0; o2 >>= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o2));
+                    sum += __shfl_xor_sync(0xffffffffu, sum, o2);
+                }
+                const float d = K::q8_1_finite(amax / 127.0f);
+                const int8_t q = K::q8_1_quant(yv, d, amax);
+                const size_t bl = ((size_t) t * ZV + head * S + col) / 32;
+                hq[bl].qs[col % 32] = q;
+                if (col % 32 == 0) hq[bl].ds = K::q8_1_ds(d, sum);
+            }
         }
         __syncthreads();   // sk / sq / the reductions are rewritten by the next token
     }
@@ -1427,9 +1441,9 @@ struct Engine {
     /// y = W x with the out projection's correction A pass in the same launch (T = 1): mm()'s prep, then the
     /// fused [mmvq rows + g128 A rows] (native_mmvq_corr_aq) - the caller runs the B pass next.  False where
     /// the pair is not available; the caller falls back to mm() + corr_branch_staged().
-    bool mm_fused_corr_a(const Mat& w, const float* xin, float* out, const Mat& a) {
+    bool mm_fused_corr_a(const Mat& w, const float* xin, float* out, const Mat& a, bool staged = false) {
         if (a.type != 142 || a.n_in != w.n_in) return false;
-        prep(xin, w.n_in, 1, q8);
+        if (!staged) prep(xin, w.n_in, 1, q8);
         return K::native_mmvq_corr_aq(w.type, w.d, q8, out, w.n_in, w.n_out, a.d, a.n_out, corr_tq, st);
     }
     /// y1 = W1 x, y2 = W2 x in one launch at one row (the two applications' shared activation); falls back to
@@ -1570,6 +1584,7 @@ struct Engine {
         const bool xq_hot = xq_staged && T <= kGemmT;
         xq_staged = false;
         bool tail_fused = false;   // the router tail's launch carries the deltas, top-k and the group tables
+        bool gdn_y_staged = false; // k_gdn_seq staged q8_1 of its output for the out projection
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
@@ -1612,12 +1627,15 @@ struct Engine {
                                                                                                   be_b, gdn_y, HK, HV, T);
                 k_gdn_norm<<<dim3(HV, T), 128, 0, st>>>(gdn_y, z, L.ssm_norm, m->eps, gdn_y, HV);
             } else {   // decode, verify windows and commits: one kernel, so a window's rows are a decode step's rows
+                // (and it stages q8_1 of its own output at one row to T <= kGemmT: the out projection's prep)
                 k_gdn_seq<<<HV, dim3(128, 4), 0, st>>>(S[li], hc_b, C, al_b, be_b, z, L.ssm_norm, m->eps, gdn_y, HK, HV,
-                                                       T, !verify);
+                                                       T, !verify, (T <= kGemmT) ? (Q81Block*) q8 : nullptr);
+                gdn_y_staged = T <= kGemmT;
             }
             tick(3, false);
             tick(4, true);   // the out projection, the correction's A pass folded in at one row
-            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa && mm_fused_corr_a(L.ssm_out, gdn_y, y, L.corr_a);
+            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa &&
+                                     mm_fused_corr_a(L.ssm_out, gdn_y, y, L.corr_a, gdn_y_staged);
             if (!corr_a_done) mm(L.ssm_out, gdn_y, y, T);
             tick(4, false);
             tick(5, true);   // the out-projection correction
