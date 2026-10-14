@@ -141,6 +141,16 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
   are careless LOGIC slips on easy problems (compares an element with itself; misses one of three pairwise checks;
   descending instead of ascending; sets the sign instead of flipping it) - exactly what a degraded router looks like.
   4-0 discordant pairs: sign test p = 0.125 two-sided - strongly suggestive, not proof at n=21.
+  **Follow-up (Mal: keep coding quality, >= 20 tok/s minimum), same 21 HumanEval + 10 tools, arena-adapt on:**
+  | bias scale | HumanEval | tools | DSpark + arena-adapt tok/s docs / python (128 tok) |
+  |---|---|---|---|
+  | x0.25 | 20/21 | 8/8 | 13.7 / 16.1 |
+  | **x0.5** | **20/21** (fails only 32, as all) | 10/10 | **22.3 / 22.9** |
+  | x0.75 | 19/21 (+160: left-to-right eval, ignores precedence) | 10/10 | 28.3 / 35.2 |
+  | 1.0 | 16/21 (+0, 80, 120, 128) | 10/10 | 37.7 / 39.1 |
+  | NVMe-only penalty (rb 0, rbf 0.6 / 1.2) | not run | - | 12.7 / 12.9, 13.9 / 15.2 (no faster than x0.25: the VRAM pull IS the speed) |
+  Verdict: x0.5 + arena-adapt = coding at the best arm's level at 22-23 tok/s (one-shot DSpark); x0.75 = 28-35 tok/s
+  with the first slip showing.  Through --serve today (no DSpark) x0.5 + arena-adapt is plain 18.4 / 15.6 tok/s.
   Reading: the full-speed bias does NOT break tool calling / simple agentic loops, but it DOES cost coding correctness
   (~-19 pt HumanEval).  NEXT: x0.5 + arena-adapt (DSpark 22.3 / 22.9 tok/s, 81.6% agreement) on the same screen, and
   the file-penalty-only sweep, looking for a config at 30+ tok/s that keeps HumanEval near 20/21.
