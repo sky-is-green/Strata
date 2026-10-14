@@ -78,7 +78,12 @@ void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream);
 
 /// dst[j * dst_stride + dst_off + k] = src[j * w + k] for k < w, j < n.  One kernel, used to place a
 /// card's own rotated FFN half into the full activation buffer and to scatter the pulled peer half.
-void dense_split_copy(const float* src, float* dst, int w, int n, int dst_stride, int dst_off, void* stream);/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
+void dense_split_copy(const float* src, float* dst, int w, int n, int dst_stride, int dst_off, void* stream);
+// Staging for the two-card handoff: copy src (VRAM) to dst (MAPPED PINNED HOST memory) with SM stores and ring the
+// doorbell in the same kernel, so the bell cannot reach the consumer before the payload's stores are visible.
+// dst must be cudaHostAllocMapped memory.
+void dense_split_stage_out(const float* src, float* dst, int64_t n, void* stream);
+void dense_split_stage_ring(const float* src, float* dst, int64_t n, uint32_t* bell, uint32_t seq, void* stream);/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
 void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
                          int n_kv, int head_dim, int max_ctx, void* stream);
 
