@@ -4030,7 +4030,11 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         const size_t w0 = wave_end, w1 = std::min(nF, wave_end + cap);
         wave_end = w1;
         rnext.store(w0);
-        const int nth = (int) std::min<size_t>(8, w1 - w0);
+        // STRATA_WAVE_THREADS (default 32, was 8): the on-demand reader's threads - small batch turns read only their
+        // routed file-tier experts here, so this is their NVMe queue depth.  s11, +272-token turn at 512K: 8 / 16 / 32
+        // threads -> batch 14.89 / 13.78 / 13.55 s (3.17 / 3.61 / 3.79 GB/s)
+        static const int wave_threads = std::getenv("STRATA_WAVE_THREADS") ? std::max(1, std::min(64, std::atoi(std::getenv("STRATA_WAVE_THREADS")))) : 32;
+        const int nth = (int) std::min<size_t>((size_t) wave_threads, w1 - w0);
         for (int k = 0; k < nth; ++k)
             readers.emplace_back([&, w1]() {
                 for (size_t q; (q = rnext.fetch_add(1)) < w1;) {

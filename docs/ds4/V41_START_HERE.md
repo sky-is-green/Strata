@@ -150,6 +150,11 @@ ee2845ca (+ serve defaults / docs).
   verify ms summed over python / prose / code: 1.0 291.3, 0.5 275.9 (old order) / 274.3 (recency), 0.7 285.1 ->
   ~-5%, at the noise floor -> default stays 1.0.  FreeToken's own rule says the same: hybrid only when CPU GEMV
   bandwidth > 2x PCIe; here ~24 GB/s (8 cores x ~3) vs 21.6.
+- **Where a small batch turn goes** (`serve: prompt phases` now prints dense / experts / logits): +272 tokens at 8K
+  context = dense 3.2 s + experts 11.6 s, and the experts are the NVMe reads of the routed file tier (34.5 GB through
+  the chunk's on-demand "wave" reader at 3.2 GB/s; the expert tier's own wall is ~1.1 s).  Wave reader threads 8 ->
+  32 (`STRATA_WAVE_THREADS`, default now 32): batch 14.9 -> 13.6 s (3.8 GB/s).  Still below the drive (~5.4 GB/s in
+  the microbench): each blob is 3 sequential span preads + a bounce memcpy, in waves of `cap` blobs - the next lever.
 - **Relay fix** (`~/AI/QuetzaCodetl/wrappers/tools/relay`, untracked file - live via ~/.local/bin/relay; skill text
   regenerated): `ask/reply/broadcast --name X` from a window with another name now gets an UNBOUND daemon instead of
   renaming the window (the session-10 gotcha).  Not committed in QuetzaCodetl (its tree has others' uncommitted work).

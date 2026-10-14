@@ -1106,6 +1106,7 @@ int main(int argc, char ** argv) {
             tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
             tail_logits.clear();
             const double tph0 = now_ms();
+            const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
@@ -1159,9 +1160,10 @@ int main(int argc, char ** argv) {
                 pp(delta);
             }
 #endif
-            std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s) + DSpark tail %d%s (cache open %.2f s, seed %.2f s)\n",
-                         delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0, bcap > 0 ? bcap_got : sp_tail,
-                         bcap > 0 ? " from the batch" : " as passes", ph_open / 1000.0, ph_tail / 1000.0);
+            std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s: dense %.2f, experts %.2f, logits %.2f) + DSpark tail %d%s "
+                         "(cache open %.2f s, seed %.2f s)\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
+                         (fd_dense - fd0[0]) / 1000.0, (fd_tier - fd0[1]) / 1000.0, (fd_logits - fd0[2]) / 1000.0,
+                         bcap > 0 ? bcap_got : sp_tail, bcap > 0 ? " from the batch" : " as passes", ph_open / 1000.0, ph_tail / 1000.0);
             if (tail_keep > 0 && ok) {   // the quality scorer's rows: req%03d.tail.f32, [tail_keep x n_vocab], last prompt row last
                 if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {
                     char nb[40];

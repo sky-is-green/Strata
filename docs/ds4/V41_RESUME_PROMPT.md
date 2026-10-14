@@ -26,7 +26,8 @@ OPEN / IDEAS (ask Mal before big ones):
    in-pass draft pruning (drop trailing draft tokens mid-pass when their unique misses are expensive - lossless,
    they are just not verified); a smarter VRAM replacement than LRU.
 2. Small turns (<= 224 new tokens) run as exact 16-token passes (~7 tok/s; +60 tokens = 8 s).
-3. Prefill floor ~15-19 s for any batch turn (NVMe-bound).
+3. Prefill floor for batch turns: +272 tokens = dense 3.2 s + experts ~10.5 s, the experts = NVMe reads of the routed
+   file tier at ~3.8 GB/s (drive ~5.4): blobs are 3 sequential span preads + bounce memcpy, in waves.
 4. Merge question: ~/AI/research/MERGE_REPORT.md (glm <-> deepseek4 closest; monorepo ~3-5 days).
 5. Relay: --name fix is live in ~/AI/QuetzaCodetl/wrappers/tools/relay (untracked); Quetza's bundled relay.ts was
    regenerated but needs a Quetza rebuild (not committed - that tree has others' uncommitted work).
