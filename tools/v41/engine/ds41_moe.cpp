@@ -3020,9 +3020,27 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             budget = (int) std::lround((double) eligible * d3_frac);
         }
         budget = std::min(budget, kMaxEnt);   // the PCIe site streams through the d_stage slots in waves
-        for (int i = 0; i < nmiss && np < budget; ++i) {
-            const int u = miss[nmiss - 1 - i];
-            if (gp.arena.ptr(layer, ue[u])) { cls[u] = PCIE; ++np; }
+        // q* (budget short of the eligible misses): the RECURRING misses cross PCIe first - missed again inside the
+        // vram_lru admission window, so the DMA also admits them to VRAM - and the one-offs go to the CPU pool
+        // (FreeToken's BY_RECENCY rule; the admission filter is our recency signal).  STRATA_TIER_QSTAR_RECENCY=0: the
+        // old order (the last-seen misses first).
+        static const bool qs_recency = !(std::getenv("STRATA_TIER_QSTAR_RECENCY") && std::getenv("STRATA_TIER_QSTAR_RECENCY")[0] == '0');
+        if (qs_recency && budget < eligible && !im.vmiss.empty() && !im.lcalls.empty()) {
+            static const int64_t win = std::getenv("STRATA_LRU_WIN") ? std::atoll(std::getenv("STRATA_LRU_WIN")) : 4;
+            const int64_t lc_next = im.lcalls[(size_t) layer] + 1;
+            for (int pass = 0; pass < 2 && np < budget; ++pass)
+                for (int i = 0; i < nmiss && np < budget; ++i) {
+                    const int u = miss[nmiss - 1 - i];
+                    if (cls[u] == PCIE || !gp.arena.ptr(layer, ue[u])) continue;
+                    const int64_t m = im.vmiss[(size_t) (layer * im.g.n_experts + ue[u])];
+                    const bool recurring = m >= 0 && lc_next - m <= win;
+                    if (recurring == (pass == 0)) { cls[u] = PCIE; ++np; }
+                }
+        } else {
+            for (int i = 0; i < nmiss && np < budget; ++i) {
+                const int u = miss[nmiss - 1 - i];
+                if (gp.arena.ptr(layer, ue[u])) { cls[u] = PCIE; ++np; }
+            }
         }
     }
     // ---- file-tier misses (in neither VRAM nor the arena) ON THE CARD: read in parallel (8 threads, split

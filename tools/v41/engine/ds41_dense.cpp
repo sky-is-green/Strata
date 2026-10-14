@@ -162,6 +162,12 @@ struct Ds41Dense::Impl {
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
     ggml_context * ictx = nullptr;
     ggml_backend_buffer_t ibuf = nullptr;
+    // ---- the NC-column tensors (state columns + their per-pass inputs) in their own context / buffer, so
+    // set_columns() can resize them: --serve keeps S columns while it decodes and grows to the prompt batch only for a
+    // layer-major batch (~0.31 MiB a column: 8192 columns = 2.6 GiB that decode gives to expert slots instead)
+    ggml_context * nctx = nullptr;
+    ggml_backend_buffer_t nbuf = nullptr;
+    int64_t NCmax = 0;
     ggml_tensor * i_emb = nullptr;        // [D, NC]
     ggml_tensor * i_pos = nullptr;        // I32 [NC]
     ggml_tensor * i_widx = nullptr;       // I32 [SWA * NC]   per query: rows of [ring | pass rows]
@@ -207,6 +213,8 @@ struct Ds41Dense::Impl {
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
     ~Impl() {
+        if (nbuf) ggml_backend_buffer_free(nbuf);
+        if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
         if (ibuf) ggml_backend_buffer_free(ibuf);
         if (sctx) ggml_free(sctx);
@@ -897,6 +905,77 @@ int64_t Ds41Dense::n_layer() const { return p_->nl; }
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
 const std::string & Ds41Dense::last_error() const { return p_->err; }
 
+// The NC-column tensors (see Impl::nctx): (re)created for `NC` columns, zeroed.  Every one is per-pass scratch (a pass
+// writes the columns it reads), so a resize between passes loses nothing.
+static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
+    if (im.nbuf) { ggml_backend_buffer_free(im.nbuf); im.nbuf = nullptr; }
+    if (im.nctx) { ggml_free(im.nctx); im.nctx = nullptr; }
+    im.NC = NC;
+    ggml_init_params cp = { ggml_tensor_overhead() * 256, nullptr, true };
+    im.nctx = ggml_init(cp);
+    ggml_context * c = im.nctx;
+    const int64_t D = im.D, HC = im.HC;
+    im.x_state = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NC);
+    im.pre_state = ggml_new_tensor_2d(c, GGML_TYPE_F32, HC, NC);
+    im.hap = ggml_new_tensor_3d(c, GGML_TYPE_F32, D, HC, NC);
+    im.post_f = ggml_new_tensor_2d(c, GGML_TYPE_F32, HC, NC);
+    im.comb_f = ggml_new_tensor_3d(c, GGML_TYPE_F32, HC, HC, NC);
+    im.shexp = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    im.o_fn = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    im.o_ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.NU, NC);
+    im.o_wts = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.NU, NC);
+    im.routed = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    im.cand = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.CB, NC);
+    for (auto & L : im.ly)
+        if (L.idx_src) { L.sel = ggml_new_tensor_2d(c, GGML_TYPE_I32, im.ITOP, NC); L.selm = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.ITOP, NC); }
+    im.i_emb = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
+    im.i_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, NC);
+    im.i_widx = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.SWA * NC);
+    im.i_wmask = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.SWA, NC);
+    im.i_wslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, im.RAW));
+    for (int r = 1; r <= 2; ++r) {
+        im.i_nvis[r] = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
+        im.i_cslot[r] = ggml_new_tensor_1d(c, GGML_TYPE_I32, NC);
+        im.i_cpos[r] = ggml_new_tensor_1d(c, GGML_TYPE_I32, NC);
+    }
+    im.i_sidx = ggml_new_tensor_1d(c, GGML_TYPE_I32, 2 * NC);
+    im.i_sslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, 2));
+    im.i_lastblk = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
+    for (int e = 0; e < 2; ++e) im.i_eng[e] = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.EC * im.ED, NC);
+    im.nbuf = ggml_backend_alloc_ctx_tensors(c, im.backend);
+    if (!im.nbuf) { err = "cannot allocate " + std::to_string(NC) + " state columns"; return false; }
+    ggml_backend_buffer_clear(im.nbuf, 0);
+    return true;
+}
+
+bool Ds41Dense::set_columns(int nc) {
+    Impl & im = *p_;
+    const int64_t want = std::max<int64_t>(im.S, std::min<int64_t>(nc, im.NCmax));
+    if (want == im.NC) return true;
+    ggml_backend_synchronize(im.backend);
+    // every cached graph holds views of the old columns (their addresses are fixed at the first allocation), and the
+    // allocators remember graphs by address - all of it goes, and is rebuilt lazily for the new tensors
+    im.graphs.clear();
+    im.logits_out.clear();
+    im.predict_out.clear();
+    im.predict_out_n.clear();
+    im.fpredict_out.clear();
+    im.fpredict_ahead.clear();
+    for (Allo * al : { &im.allo_dec, &im.allo_pass }) {
+        if (al->a) ggml_gallocr_free(al->a);
+        al->a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
+        al->graph_epoch.clear();
+        al->compute_bufs.clear();
+        ++al->epoch;
+    }
+    if (im.gctx) ggml_free(im.gctx);
+    ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
+    im.gctx = ggml_init(gp);
+    return alloc_cols(im, want, im.err);
+}
+
+int Ds41Dense::columns() const { return (int) p_->NC; }
+
 bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std::string & err) {
     Impl & im = *p_;
     im.cfg = cfg;
@@ -922,7 +1001,8 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     if (const char * e = std::getenv("DS41_TEST_TOPK")) im.ITOP = std::atoi(e);
     if (const char * e = std::getenv("DS41_TEST_CAND_BLOCKS")) im.CB = std::atoi(e);
     im.S = std::max(1, cfg.max_pass);                       // the dense sub-batch size of the layer-major walk
-    im.NC = std::max<int64_t>(im.S, std::max(1, cfg.prompt_batch));   // state columns: the whole prompt batch, or the pass
+    im.NCmax = std::max<int64_t>(im.S, std::max(1, cfg.prompt_batch));   // state columns: the whole prompt batch, or the pass
+    im.NC = cfg.elastic_cols ? im.S : im.NCmax;                           // elastic: S until a batch asks for more
     // the window ring: every row is gathered BY POSITION (slot = pos % RAW), so its size never changes results.  DSpark
     // verify passes write up to k rejected draft positions; a rejected q evicts q - RAW, which a later query q' (>= the
     // last accepted position, re-fed) needs iff q - RAW >= q' - SWA + 1  ->  safe for k <= RAW - SWA = 16 drafts.
@@ -969,18 +1049,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
             default: return ggml_new_tensor_3d(im.sctx, t, d[0], d[1], d[2]);
         }
     };
-    const int64_t D = im.D, HC = im.HC, NC = im.NC;
-    im.x_state = T(GGML_TYPE_F32, { D, HC, NC });
-    im.pre_state = T(GGML_TYPE_F32, { HC, NC });
-    im.hap = T(GGML_TYPE_F32, { D, HC, NC });
-    im.post_f = T(GGML_TYPE_F32, { HC, NC });
-    im.comb_f = T(GGML_TYPE_F32, { HC, HC, NC });
-    im.shexp = T(GGML_TYPE_F32, { D, NC });
-    im.o_fn = T(GGML_TYPE_F32, { D, NC });
-    im.o_ids = T(GGML_TYPE_I32, { im.NU, NC });
-    im.o_wts = T(GGML_TYPE_F32, { im.NU, NC });
-    im.routed = T(GGML_TYPE_F32, { D, NC });
-    im.cand = T(GGML_TYPE_I32, { im.CB, NC });
+    const int64_t D = im.D, NCM = im.NCmax;
     for (int64_t l = 0; l < im.nl; ++l) {
         auto & L = im.ly[(size_t) l];
         L.raw = T(kvt, { im.DH, im.RAW });
@@ -1000,7 +1069,6 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
                 L.st_sc_snap = T(GGML_TYPE_F32, { im.DH, 2 });
             }
         }
-        if (L.idx_src) { L.sel = T(GGML_TYPE_I32, { im.ITOP, NC }); L.selm = T(GGML_TYPE_F32, { im.ITOP, NC }); }
     }
     im.sbuf = ggml_backend_alloc_ctx_tensors(im.sctx, im.backend);
     if (!im.sbuf) { err = "cannot allocate the decode state"; return false; }
@@ -1012,16 +1080,6 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
     im.ictx = ggml_init(ipp);
     auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) { return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2); };
-    im.i_emb = I(GGML_TYPE_F32, D, NC);
-    im.i_pos = I(GGML_TYPE_I32, NC);
-    im.i_widx = I(GGML_TYPE_I32, im.SWA * NC);
-    im.i_wmask = I(GGML_TYPE_F32, im.SWA, NC);
-    im.i_wslot = I(GGML_TYPE_I32, std::min<int64_t>(NC, im.RAW));
-    for (int r = 1; r <= 2; ++r) { im.i_nvis[r] = I(GGML_TYPE_F32, NC); im.i_cslot[r] = I(GGML_TYPE_I32, NC); im.i_cpos[r] = I(GGML_TYPE_I32, NC); }
-    im.i_sidx = I(GGML_TYPE_I32, 2 * NC);
-    im.i_sslot = I(GGML_TYPE_I32, std::min<int64_t>(NC, 2));
-    im.i_lastblk = I(GGML_TYPE_F32, NC);
-    for (int e = 0; e < 2; ++e) im.i_eng[e] = I(GGML_TYPE_F32, im.EC * im.ED, NC);
     im.neg_ramp = I(GGML_TYPE_F32, im.cmax[1] + 1);
     im.blk_ramp = I(GGML_TYPE_F32, im.cmax[1] / im.CBS + 2);
     im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
@@ -1039,13 +1097,15 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     im.gctx = ggml_init(gp);
     im.allo_dec.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
-    im.host_fn.resize((size_t) (D * NC));
+    if (!alloc_cols(im, im.NC, err)) return false;
+    // the host mirrors are sized for the largest batch once (pinned registrations must not move)
+    im.host_fn.resize((size_t) (D * NCM));
 #ifdef DS41_HAVE_CUDA
     // pinned: the fn rows go device -> host -> the tier's device input every layer (pageable copies ran at ~2 GB/s)
     if (!im.cpu && !im.host_fn.empty()) ggml_backend_cuda_register_host_buffer(im.host_fn.data(), im.host_fn.size() * 4);
 #endif
-    im.host_ids.resize((size_t) (im.NU * NC));
-    im.host_wts.resize((size_t) (im.NU * NC));
+    im.host_ids.resize((size_t) (im.NU * NCM));
+    im.host_wts.resize((size_t) (im.NU * NCM));
 #ifdef DS41_HAVE_CUDA
     // pinned too: attn_router reads fn / ids / wts back with three async copies and one sync (truly async only from
     // pinned memory)

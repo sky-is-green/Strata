@@ -53,6 +53,9 @@ struct Ds41DenseConfig {
     /// grids exactly (e2m1 x E4M3 per 16 / x 2^k per 32), packed bit for bit by the vendored ggml-cuda's set_rows
     /// (cpy-utils.cuh *_ds41_block): 4.5 / 4.25 bits a value instead of BF16's 16 - ~3.5x less KV VRAM at long ctx.
     bool    kv_fp4 = false;
+    /// --serve: start with max_pass (S) state columns and let set_columns() grow them for a layer-major batch and give
+    /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
+    bool    elastic_cols = false;
 };
 
 class Ds41Dense {
@@ -149,6 +152,10 @@ public:
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns
     /// after finish_span (the serve DSpark seed reads its main_hidden there instead of re-running the tail as passes).
     bool read_state_cols(int c0, int n, std::vector<float> & x);
+    /// Resize the state columns to max(S, min(nc, prompt_batch)) between passes (drops every cached graph); columns()
+    /// is the current count.  A no-op when unchanged.
+    bool set_columns(int nc);
+    int columns() const;
     /// Gate tap: an index source layer's top-k rows of the current pass (n * K ints, token-major; K = min(cap, top-k))
     /// and their visibility mask; empty for other layers.
     bool read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K);

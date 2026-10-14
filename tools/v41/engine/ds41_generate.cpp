@@ -268,6 +268,11 @@ int main(int argc, char ** argv) {
     const int S = a.prefill_chunk > 0 ? a.prefill_chunk : (a.prompt_batch > 0 ? 512 : 1);
     dc.max_pass = S;
     dc.prompt_batch = PB;
+    // --serve: elastic state columns (STRATA_ELASTIC_COLS=0 = the fixed prompt_batch columns): decode keeps S columns and
+    // the ~0.31 MiB a column of a big prompt batch (2.6 GiB at 8192) goes to VRAM expert slots; a layer-major batch
+    // grows them (the VRAM cache is released for it anyway) and gives them back.  s11: 2.6 GiB of slots = 10-20% of a
+    // verify pass (one-shot, margin 1.0 / 2.3 / 3.6: python 131 / 136 / 145 ms, code 89 / 93 / 107 ms).
+    dc.elastic_cols = a.serve && PB > 1 && !(std::getenv("STRATA_ELASTIC_COLS") && std::getenv("STRATA_ELASTIC_COLS")[0] == '0');
     // encoder-only prompt prefill (enc-skip): tokens before the last `enc_replay` need their layers past layer 20 only
     // through the per-layer 128-token window, so for a long prompt they can stop after the KV-writing part of layer
     // 20 (the layer-major batch path only; the chunk path has no per-layer column split, --ppl/--dump-logits need
@@ -460,7 +465,8 @@ int main(int argc, char ** argv) {
     long long fp_miss[kFP + 1] = {0}, fp_hit[kFP + 1][3] = {{0}}, fp_cand[kFP + 1][3] = {{0}};
     // decode: the tier sums the routed experts on the card straight into the dense half's routed tensor (same bits as
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
-    float * const rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
+    // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
+    float * rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
     auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
@@ -800,6 +806,10 @@ int main(int argc, char ** argv) {
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
                 }
                 double t0 = now_ms();
+                if (B > dense.columns()) {
+                    if (!dense.set_columns(B)) { ferr = dense.last_error(); return false; }
+                    if (rdev1) rdev1 = dense.routed_dev();
+                }
                 if (!dense.begin_batch(ids + c0, B, pos0 + c0)) { ferr = dense.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
@@ -917,6 +927,10 @@ int main(int argc, char ** argv) {
                 c0 += m;
             }
             progress(c0);
+        }
+        if (dc.elastic_cols) {   // back to S columns
+            if (!dense.set_columns(0)) { ferr = dense.last_error(); return false; }
+            if (rdev1) rdev1 = dense.routed_dev();
         }
         tier.release_chunk();
         return true;
