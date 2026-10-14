@@ -110,6 +110,29 @@ __global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __r
     for (int64_t c = lane; c < cols; c += 32) r[c] = (w ? r[c] * w[c] : r[c]) * inv;
 }
 
+// The dense decode's q path in one launch: `dense_split_q` (the first head_dim of every [q | gate] row) followed
+// by rms_norm_weighted over the copy.  It lives HERE, beside the kernel it fuses, because elementwise.cu is
+// compiled with -ffp-contract=off on HIP (see CMakeLists): the same source in dense_kernels.cu lowered `rsqrtf`
+// differently and changed the token stream, which `qrms_test` showed as one row's worth of 1-ulp differences.
+// Warp 0 runs rms_norm_weighted_kernel's exact reduction; all four warps write `(src[c] * w[c]) * inv`.
+__global__ void split_q_rms_kernel(const float* __restrict__ q_full, const float* __restrict__ w,
+                                   float* __restrict__ q, int head_dim, float eps) {
+    const int row = blockIdx.x;
+    const float* src = q_full + (size_t) row * 2 * head_dim;
+    float* dst = q + (size_t) row * head_dim;
+    __shared__ float sinv;
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x & 31;
+        float acc = 0.0f;
+        for (int c = lane; c < head_dim; c += 32) acc += src[c] * src[c];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) sinv = rsqrtf(acc / (float) head_dim + eps);
+    }
+    __syncthreads();
+    const float inv = sinv;
+    for (int c = threadIdx.x; c < head_dim; c += blockDim.x) dst[c] = (src[c] * w[c]) * inv;
+}
+
 void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
     const cudaError_t e = cudaDeviceSynchronize();
@@ -456,6 +479,17 @@ void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, flo
     rms_norm_weighted_kernel<<<grid, warps_per_block * 32, 0, (cudaStream_t) stream>>>(x, w, rows, cols, eps);
     check_launch("rms_norm_weighted");
     sync_if_needed(stream, "rms_norm_weighted");
+}
+
+void dense_split_q_rms(const float* q_full, const float* w, float* q, int rows, int head_dim, float eps, void* stream) {
+    if (rows < 1) return;
+    if (head_dim < 32 || head_dim % 32 != 0) {
+        std::fprintf(stderr, "dense_split_q_rms: head_dim must be a multiple of 32\n");
+        std::exit(1);
+    }
+    split_q_rms_kernel<<<rows, 128, 0, (cudaStream_t) stream>>>(q_full, w, q, head_dim, eps);
+    check_launch("dense_split_q_rms");
+    sync_if_needed(stream, "dense_split_q_rms");
 }
 
 }  // namespace strata::kernels

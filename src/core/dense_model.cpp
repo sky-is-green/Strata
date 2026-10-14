@@ -741,17 +741,21 @@ struct DenseModel::Impl {
 void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s) {
     const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
     const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
-    quantize(xn, E, n, s);
-    if (L.ab_quant) {                               // the scratch still holds xn: nothing quantized in between
+    if (L.ab_quant) {                               // the scratch holds q8_1(xn) for the two quantized projections
+        quantize(xn, E, n, s);
         gemv(L.alpha_q, alpha, n, s);
         gemv(L.beta_q, beta, n, s);
     } else {
+        // The file stores alpha/beta as floats: the pair reads `xn` itself, and the rotation below overwrites
+        // q8_1 -- quantizing xn first (as this used to) was a dead launch on every GDN layer of such a file.
         PScope ps(&prof, Prof::F32ROW, s);
         dense_gemv_f32_rows_pair(L.alpha_w, L.beta_w, xn, alpha, beta, E, VH, n, s);
     }
     // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not
     if (L.rot & (ROT_QKV | ROT_Z)) {
         fwht_quantize(xn, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
+    } else if (!L.ab_quant) {
+        quantize(xn, E, n, s);                      // not folded: the qkv/z GEMVs' activation is q8_1(xn)
     }
     gemv(L.qkv, qkv, n, s);
     gemv(L.z, z, n, s);
@@ -800,8 +804,7 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     // columns at once: the strided copy that splits q from its output gate, the per-head norms, RoPE and the KV
     // append are one launch each instead of one per column.  The attention stays the split-K decode kernel, which
     // parallelises over the cache - the one part that wants the columns kept apart.
-    dense_split_q(q_full, qcur, n * H, D, s);
-    rms_norm_weighted(qcur, qn, n * H, D, c.rms_eps, s);
+    dense_split_q_rms(q_full, qn, qcur, n * H, D, c.rms_eps, s);
     rms_norm_weighted(kcur, kn, n * HK, D, c.rms_eps, s);
     // The position of a row is its column, computed inside the rope launch (rows / n_head for q, rows / n_kv for
     // k): no positions buffer, no two extra launches.  The prompt path keeps the explicit buffer.
@@ -855,15 +858,20 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     if (trb) trace_vec("ffn_g", -1, cur_layer, "single", ffn_g, c.n_ff, s);
     {
         PScope ps(&prof, Prof::SWIGLU, s);
-        dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
+        // swiglu + (the rotation) + the q8_1 the down GEMV reads, in one launch; the trace's h/rot rows come
+        // back through h_out/rot_out.
+        if (rot & ROT_FFN_DOWN)
+            dense_swiglu_quantize_rows(ffn_g, ffn_u, q8_1, ham_signs(c.n_ff), c.n_ff, n, trb ? ffn_h : nullptr,
+                                       trb ? rot_scratch : nullptr, s);
+        else if (c.n_ff % 1024 == 0)
+            dense_swiglu_quantize_rows(ffn_g, ffn_u, q8_1, nullptr, c.n_ff, n, trb ? ffn_h : nullptr, nullptr, s);
+        else {
+            dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
+            quantize(ffn_h, c.n_ff, n, s);
+        }
     }
     if (trb) trace_vec("ffn_h", -1, cur_layer, "single", ffn_h, c.n_ff, s);
-    if (rot & ROT_FFN_DOWN) {
-        fwht_quantize(ffn_h, c.n_ff, n, ham_signs(c.n_ff), trb ? rot_scratch : nullptr, 0, 0, 0, s);
-        if (trb) trace_vec("ffn_hrot", -1, cur_layer, "single", rot_scratch, c.n_ff, s);
-    } else {
-        quantize(ffn_h, c.n_ff, n, s);
-    }
+    if (trb && (rot & ROT_FFN_DOWN)) trace_vec("ffn_hrot", -1, cur_layer, "single", rot_scratch, c.n_ff, s);
     gemv(d, mix, n, s);
     if (trb) trace_vec("ffn_mix", -1, cur_layer, "single", mix, E, s);
     if (trb && n > 1) trace_vec("ffn_mix_c1", -1, cur_layer, "single", mix + E, E, s);

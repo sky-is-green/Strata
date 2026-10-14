@@ -81,6 +81,11 @@ void silu_inplace(float* x, int64_t n, void* stream);
 /// which); this one does not, and the same `sqrt(cols)`-sized argument applies to getting it wrong.
 void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream);
 
+/// dense_split_q + rms_norm_weighted in one launch, bit-identical to the pair (it lives in this file because the
+/// fused kernel has to compile under the same flags as the kernel it fuses): q_full is [rows, 2*head_dim], q is
+/// [rows, head_dim] and receives `(q_full[r, c] * w[c]) * inv`.
+void dense_split_q_rms(const float* q_full, const float* w, float* q, int rows, int head_dim, float eps, void* stream);
+
 /// *seq = v in MAPPED PINNED memory - THE DOORBELL.  A KERNEL and not cudaEventRecord, because round 199
 /// found that an event record inside a capture is SILENTLY DROPPED while a kernel is captured normally, and
 /// round 209 measured the host seeing this one's result 0.050 ms into a 39.8 ms graph.

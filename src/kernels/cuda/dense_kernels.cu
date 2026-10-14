@@ -254,6 +254,48 @@ __global__ void fwht_quant_kernel(const float* __restrict__ x, Q81Twin* __restri
     if (lane == 0) dst->ds = q8_1_ds(d, sum);
 }
 
+// dense_swiglu + (the folded-basis rotation) + native_quantize_q8_1 in one launch.  One 1024-thread block per
+// (row, 1024-block) computes swiglu_kernel's own expression into shared memory, optionally runs
+// fwht1024_kernel's butterfly, and quantizes the 32 q8_1 blocks with fwht_quant_kernel's warp calls; `h_out`
+// and `rot_out` (both optional) keep the trace's intermediate rows alive.  Bit-identical to the pair/triple.
+__global__ void swiglu_quant_kernel(const float* __restrict__ g, const float* __restrict__ u,
+                                    Q81Twin* __restrict__ y, const float* __restrict__ signs, int width,
+                                    float* __restrict__ h_out, float* __restrict__ rot_out) {
+    __shared__ float buf[1024];
+    const int t = threadIdx.x;
+    const int blk = blockIdx.x, row = blockIdx.y;
+    const size_t j = (size_t) blk * 1024 + t;
+    const size_t i = (size_t) row * width + j;
+    const float a = g[i];
+    float v = (a / (1.0f + __expf(-a))) * u[i];
+    if (h_out) h_out[i] = v;
+    float xi = v;
+    if (signs) {
+        v *= (1.0f / 32.0f);
+        v *= signs[j];
+        buf[t] = v;
+        for (int len = 1; len < 1024; len <<= 1) {
+            __syncthreads();
+            const float s = buf[t], b = buf[t ^ len];
+            __syncthreads();
+            buf[t] = (t & len) ? (b - s) : (s + b);
+        }
+        xi = buf[t];
+        if (rot_out) rot_out[i] = xi;
+    }
+    const int warp = t >> 5, lane = t & 31;
+    float amax = fabsf(xi);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    float sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = q8_1_finite(amax / 127.0f);
+    Q81Twin* dst = y + (size_t) row * (width / 32) + blk * 32 + warp;
+    dst->qs[lane] = q8_1_quant(xi, d, amax);
+    if (lane == 0) dst->ds = q8_1_ds(d, sum);
+}
+
 // [hd][nk][rep] -> [hd][rep][nk] along the feature axis of every row (the source index of destination j)
 __global__ void permute_gdn_v_kernel(const float* __restrict__ x, float* __restrict__ y, int width, int hd, int nk, int rep) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1366,6 +1408,18 @@ void dense_fwht_rows(const float* x, float* y, const float* signs, int width, in
     const dim3 grid((unsigned) (width / 1024), (unsigned) rows);
     fwht1024_kernel<<<grid, 1024, 0, (cudaStream_t) stream>>>(x, y, signs, width, inverse ? 1 : 0);
     check("dense_fwht_rows");
+}
+
+void dense_swiglu_quantize_rows(const float* gate, const float* up, void* q8_out, const float* signs, int width,
+                                int rows, float* h_out, float* rot_out, void* stream) {
+    if (rows < 1) return;
+    if (!q8_out) throw std::runtime_error("dense_swiglu_quantize_rows: no q8_1 output");
+    if (width <= 0 || width % 1024 != 0)
+        throw std::runtime_error("dense_swiglu_quantize_rows: width must be a multiple of 1024");
+    const dim3 grid((unsigned) (width / 1024), (unsigned) rows);
+    swiglu_quant_kernel<<<grid, 1024, 0, (cudaStream_t) stream>>>(gate, up, (Q81Twin*) q8_out, signs, width, h_out,
+                                                                 rot_out);
+    check("dense_swiglu_quantize_rows");
 }
 
 void dense_fwht_quantize_rows(const float* x, void* q8_out, float* rot_out, const float* signs, int width, int rows,

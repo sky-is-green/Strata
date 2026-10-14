@@ -38,6 +38,12 @@ void dense_argmax_prob(const float* logits, int n, int* out_id, float* out_p, vo
 /// out[i] = silu(gate[i]) * up[i]
 void dense_swiglu(const float* gate, const float* up, float* out, int64_t n, void* stream);
 
+/// dense_swiglu + (dense_fwht_rows when `signs` is given) + native_quantize_q8_1 in one launch, bit-identical to
+/// the triple: one 1024-thread block per (row, 1024-block).  width must be a multiple of 1024; `h_out` and
+/// `rot_out` (optional) receive the raw and rotated rows for the FFN trace.
+void dense_swiglu_quantize_rows(const float* gate, const float* up, void* q8_out, const float* signs, int width,
+                                int rows, float* h_out, float* rot_out, void* stream);
+
 /// y[r] = sum_i W[r * n_in + i] * x[i]           W is a GGUF matrix stored as F32: ne0 = n_in is the contiguous axis
 void dense_gemv_f32(const float* W, const float* x, float* y, int n_in, int n_out, void* stream);
 
