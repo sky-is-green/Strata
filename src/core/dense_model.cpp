@@ -780,12 +780,10 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     dense_split_q(q_full, qcur, n * H, D, s);
     rms_norm_weighted(qcur, qn, n * H, D, c.rms_eps, s);
     rms_norm_weighted(kcur, kn, n * HK, D, c.rms_eps, s);
-    // The position of a row is its column, so the table is written per tensor: rows / n_head for q, rows / n_kv for
-    // k.  Two writes, exactly as the prompt path does, into a buffer sized for the wider of the two.
-    dense_positions_i32(pos_dev, n * H, H, pos0, s);
-    native_rope_apply(qcur, qcur, n * H, D, c.n_rot, rope, pos_dev, s);
-    dense_positions_i32(pos_dev, n * HK, HK, pos0, s);
-    native_rope_apply(kcur, kcur, n * HK, D, c.n_rot, rope, pos_dev, s);
+    // The position of a row is its column, computed inside the rope launch (rows / n_head for q, rows / n_kv for
+    // k): no positions buffer, no two extra launches.  The prompt path keeps the explicit buffer.
+    native_rope_apply_rows(qcur, qcur, n * H, D, c.n_rot, rope, H, pos0, s);
+    native_rope_apply_rows(kcur, kcur, n * HK, D, c.n_rot, rope, HK, pos0, s);
     dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
     for (int j = 0; j < n; ++j) {
         dense_attn_decode_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch,
