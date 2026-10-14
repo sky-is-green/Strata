@@ -92,6 +92,32 @@ int main() {
         check(nm, std::memcmp(&s1, &s2, 4) == 0);
         std::snprintf(nm, sizeof nm, "n=%d dot == float reference (rel %.2e)", n, std::fabs(s1 - sref) / (std::fabs(sref) + 1e-12));
         check(nm, std::fabs(s1 - sref) <= 1e-5 * (std::fabs(sref) + 1e-3));
+        // ptq1_0_rows_q8_0 (the pool's multi-token rows): 8 tokens x 6 rows of this n, each == the scalar dot within
+        // fp32 reassociation (its sub-block sums are the same exact int32s; only the float accumulation order differs)
+        {
+            const int R = 6, NT = 8;
+            std::vector<uint8_t> rows(R * ptq1_0_row_bytes(n));
+            for (int r = 0; r < R; ++r) {
+                std::vector<float> wr(n); for (auto& v : wr) v = nd(rng) * (r == 3 ? 1e-3f : 1.f);
+                ptq1_0_quantize_ref(wr.data(), rows.data() + r * ptq1_0_row_bytes(n), n);
+            }
+            std::vector<std::vector<Q8>> qa(NT, q);
+            for (int t = 1; t < NT; ++t) for (auto& b : qa[t]) for (auto& v : b.qs) v = (int8_t) std::max(-127, std::min(127, (int) v + (int) ud(rng) * t));
+            std::vector<std::vector<float>> o(NT, std::vector<float>(R));
+            float* op[NT]; const void* ap[NT];
+            for (int t = 0; t < NT; ++t) { op[t] = o[t].data(); ap[t] = qa[t].data(); }
+            bool ok = true; double worst = 0;
+            for (int nt = 1; nt <= NT; ++nt) {
+                ptq1_0_rows_q8_0(rows.data(), ptq1_0_row_bytes(n), n, ap, nt, op, 0, R);
+                for (int t = 0; t < nt; ++t) for (int r = 0; r < R; ++r) {
+                    float ref; ptq1_0_vec_dot_q8_0_scalar(n, &ref, rows.data() + r * ptq1_0_row_bytes(n), qa[t].data());
+                    const double e = std::fabs(ref - o[t][r]) / (std::fabs(ref) + 1e-2);
+                    worst = std::max(worst, e); ok &= e <= 1e-3;
+                }
+            }
+            std::snprintf(nm, sizeof nm, "n=%d rows kernel (1-8 tokens) == scalar dot (worst rel %.2e)", n, worst);
+            check(nm, ok);
+        }
     }
     // mutation check: a wrong trit order must be caught by the layout test
     {

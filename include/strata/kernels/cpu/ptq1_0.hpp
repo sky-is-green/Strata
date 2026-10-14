@@ -38,5 +38,10 @@ void ptq1_0_dequant(const uint8_t* src, float* y, int64_t n);
 void ptq1_0_vec_dot_q8_0(int n, float* s, size_t bs, const void* vx, size_t bx, const void* vy, size_t by, int nrc);
 /// The scalar form of the same (the parity reference for the AVX2 one).
 void ptq1_0_vec_dot_q8_0_scalar(int n, float* s, const void* vx, const void* vy);
+/// Rows [r0, r1) of a PTQ1_0 matrix (row stride `row_bytes`, n weights a row) against nt Q8_0 rows (nt <= 8):
+/// out[t][r] = row r . act[t].  The AVX2 path decodes each 128-weight block ONCE for all tokens (every digit in SIMD)
+/// and keeps each 32-weight sub-block's sum exact in int32 (as the scalar dot) - 3.9x the per-token dot at one token,
+/// 6-8x at 2-3 (s11 2026-10-15, one Zen 3 core).  Without AVX2: the per-token dot.
+void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1);
 
 }  // namespace strata::kernels::cpu

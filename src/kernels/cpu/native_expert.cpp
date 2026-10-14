@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <vector>
 #include <mutex>
 
 namespace strata::kernels::cpu {
@@ -192,6 +193,28 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             return;
         }
     }
+    // PTQ1_0 (ternary) gate/up: ptq1_0_rows_q8_0 decodes each block once for every token (3.9x the per-token dot at one
+    // token, 6-8x at 2-3; s11 2026-10-15).  STRATA_NO_PTQ1_ROWS=1 = the per-token dot below.
+    static const bool ptq_rows = std::getenv("STRATA_NO_PTQ1_ROWS") == nullptr;
+    if (ptq_rows && f.gu_type == kPtq1Type && !mixed && r1 > r0) {
+        const int R = r1 - r0, n = (int) f.n_embd;
+        thread_local std::vector<float> gb, ub;
+        gb.resize((size_t) nt * (size_t) R);
+        ub.resize((size_t) nt * (size_t) R);
+        float* gp[MAXT];
+        float* upp[MAXT];
+        for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + (size_t) t * R; upp[t] = ub.data() + (size_t) t * R; }
+        ptq1_0_rows_q8_0(blob + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, gp, 0, R);
+        ptq1_0_rows_q8_0(blob + f.up_off + (size_t) r0 * f.gu_row, f.gu_row, n, act, nt, upp, 0, R);
+        const float lim = f.swiglu_limit;
+        for (int t = 0; t < nt; ++t)
+            for (int i = 0; i < R; ++i) {
+                const float g = std::min(gp[t][i], lim);       // DeepSeek-V4's clamp, as below
+                const float u = std::min(std::max(upp[t][i], -lim), lim);
+                ff[t][r0 + i] = (g / (1.f + std::exp(-g))) * u;
+            }
+        return;
+    }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
     const ggml_vec_dot_t udot = mixed ? traits(f.up_type)->vec_dot : dot;
     const size_t urow = mixed ? f.up_row : f.gu_row;
@@ -227,6 +250,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
     if (cpu_avx2_ok() && nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    static const bool ptq_rows = std::getenv("STRATA_NO_PTQ1_ROWS") == nullptr;
+    if (ptq_rows && f.d_type == kPtq1Type) {   // PTQ1_0 down: as the gate/up rows above
+        ptq1_0_rows_q8_0(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
