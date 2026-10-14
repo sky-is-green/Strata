@@ -251,6 +251,63 @@ __global__ void k_add(float* x, const float* y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] += y[i];
 }
+
+/// The GDN layer's alpha/beta and the conv in one launch (T = 1): k_gdn_ab's rows with four warps a block (the
+/// same per-row float4 dot and XOR tree - only which block computes a row changes), then k_conv_seq's blocks
+/// (its body unchanged, the block index shifted).  Bitwise the two kernels; the caller runs them separately for
+/// every other T.
+__global__ void __launch_bounds__(128) k_gdn_ab_conv(const float* Wa, const float* Wb, const float* x, const float* dt,
+                                                     const float* ssm_a, float* alpha, float* beta, int n_in, int HV,
+                                                     float* hist, const float* qkv, const float* w, float* h, int C,
+                                                     int qk_heads, float eps, int T, bool write, int ab_blocks) {
+    if ((int) blockIdx.x < ab_blocks) {
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        const int o = (int) blockIdx.x * 4 + warp;
+        if (o >= 2 * HV) return;
+        const bool isb = o >= HV;
+        const int r = isb ? o - HV : o;
+        const float4* wr = (const float4*) ((isb ? Wb : Wa) + (size_t) r * n_in);
+        const float4* xr = (const float4*) (x + (size_t) blockIdx.y * n_in);
+        float acc = 0.f;
+        for (int i = lane; i < n_in / 4; i += 32) {
+            const float4 a = wr[i], b = xr[i];
+            acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane != 0) return;
+        if (isb) beta[(size_t) blockIdx.y * HV + r] = sigm(acc);
+        else alpha[(size_t) blockIdx.y * HV + r] = softplus(acc + dt[r]) * ssm_a[r];
+        return;
+    }
+    __shared__ float part[4];
+    const int bx = (int) blockIdx.x - ab_blocks;
+    const int c = bx * 128 + threadIdx.x;
+    float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2];
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    const bool qk = bx < qk_heads;
+    for (int t = 0; t < T; ++t) {
+        const float xv = qkv[(size_t) t * C + c];
+        const float sum = v0 * w0 + v1 * w1 + v2 * w2 + xv * w3;
+        v0 = v1;
+        v1 = v2;
+        v2 = xv;
+        float y = sum / (1.0f + __expf(-sum));
+        if (qk) {
+            float sq = y * y;
+            for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+            if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
+            __syncthreads();
+            const float ss = part[0] + part[1] + part[2] + part[3];
+            __syncthreads();
+            y *= rsqrtf(ss + eps);
+        }
+        h[(size_t) t * C + c] = y;
+    }
+    if (!write) return;   // a verify window: the history is commit()'s to move
+    hist[c * 3] = v0;
+    hist[c * 3 + 1] = v1;
+    hist[c * 3 + 2] = v2;
+}
 __global__ void k_swiglu(const float* g, const float* u, float* h, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) h[i] = silu(g[i]) * u[i];
@@ -1562,7 +1619,16 @@ struct Engine {
             if (!xq_hot) prep(h, N, T, xq);
             mm_pair(L.qkv, qkv_b, L.zg, z, T);
             tick(0, false);
-            tick(1, true);   // alpha/beta (or the attention prep)
+            tick(1, true);   // alpha/beta and the conv in one launch at one row
+            if (T == 1) {
+                const int ab_blocks = (2 * HV + 3) / 4;
+                k_gdn_ab_conv<<<ab_blocks + C / 128, 128, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N, HV,
+                                                                   conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, 1,
+                                                                   !verify, ab_blocks);
+                tick(1, false);
+                tick(2, true);   // the conv rides in class 1's launch at one row
+                tick(2, false);
+            } else {
             if (T <= kGemmT) {
                 k_gdn_ab<<<dim3(rows8(2 * HV), T), kThreads, 0, st>>>(L.alpha, L.beta, h, L.dt, L.ssm_a, al_b, be_b, N,
                                                                       HV);
@@ -1580,6 +1646,7 @@ struct Engine {
             // flipped near-tie later; with them the KL is the same, 1.05x / 0.81x the floor, but MTP would not be exact.)
             k_conv_seq<<<C / 128, 128, 0, st>>>(conv[li], qkv_b, L.conv, hc_b, C, 2 * HK, m->eps, T, !verify);
             tick(2, false);
+            }
             tick(3, true);   // the delta rule and the norm
             if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
                 k_gdn_seq_cols<<<dim3(HV, kGdnColGroups), dim3(128 / kGdnColGroups, 16), 0, st>>>(S[li], hc_b, C, al_b,
