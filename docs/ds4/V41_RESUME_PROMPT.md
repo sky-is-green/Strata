@@ -28,13 +28,23 @@ STATE (RTX 4090 + 90 GB RAM), all committed + pushed, production build-ds4-gpu r
   python verify pass) and the dense half.
 - **The 512K turn bench's run-to-run spread is 1.5-4.3%** (same config back to back; the later run is slower).  Any
   A/B needs >= 3 runs a side - a single pair produced the 64 x 16 false positive.
-- OPEN, Mal's call: delete /media/mal/NVME1TB/Models/V41-Mirror/V41-GSQ.experts.mirror (84 GiB, drive ~97% full,
-  rebuilds in 81 s).  Untried: in-pass draft pruning, a smarter VRAM replacement than LRU, the VMM refactor for the
-  prompt state's 2.6 GiB, overlapping the file reads with the dense half of the same layer.
+- Done 2026-10-15 (Mal's go): the 84 GiB mirror file is DELETED and session 11's hourly chronos nudge cron is
+  removed (pre-removal crontab at ~/.quetza-data/crontab-backup-2026-10-15.txt; re-arm before an overnight run).
 - A FOREIGN headless Chrome (agent-browser, not ours) holds a 51 MiB CUDA context, so the harnesses' gpu_busy()
   ("any compute app") never clears: gate on VRAM used instead (>= 2 GB = busy).
-- Relay: --name fix live (untracked, ~/AI/QuetzaCodetl/wrappers/tools/relay).  The hourly chronos nudge cron
-  (17 * * * * ds4-overnight-nudge.sh) is still installed - remove it if no overnight run is planned.
+- Relay: --name fix live (untracked, ~/AI/QuetzaCodetl/wrappers/tools/relay).
+
+NEXT - Mal's pick for this session, in docs/ds4/V41_START_HERE.md "### NEXT (session 13)": (1) in-pass draft
+pruning (a verify pass runs 1+depth rows and its expert bytes scale with the width - 72/91/118/135 ms for 1-4 rows;
+drop TRAILING draft rows mid-pass once their unique misses are known to be expensive: they are just not verified
+this pass, so the distribution stays exact - measure time per token, NOT tokens/pass); (2) a VRAM replacement
+policy smarter than LRU (score victims by the predicted next use the prefetch path already computes, add a
+frequency term, or a prediction-based warm set across a batch turn - the released-set warm_reseed of session 12
+showed nothing); (3) the VMM refactor for the prompt state's ~2.6 GiB (cuMemAddressReserve/Map with stable virtual
+addresses so cached graphs keep their pointers, giving the dense half's NC columns back to the expert cache: +2.6
+GiB = 10-20% of a verify pass; only worth it with a decode-side measurement, gate on bit-exactness with
+STRATA_PRESTAGE_GIB pinned).  EVERY one of these needs >= 3 runs a side - the bench's identical-config spread is
+1.5-4.3% and a single pair already produced the 64 x 16 false positive.
 
 RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes the GPU lock; never wrap it in
 flock); --serve runs NOT through memguard (engine.sh / ds41-engine.sh: flock + systemd-run scope).  Need >= 75 GB

@@ -210,8 +210,10 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
     the wave reader's own rate is ~5.3-6.2 GB/s (rb2).  Splitting a blob across two drives adds a straggler (the
     mirror's per-part service time is ~2x the PM9A1's) and buys throughput the pipeline does not want.  A second
     drive only pays if the file tier must move 2x the bytes - and even arena 32 (2x the file-tier traffic) did not.
-  - The 84 GiB mirror file is still at `/media/mal/NVME1TB/Models/V41-Mirror/V41-GSQ.experts.mirror` (the drive is
-    ~97% full).  Rebuildable in 81 s; delete it if the space is wanted.
+  - The 84 GiB mirror file was **deleted 2026-10-15** (NVME1TB 6.5 -> 91 GB free).  If it is ever wanted again:
+    `build-ds4-dspark/ds41_generate -m "/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf" --rank "/media/mal/SSD
+    NVME/AI/V41-GSQ/rank.bin" --build-mirror "/media/mal/NVME1TB/Models/V41-Mirror/V41-GSQ.experts.mirror"
+    --mirror-gib 85` (81 s; `--check-mirror` then compares it blob by blob).
 - **warm_reseed** (`release_cache` remembers the (layer, expert) that held VRAM slots, most-recently-used first; the
   next seed fills the first `STRATA_WARM_SHARE` per mille (default 500) of the slots from that list instead of the
   global rank): coded, measured, and **default OFF** (`STRATA_WARM_RESEED=1` to try it).  512K: +273 10.48 vs
@@ -243,6 +245,43 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   AFTER the batch, and their tier time is not in `fd_dense` / `fd_tier`.  A 271-token python prompt: 30.32 s wall =
   10.4 s of feed (dense 3.4 + experts 6.9 + logits 0.1) + the ~20 s tail (+ the deferred VRAM seed).  In `--serve`
   a batch turn takes that tail from the batch itself, so the serve numbers are not comparable.
+- **Housekeeping 2026-10-15** (Mal's go): the 84 GiB mirror file is deleted (see above) and session 11's hourly
+  chronos nudge cron is **removed** (`crontab -l | grep -v ds4-overnight-nudge | crontab -`; the pre-removal copy is
+  at `~/.quetza-data/crontab-backup-2026-10-15.txt`, restore with `crontab <that file>`) - re-arm it if an overnight
+  run is planned.  Also: a foreign headless Chrome (agent-browser, not ours) holds a 51 MiB CUDA context, so the
+  harnesses' `gpu_busy()` ("any compute app") never clears - gate on VRAM used (>= 2 GB = busy) or on
+  `pgrep -x ds41_generate`.
+
+### NEXT (session 13, Mal's pick 2026-10-15) - the three levers, with how to measure each
+**Bench discipline first: the 512K turn bench's run-to-run spread with an identical config is 1.5-4.3%** (session 12:
+31.51 -> 31.98 s on the same turn, and the short decodes swing 2.76 -> 3.09 s).  Every claim below needs **>= 3 runs
+a side**, alternating A/B/A/B, and both baselines quoted.  A single pair produced session 12's 64 x 16 false positive.
+1. **In-pass draft pruning (decode, keeps the output distribution exact).**  A DSpark verify pass runs 1+depth rows
+   and its expert bytes scale with the width (s11: verify ms by width 72 / 91 / 118 / 135 for 1 / 2 / 3 / 4 tokens;
+   every verified draft row costs ~20-27 ms of expert bytes).  Drop *trailing* draft rows mid-pass, once the first
+   layers' unique-miss set is known to be expensive: the dropped rows are simply not verified this pass, they stay
+   drafts and are re-fed next pass, so nothing about acceptance or sampling changes - a narrower pass, not a
+   different rule.  Where: `gpu_run_n_ex` (the verify path, `nt = 1 + depth`) - trim the row count before the
+   launches; drafting already allows any width (`STRATA_DSPARK_DEPTH` 0..5).  Measure: **time per token** (not
+   tokens/pass - a narrower pass would "win" that for free) plus accepted drafts/pass at 3 prompts x >= 3 runs;
+   report the trimmed-pass share.  Bitwise gate: `--kv-fp4` + a pinned `STRATA_PRESTAGE_GIB` (and note that the
+   greedy stream already depends on the verify width at ties, s11).
+2. **A VRAM replacement policy smarter than LRU.**  Today: per-layer LRU with a 4-call admission window
+   (`STRATA_LRU_WIN`) and a single same-class victim (`lru_victim`); the serve decode hit rate is already ~93% (222
+   of 239 routed rows a token at 512K, 1509-1946 slots).  Untried, in order of promise: (a) score victims by
+   *predicted next use* - the engine already predicts the next layers' top-k for prefetch (`Ds41Dense::predict`,
+   `--pf-b`, `spec_read`), so the same prediction can rank victims instead of recency; (b) add a frequency term so
+   one-off misses cannot evict a hot expert; (c) a *prediction*-based warm set across a batch turn (session 12's
+   warm_reseed used the released set, which is mostly recent misses, and showed nothing).  Measure: hits /
+   (hits + pcie + file) and verify ms/pass on the 4-turn bench, >= 3 runs a side.
+3. **VMM refactor for the prompt state's ~2.6 GiB.**  The layer-major prompt holds NC-sized state columns (0.31 MiB
+   a column x 8192 ~ 2.6 GiB) that decode does not need; `set_columns()` (elastic columns) resizes and drops every
+   cached graph, which is why the VRAM is not given back.  A VMM pool (cuMemAddressReserve / cuMemMap / cuMemUnmap
+   with STABLE virtual addresses, so cached graphs and tensor views keep their pointers) would let the dense half
+   and the expert cache share that VRAM: +2.6 GiB of slots is worth ~10-20% of a verify pass (measured: 13.44 /
+   12.13 / 10.83 GiB of slots -> python verify 131 / 136 / 145 ms).  Session 11 parked it because 1227 -> 1509 slots
+   showed nothing in decode - so do it only together with a decode-side measurement, and gate on bit-exactness with
+   `STRATA_PRESTAGE_GIB` pinned.
 
 ### Session 10b (2026-10-14 19:40-21:10) - DSpark IN --serve (speculative SAMPLING), crash fix UNTESTED; research
 **Read this block first.**  Mal's go 2026-10-14: (1) default x0.5 + arena-adapt + draft K=64 + arena 64 GiB, (2) DSpark
