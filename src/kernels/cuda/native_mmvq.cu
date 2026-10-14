@@ -74,6 +74,10 @@ struct Q20Block {
     half d;
     uint8_t qs[16];
 };
+struct Pq20Block {                       // PQ2_0 (Bonsai 2): 128 codes, one fp16 scale per block
+    half d;
+    uint8_t qs[32];
+};
 struct Q3KBlock {
     uint8_t hmask[32];
     uint8_t qs[64];
@@ -117,6 +121,7 @@ struct IQ4NLBlock {
 static_assert(sizeof(Q5KBlock) == 176 && alignof(Q5KBlock) == 4);
 static_assert(sizeof(Q81Block) == 36 && alignof(Q81Block) == 4);
 static_assert(sizeof(Q20Block) == 18 && alignof(Q20Block) == 2 && offsetof(Q20Block, qs) == 2);
+static_assert(sizeof(Pq20Block) == 34 && alignof(Pq20Block) == 2 && offsetof(Pq20Block, qs) == 2);
 static_assert(sizeof(Q3KBlock) == 110 && alignof(Q3KBlock) == 2 && offsetof(Q3KBlock, qs) == 32 &&
               offsetof(Q3KBlock, scales) == 96 && offsetof(Q3KBlock, d) == 108);
 static_assert(sizeof(IQ4XSBlock) == 136 && alignof(IQ4XSBlock) == 2 &&
@@ -353,6 +358,49 @@ __global__ void native_q2_0_mmvq_kernel(const Q20Block* __restrict__ w,
         tmp[i] = warp_sum(tmp[i]);
         if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
     }
+}
+
+// PQ2_0 (Bonsai 2): one 32-value chunk; the whole-block dot's inner step with the scales folded in.
+__device__ __forceinline__ float pq2_q8_chunk(const Pq20Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                              int kc) {
+    const float d2 = w->d;
+    const int16_t* qs = reinterpret_cast<const int16_t*>(w->qs) + kc * 4;
+    const int* q8 = reinterpret_cast<const int*>(x->qs);
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q = qs[j];
+        const int u = q8[j * 2];
+        const int v = q8[j * 2 + 1];
+        const int qe = __byte_perm(0x020100ff, 0x020100ff, q >> 0);
+        const int qo = __byte_perm(0x020100ff, 0x020100ff, q >> 2);
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+        sumi = STRATA_DP4A(u, qx, sumi);
+        sumi = STRATA_DP4A(v, qy, sumi);
+    }
+    const float d8 = __low2float(x->ds);
+    return d2 * d8 * sumi;
+}
+
+// PQ2_0 generic MMVQ: one warp per row, one lane per 32-value chunk, warp-shuffle reduction.  The
+// block-reduce shape measured 377 GB/s on the Bonsai shapes and this one 535 (pq2_bench, variant 1).
+__global__ void __launch_bounds__(256, 1)
+native_pq2_0_mmvq_kernel(const Pq20Block* __restrict__ w, const Q81Block* __restrict__ x,
+                         float* __restrict__ y, int n_in, int n_out) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= n_out) return;
+    const int blocks_per_row = n_in / 128;
+    float acc = 0.0f;
+    for (int b = lane; b < blocks_per_row * 4; b += 32) {
+        const Pq20Block* wb = w + (std::size_t) warp * blocks_per_row + (b >> 2);
+        const Q81Block* xb = x + (std::size_t) (b >> 2) * 4 + (b & 3);
+        acc += pq2_q8_chunk(wb, xb, b & 3);
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) y[warp] = acc;
 }
 
 // Q3_K's 110-byte stride gives alternate blocks only two-byte alignment.
@@ -2254,6 +2302,26 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     launch_check();
 }
 
+void native_pq2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 128);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    if (ncols > 1) {                              // prompt columns keep the generic multi-column path
+        iq_mmvq(142, weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        return;
+    }
+    const auto* w = static_cast<const Pq20Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const unsigned blocks = unsigned((std::size_t(n_out) + 7) / 8);
+    native_pq2_0_mmvq_kernel<<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+    launch_check();
+}
+
 void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 64);
@@ -2556,7 +2624,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 142: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 142: native_pq2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");

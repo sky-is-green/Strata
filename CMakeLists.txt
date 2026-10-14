@@ -772,6 +772,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(iq_parity src/kernels/iq_parity.cpp)
   target_include_directories(iq_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+
+  # the PQ2_0 GEMV bandwidth micro-benchmark (Bonsai spike): the kernel in isolation
+  add_executable(pq2_bench tests/pq2_bench.cu)
+  target_include_directories(pq2_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(pq2_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   # TODO 24: the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
   # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
   # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order

@@ -123,6 +123,9 @@ void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cac
 
 /// y[r, :] = W x[r, :] for r in [0, rows): the batched form of dense_gemv_f32 (one warp per output row per input row).
 void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int n_out, int rows, void* stream);
+/// ssm_alpha and ssm_beta over the same activation, one launch (the pair the GDN layer reads together).
+void dense_gemv_f32_rows_pair(const float* Wa, const float* Wb, const float* X, float* ya, float* yb, int n_in,
+                              int n_out, int rows, void* stream);
 
 /// The 4-tap causal conv + SiLU over a chunk: history is [channels, 3] (oldest first, updated in place to the
 /// chunk's last three inputs), qkv and h are [T, channels].  Only the SiLU output is written (the decode path keeps

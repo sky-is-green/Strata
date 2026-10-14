@@ -194,7 +194,7 @@ void trace_logits(int64_t pos, const float* dev, int n, void* stream) {
 // printed to stderr every 8 passes.  The pass is synchronized at its end, so this slows decoding slightly: it is a
 // measuring mode, not a way to run.
 struct Prof {
-    enum { GEMV_Q4K, GEMV_Q6K, GEMV_Q80, GEMV_OTHER, QUANT, GDN_LOOP, ATTN_LOOP, NB };
+    enum { GEMV_Q4K, GEMV_Q6K, GEMV_Q80, GEMV_OTHER, QUANT, GDN_LOOP, ATTN_LOOP, RMS, SWIGLU, ADD, F32ROW, EMB, NB };
     bool enabled = false, on = false;
     std::vector<cudaEvent_t> ev;
     size_t used = 0;
@@ -231,9 +231,11 @@ struct Prof {
             const double P = (double) passes;
             std::fprintf(stderr,
                          "strata-dense prof: %.1f cols/pass, GPU %.1f ms/pass = gemv Q4_K %.1f + Q6_K %.1f + Q8_0 %.1f + other %.1f"
-                         " | quantize %.1f | gdn token loop %.1f | attn token loop %.1f | rest %.1f ; host enqueue %.1f ms/pass\n",
+                         " | quantize %.1f | gdn %.1f | attn %.1f | rms %.1f | swiglu %.1f | add %.1f | f32 rows %.1f"
+                         " | embd/head %.1f | rest %.1f ; host enqueue %.1f ms/pass\n",
                          (double) cols / P, total_ms / P, ms[GEMV_Q4K] / P, ms[GEMV_Q6K] / P, ms[GEMV_Q80] / P, ms[GEMV_OTHER] / P,
-                         ms[QUANT] / P, ms[GDN_LOOP] / P, ms[ATTN_LOOP] / P, (total_ms - known) / P, host_ms / P);
+                         ms[QUANT] / P, ms[GDN_LOOP] / P, ms[ATTN_LOOP] / P, ms[RMS] / P, ms[SWIGLU] / P, ms[ADD] / P,
+                         ms[F32ROW] / P, ms[EMB] / P, (total_ms - known) / P, host_ms / P);
             for (double& m : ms) m = 0;
             total_ms = host_ms = 0; passes = cols = 0;
         }
@@ -546,8 +548,8 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
         gemv(L.alpha_q, alpha, n, s);
         gemv(L.beta_q, beta, n, s);
     } else {
-        dense_gemv_f32_rows(L.alpha_w, xn, alpha, E, VH, n, s);
-        dense_gemv_f32_rows(L.beta_w, xn, beta, E, VH, n, s);
+        PScope ps(&prof, Prof::F32ROW, s);
+        dense_gemv_f32_rows_pair(L.alpha_w, L.beta_w, xn, alpha, beta, E, VH, n, s);
     }
     // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not
     if (L.rot & (ROT_QKV | ROT_Z)) {
@@ -637,7 +639,10 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
 void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
                                  int n, uint16_t rot, void* s) {
     const int E = c.n_embd;
-    dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
+    {
+        PScope ps(&prof, Prof::RMS, s);
+        dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
+    }
     if (rot & (ROT_FFN_GATE | ROT_FFN_UP)) {
         dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
         quantize(rot_scratch, E, n, s);
@@ -646,7 +651,10 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     }
     gemv(g, ffn_g, n, s);
     gemv(u, ffn_u, n, s);
-    dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
+    {
+        PScope ps(&prof, Prof::SWIGLU, s);
+        dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
+    }
     if (rot & ROT_FFN_DOWN) {
         dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), c.n_ff, n, false, s);
         quantize(rot_scratch, c.n_ff, n, s);
@@ -654,7 +662,10 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
         quantize(ffn_h, c.n_ff, n, s);
     }
     gemv(d, mix, n, s);
-    add_inplace(x, mix, (int64_t) n * E, s);
+    {
+        PScope ps(&prof, Prof::ADD, s);
+        add_inplace(x, mix, (int64_t) n * E, s);
+    }
 }
 
 #ifdef STRATA_DENSE_MMQ
@@ -1348,15 +1359,23 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
     const bool dbg = I.dbg_from >= 0 && pos0 < I.dbg_to && pos0 + n > I.dbg_from;
     try {
         if (I.prof.enabled) I.prof.begin(s);
-        if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
+        {
+            PScope ps(&I.prof, Prof::EMB, s);
+            if (!I.upload_embeddings(I.embd, tokens, n, E, cfg_.n_vocab, I.x, err)) { I.prof.on = false; return false; }
+        }
         if (dbg) trace_vec("embed", pos0, -1, "", I.x, n * E, s);
-
         for (int l = 0; l < cfg_.n_layer; ++l) {
             Layer& L = I.layers[(size_t) l];
-            dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            {
+                PScope ps(&I.prof, Prof::RMS, s);
+                dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
+            }
             if (!L.attn) I.gdn_block(cfg_, L, n, snapshot, s);
             else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, L.rot, s);
-            add_inplace(I.x, I.mix, (int64_t) n * E, s);
+            {
+                PScope ps(&I.prof, Prof::ADD, s);
+                add_inplace(I.x, I.mix, (int64_t) n * E, s);
+            }
             I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
             if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
         }
@@ -1366,7 +1385,10 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
         snap_cols_ = n;
 
         if (lg != Logits::None || keep_hidden) {
-            dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            {
+                PScope ps(&I.prof, Prof::RMS, s);
+                dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
+            }
             if (lg == Logits::Last) {
                 const float* src = I.hid + (size_t) (n - 1) * E;
                 if (I.head_rot) { dense_fwht_rows(src, I.rot_scratch, I.ham_signs(E), E, 1, false, s); src = I.rot_scratch; }

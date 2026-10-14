@@ -1228,6 +1228,41 @@ void dense_gemv_f32_rows(const float* W, const float* X, float* y, int n_in, int
     check("dense_gemv_f32_rows");
 }
 
+// The layer's two small GDN projections (ssm_alpha and ssm_beta) over the same activation: one warp per output
+// row computes both, so the activation read is shared and the layer launches one kernel instead of two.
+__global__ void gemv_f32_rows_pair_kernel(const float* __restrict__ Wa, const float* __restrict__ Wb,
+                                          const float* __restrict__ X, float* __restrict__ ya, float* __restrict__ yb,
+                                          int n_in, int n_out) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= n_out) return;
+    const int col = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const float* wa = Wa + (size_t) row * n_in;
+    const float* wb = Wb + (size_t) row * n_in;
+    const float* xr = X + (size_t) col * n_in;
+    float aa = 0.0f, ab = 0.0f;
+    for (int i = lane; i < n_in; i += 32) {
+        const float x = xr[i];
+        aa += wa[i] * x;
+        ab += wb[i] * x;
+    }
+    aa = warp_sum(aa);
+    ab = warp_sum(ab);
+    if (lane == 0) {
+        ya[(size_t) col * n_out + row] = aa;
+        yb[(size_t) col * n_out + row] = ab;
+    }
+}
+
+void dense_gemv_f32_rows_pair(const float* Wa, const float* Wb, const float* X, float* ya, float* yb, int n_in,
+                              int n_out, int rows, void* stream) {
+    if (rows < 1) return;
+    const int warps = 4;
+    const dim3 grid((n_out + warps - 1) / warps, rows);
+    gemv_f32_rows_pair_kernel<<<grid, warps * 32, 0, (cudaStream_t) stream>>>(Wa, Wb, X, ya, yb, n_in, n_out);
+    check("dense_gemv_f32_rows_pair");
+}
+
 void dense_gdn_conv_chunk(float* history, const float* qkv, const float* conv_w, float* h, int channels, int T,
                           const DenseGdnSnap& snap, void* stream) {
     if (T < 1) return;
