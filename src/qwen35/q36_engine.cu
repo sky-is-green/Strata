@@ -1168,6 +1168,8 @@ struct Engine {
     // routed experts / shared+combine.  stderr, a 64-step window average.
     bool time_decode = false;
     cudaEvent_t ev_step[2] = {};
+    cudaEvent_t ev_head[2] = {};
+    double t_head_ms = 0;
     std::vector<cudaEvent_t> ev_cls;   // [layer][class][start/stop]
     static constexpr int kTimeCls = 12;
     double t_step_ms = 0, t_cls_ms[kTimeCls] = {};
@@ -1263,6 +1265,8 @@ struct Engine {
         if (time_decode) {
             CK(cudaEventCreate(&ev_step[0]));
             CK(cudaEventCreate(&ev_step[1]));
+            CK(cudaEventCreate(&ev_head[0]));
+            CK(cudaEventCreate(&ev_head[1]));
             ev_cls.resize((m->layers.size() + 1) * kTimeCls * 2);
             for (auto& e : ev_cls) CK(cudaEventCreate(&e));
         }
@@ -1784,9 +1788,12 @@ struct Engine {
     /// logits [n][V] = W_out hn rows, and each row's greedy pick.
     void head_rows(const float* hn, int n, float* lg, int32_t* pk) {
         const auto& g = m->g;
+        const bool th = time_decode && n == 1 && !use_graph;
+        if (th) cudaEventRecord(ev_head[0], st);
         mm(m->head, hn, lg, n);
         k_argmax<<<dim3(kArgBlocks, n), kThreads, 0, st>>>(lg, (int) g.n_vocab, pk, amv, ami, false);
         k_argmax<<<dim3(1, n), kThreads, 0, st>>>(lg, kArgBlocks, pk, amv, ami, true);
+        if (th) cudaEventRecord(ev_head[1], st);
     }
 
     /// The MTP block over T rows: row t reads token tok_m[t] at position p0 + t (also at *pos0_m) and the seed hidden
@@ -2053,7 +2060,7 @@ struct Engine {
                 float ms = 0;
                 CK(cudaEventElapsedTime(&ms, ev_step[0], ev_step[1]));
                 t_step_ms += ms;
-                if (!use_graph)
+                if (!use_graph) {
                     for (size_t l = 0; l < m->layers.size(); ++l)
                         for (int c = 0; c < kTimeCls; ++c) {
                             float cm = 0;
@@ -2061,6 +2068,10 @@ struct Engine {
                                                     ev_cls[(l * kTimeCls + c) * 2 + 1]));
                             t_cls_ms[c] += cm;
                         }
+                    float hm = 0;
+                    CK(cudaEventElapsedTime(&hm, ev_head[0], ev_head[1]));
+                    t_head_ms += hm;
+                }
                 if (++t_steps % 64 == 0) {
                     static const char* kNames[kTimeCls] = {"mix-qkv",  "mix-ab",   "mix-conv", "mix-rec", "mix-out",
                                                            "out-corr", "router+topk", "exp-setup", "experts", "shared",
@@ -2070,8 +2081,10 @@ struct Engine {
                     if (!use_graph)
                         for (int c = 0; c < kTimeCls; ++c)
                             std::fprintf(stderr, " | %s %.2f", kNames[c], t_cls_ms[c] / 64.0);
+                    if (!use_graph) std::fprintf(stderr, " | head+embed %.2f", t_head_ms / 64.0);
                     std::fprintf(stderr, "\n");
                     t_step_ms = 0;
+                    t_head_ms = 0;
                     for (double& v : t_cls_ms) v = 0;
                 }
             }
