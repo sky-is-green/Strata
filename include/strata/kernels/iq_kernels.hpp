@@ -28,6 +28,10 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
 /// The correction branch's A pass with its q8_1 image fused in: tq = q8_1(A xq), both bitwise the staged
 /// quantize + iq_mmvq(142, ncols = 1).  n_in is a multiple of 128, rank of 32.
 void iq_corr_g128_aq(const void* a, const void* x_q8_1, int n_in, int rank, void* t_q8_1, void* stream);
+/// The out projection's MMVQ rows and the correction's A pass in one launch (T = 1; both read the same staged
+/// q8_1 image).  False where the pair is not available for the type - the caller runs the two launches.
+bool native_mmvq_corr_aq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, const void* a,
+                         int rank, void* tq, void* stream);
 
 /// The correction branch's B pass at one row with the add folded in: out = (or +=) B tq, tq the staged q8_1
 /// image of t.  Bitwise iq_mmvq(142, ncols = 1) + the f32 add.  rank is a multiple of 128.

@@ -3504,6 +3504,73 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     check("iq_mmvq");
 }
 
+// ---------------------------------------------------------------- the out projection's MMVQ rows and the
+// correction's A pass in one launch (T = 1): the MMVQ part is mmvq_kernel's row mapping in this kernel's own
+// 1024-thread form (one warp per row, row_dot<TY>, lane 0 stores - the same per-row bits), the correction part
+// corr_g128_aq_kernel's block body unchanged.  The two read the same staged q8_1 image and are independent; the
+// engine falls back to the separate launches where the types or shapes do not fit.
+template<int TY>
+__global__ void __launch_bounds__(1024) mmvq_corr_aq_kernel(const uint8_t* __restrict__ w, size_t row_bytes,
+                                                            const block_q8_1* __restrict__ x, float* __restrict__ y,
+                                                            int n_in, int n_out, int mm_blocks,
+                                                            const uint8_t* __restrict__ a, int rank,
+                                                            block_q8_1* __restrict__ tq) {
+    if ((int) blockIdx.x < mm_blocks) {
+        const int row = (int) blockIdx.x * 32 + (threadIdx.x >> 5);
+        if (row >= n_out) return;
+        const int lane = threadIdx.x & 31;
+        const float s = row_dot<TY>(w + (size_t) row * row_bytes, x, n_in / Fmt<TY>::qk, lane);
+        if (lane == 0) y[row] = s;
+        return;
+    }
+    __shared__ float ts[32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = ((int) blockIdx.x - mm_blocks) * 32 + warp;
+    const int nb = n_in / Fmt<142>::qk;
+    const uint8_t* wr = a + (size_t) row * ((size_t) (n_in / 128) * sizeof(block_pq2_0));
+    float s = 0.0f;
+    for (int k = lane; k < nb; k += 32) {
+        const Split<142>::W wv = Split<142>::load(wr, k, 0);
+        s += Split<142>::apply(wv, x + k * 4, 0);
+    }
+    s = warp_sum(s);
+    if (lane == 0) ts[warp] = s;
+    __syncthreads();
+    if (warp == 0) {
+        const float xi = ts[lane];
+        float amax = fabsf(xi), sum = xi;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        }
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        tq[(int) blockIdx.x - mm_blocks].qs[lane] = q;
+        if (lane == 0) tq[(int) blockIdx.x - mm_blocks].ds = q8_1_ds(d, sum);
+    }
+}
+
+// The fused pair's launcher: false where the type has no instantiation (the caller runs the two launches).
+bool native_mmvq_corr_aq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, const void* a,
+                         int rank, void* tq, void* stream) {
+    if (rank <= 0 || rank % 32 != 0 || n_in <= 0 || n_in % 128 != 0 || n_out <= 0) return false;
+    cudaStream_t s = (cudaStream_t) stream;
+    const size_t rb = iq_row_bytes(t, n_in);
+    const auto* W = (const uint8_t*) w;
+    const auto* X = (const block_q8_1*) x_q8_1;
+    const int mm_blocks = (n_out + 31) / 32;
+    switch (t) {
+#define STRATA_MMVQ_CA(T) case T: mmvq_corr_aq_kernel<T><<<(unsigned) (mm_blocks + rank / 32), 1024, 0, s>>>( \
+            W, rb, X, y, n_in, n_out, mm_blocks, (const uint8_t*) a, rank, (block_q8_1*) tq); break;
+        STRATA_MMVQ_FMTS(STRATA_MMVQ_CA)
+#undef STRATA_MMVQ_CA
+        default: return false;
+    }
+    check("native_mmvq_corr_aq");
+    return true;
+}
+
 // The correction branch's A pass with the q8_1 image of its result fused in: tq [rank/32 blocks] = quantize_q8_1
 // of A xq (both bitwise the staged form: quantize_q8_1_rows of iq_mmvq(142, ncols = 1)'s output).
 void iq_corr_g128_aq(const void* a, const void* x_q8_1, int n_in, int rank, void* t_q8_1, void* stream) {
