@@ -3,7 +3,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <mma.h>
+#if !defined(__HIPCC__)
+#include <mma.h>   // nvcuda::wmma; the HIP port runs the non-tensor-core chunk kernels instead
+#endif
 #include <cstdlib>
 
 #include <cfloat>
@@ -174,6 +176,41 @@ __device__ __forceinline__ void fwht256_shared(float* buf) {
     __syncthreads();
     buf[t] *= 0.0625f;                      // 1 / sqrt(256)
     __syncthreads();
+}
+
+// The folded-basis transform: one 1024-element block per (row, block) with 1024 threads.  The normalization
+// 1/sqrt(1024) is applied at the load; forward applies the signs before the transform (R x), inverse after
+// (R^T x).  Same butterfly as fwht256_shared, one size up.
+__global__ void fwht1024_kernel(const float* __restrict__ x, float* __restrict__ y, const float* __restrict__ signs,
+                                int width, int inverse) {
+    __shared__ float buf[1024];
+    const int t = threadIdx.x;                                  // 1024 threads per block
+    const int blk = blockIdx.x, row = blockIdx.y;
+    const float* xr = x + (size_t) row * width + (size_t) blk * 1024;
+    const float* sg = signs + (size_t) blk * 1024;
+    float v = xr[t] * (1.0f / 32.0f);
+    if (!inverse) v *= sg[t];
+    buf[t] = v;
+    for (int len = 1; len < 1024; len <<= 1) {
+        __syncthreads();
+        const float a = buf[t], b = buf[t ^ len];
+        __syncthreads();
+        buf[t] = (t & len) ? (b - a) : (a + b);
+    }
+    float o = buf[t];
+    if (inverse) o *= sg[t];
+    y[(size_t) row * width + (size_t) blk * 1024 + t] = o;
+}
+
+// [hd][nk][rep] -> [hd][rep][nk] along the feature axis of every row (the source index of destination j)
+__global__ void permute_gdn_v_kernel(const float* __restrict__ x, float* __restrict__ y, int width, int hd, int nk, int rep) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= width) return;
+    const int row = blockIdx.y;
+    const int h = j % hd, rest = j / hd;
+    const int r = rest % rep, k = rest / rep;
+    const int i = h + hd * k + hd * nk * r;
+    y[(size_t) row * width + j] = x[(size_t) row * width + i];
 }
 
 // Stores buf[0..head_dim) as one cell.  One warp per block of 32 values; blockDim.x == head_dim.
@@ -600,6 +637,7 @@ __global__ void attn_chunk_g_kernel(const float* __restrict__ q, const uint8_t* 
         __syncthreads();                                  // sacc is rewritten by the next head
     }
 }
+#if !defined(__HIPCC__)
 // ---- tensor-core chunk attention: block = (KV head, tile of 8 tokens) x the 6 query heads that share the KV head =
 // 48 rows.  K/V cells are dequantized to half in shared memory once per block and multiplied with WMMA.
 // Two passes over the cells: pass 1 finds each row's max, pass 2 recomputes S, forms P = exp(S - max) and accumulates
@@ -759,6 +797,7 @@ void launch_attn_chunk_tc(const float* q, const uint8_t* K, const uint8_t* V, fl
     }
     attn_chunk_tc_kernel<KF, VF><<<dim3(n_kv, (T + 7) / 8), 256, kTcSmem, st>>>(q, K, V, out, T, n_head, pos0, max_ctx, scale);
 }
+#endif  // !__HIPCC__
 // grid (ceil(n_out / 4), rows): one warp per output row of W for one input row.
 __global__ void gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ X, float* __restrict__ y,
                                      int n_in, int n_out) {
@@ -1088,11 +1127,28 @@ void dense_kv_append_rows(uint16_t* k_cache, uint16_t* v_cache, const float* k, 
     dense_kv_append_rows_fmt(k_cache, v_cache, kF16, kF16, k, v, T, pos0, n_kv, head_dim, max_ctx, stream);
 }
 
+void dense_fwht_rows(const float* x, float* y, const float* signs, int width, int rows, bool inverse, void* stream) {
+    if (rows < 1) return;
+    if (!signs) throw std::runtime_error("dense_fwht_rows: no sign vector for this width");
+    if (width <= 0 || width % 1024 != 0) throw std::runtime_error("dense_fwht_rows: width must be a multiple of 1024");
+    const dim3 grid((unsigned) (width / 1024), (unsigned) rows);
+    fwht1024_kernel<<<grid, 1024, 0, (cudaStream_t) stream>>>(x, y, signs, width, inverse ? 1 : 0);
+    check("dense_fwht_rows");
+}
+
+void dense_permute_gdn_v(const float* x, float* y, int width, int rows, int hd, int nk, int rep, void* stream) {
+    if (rows < 1) return;
+    const dim3 grid((unsigned) ((width + 255) / 256), (unsigned) rows);
+    permute_gdn_v_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, y, width, hd, nk, rep);
+    check("dense_permute_gdn_v");
+}
+
 void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt, float* out,
                           int T, int pos0, int n_head, int n_kv, int head_dim, int max_ctx, float scale, void* stream) {
     if (T < 1 || pos0 < 0 || pos0 + T > max_ctx)
         throw std::runtime_error("dense_attn_chunk: positions outside the cache");
-        static const bool use_tc = !(std::getenv("STRATA_DENSE_ATTN_TC") && std::getenv("STRATA_DENSE_ATTN_TC")[0] == '0');
+    #if !defined(__HIPCC__)
+    static const bool use_tc = !(std::getenv("STRATA_DENSE_ATTN_TC") && std::getenv("STRATA_DENSE_ATTN_TC")[0] == '0');
     if (use_tc && n_head / n_kv == 6 && head_dim == 256) {
         const cudaStream_t st = (cudaStream_t) stream;
         const uint8_t* K = (const uint8_t*) k_cache;
@@ -1113,6 +1169,7 @@ void dense_attn_chunk_fmt(const float* q, const void* k_cache, const void* v_cac
         check("dense_attn_chunk_tc");
         return;
     }
+#endif  // !__HIPCC__
     if (n_head % n_kv != 0)
         throw std::runtime_error("dense_attn_chunk: n_head must be a multiple of n_kv");
     check_kv_formats("dense_attn_chunk", k_fmt, v_fmt, head_dim);

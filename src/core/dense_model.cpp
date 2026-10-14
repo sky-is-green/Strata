@@ -22,6 +22,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <unordered_set>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
@@ -40,7 +41,7 @@ constexpr uint32_t kF32 = 0, kF16 = 1, kBF16 = 30;
 constexpr int NC = DenseModel::kMaxCols;
 
 // The GGUF types a quantized weight may have: exactly what native_mmvq takes.
-const char* kSupported = "Q4_0, Q5_0, Q8_0, Q2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS";
+const char* kSupported = "Q4_0, Q5_0, Q8_0, Q2_0, PQ2_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS";
 
 struct QMat {
     void* dev = nullptr;
@@ -48,8 +49,16 @@ struct QMat {
     int n_in = 0, n_out = 0;
 };
 
+/// Which of a layer's matrices are stored in the folded (rotated) basis; see prism.hadamard.weight_names.
+enum RotBit : uint16_t {
+    ROT_QKV = 1u << 0, ROT_Z = 1u << 1, ROT_SSM_OUT = 1u << 2,
+    ROT_Q = 1u << 3, ROT_K = 1u << 4, ROT_V = 1u << 5, ROT_O = 1u << 6,
+    ROT_FFN_GATE = 1u << 7, ROT_FFN_UP = 1u << 8, ROT_FFN_DOWN = 1u << 9,
+};
+
 struct Layer {
     bool attn = false;
+    uint16_t rot = 0;                               // RotBit mask of the folded matrices (0 = plain file)
     float* attn_norm = nullptr;
     float* post_norm = nullptr;
     QMat ffn_gate, ffn_up, ffn_down;
@@ -109,6 +118,7 @@ bool dequant_row(uint32_t type, const uint8_t* src, int n, float* out) {
         case 20: strata::dequantize_iq4_nl(blk, o); break;
         case 23: strata::dequantize_iq4_xs(blk, o); break;
         case 42: strata::dequantize_q2_0(blk, o); break;
+        case 142: strata::dequantize_pq2_0(blk, o); break;
         default: return false;
         }
     }
@@ -270,6 +280,24 @@ struct DenseModel::Impl {
     };
     EmbdSrc embd, embd_mtp;
     float* embd_stage = nullptr;                    // pinned, NC * n_embd floats
+
+    // ---- PrismML's folded basis (Bonsai 2's `prism.hadamard.*` metadata).  When a weight is listed there it
+    // is stored as D = W R^T, and its *activation* has to carry R (signs, then the block Walsh-Hadamard) before
+    // the GEMV; token_embd carries R^T on its output instead.
+    bool hadamard = false;                          // the file declares the folded basis
+    int rot_block = 0;                              // its block size (the kernels implement 1024)
+    bool rot_inverse_embd = false;                  // token_embd.weight is in inverse_weight_names
+    bool rot_gdn_v_grouped = false;                 // prism.hadamard.gdn_v_grouped
+    bool head_rot = false;                          // output.weight is folded
+    struct RotSigns { int width; float* dev; };
+    std::vector<RotSigns> rot_signs;                // one +/-1 table per rotated width, on the device
+    std::vector<void*> rot_allocs;                  // their cudaMalloc'ed storage
+    float* rot_scratch = nullptr;                   // NC * max width floats
+    const float* ham_signs(int width) const {
+        if (!hadamard) return nullptr;
+        for (const RotSigns& s : rot_signs) if (s.width == width) return s.dev;
+        return nullptr;
+    }
 
     float* output_norm = nullptr;
     QMat head;
@@ -463,6 +491,13 @@ struct DenseModel::Impl {
             if (!dequant_row(src.type, row, E, st + (size_t) j * E)) { err = "dense model: embedding dequantization"; return false; }
         }
         cudaMemcpyAsync(dst, st, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream);
+        if (rot_inverse_embd) {
+            // token_embd is stored folded too (inverse_weight_names): the lookup lands in the rotated basis, so
+            // the table's output carries R^T = H/32 then the signs (Prism's fwht(x, inverse)).
+            const float* sg = ham_signs(E);
+            if (!sg) { err = "dense model: token_embd needs the E-wide prism.hadamard signs"; return false; }
+            dense_fwht_rows(dst, dst, sg, E, n, true, stream);
+        }
         cudaEventRecord(embed_done, stream);
         return true;
     }
@@ -480,8 +515,9 @@ struct DenseModel::Impl {
     // ---- the blocks.  Input is I.xn (the normalized residual) unless stated; the output goes to I.mix.
     void gdn_block(const DenseConfig& c, Layer& L, int n, bool snapshot, void* s);
     void attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
-                    const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s);
-    void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n, void* s);
+                    const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, uint16_t rot, void* s);
+    void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n,
+                   uint16_t rot, void* s);
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
 
 #ifdef STRATA_DENSE_MMQ
@@ -506,8 +542,6 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
     const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
     quantize(xn, E, n, s);
-    gemv(L.qkv, qkv, n, s);
-    gemv(L.z, z, n, s);
     if (L.ab_quant) {                               // the scratch still holds xn: nothing quantized in between
         gemv(L.alpha_q, alpha, n, s);
         gemv(L.beta_q, beta, n, s);
@@ -515,6 +549,13 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
         dense_gemv_f32_rows(L.alpha_w, xn, alpha, E, VH, n, s);
         dense_gemv_f32_rows(L.beta_w, xn, beta, E, VH, n, s);
     }
+    // the folded basis: qkv and z read the hidden through R = (1/sqrt n) H diag(S); alpha/beta do not
+    if (L.rot & (ROT_QKV | ROT_Z)) {
+        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
+        quantize(rot_scratch, E, n, s);
+    }
+    gemv(L.qkv, qkv, n, s);
+    gemv(L.z, z, n, s);
     {
     PScope ps_gdn(&prof, Prof::GDN_LOOP, s);
     // slot[j] receives the state right after column j, which is what rollback(j) restores.  run() guarantees
@@ -531,14 +572,32 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     dense_gdn_gates(alpha, L.dt, L.ssm_a, gate, beta, VH, n, s);
     dense_gdn_rec_chunk(L.state, h, gate, beta, z, L.ssm_norm, c.rms_eps, y, KH, VH, n, snaps, s);
     }
-    quantize(y, V, n, s);
+    if (L.rot & ROT_SSM_OUT) {
+        const float* sg = ham_signs(V);
+        if (rot_gdn_v_grouped) {
+            // Prism's grouped V layout: [hd, nk, rep] rows -> [hd, rep, nk], then the same transform
+            dense_permute_gdn_v(y, rot_scratch, V, n, V / VH, KH, VH / KH, s);
+            dense_fwht_rows(rot_scratch, rot_scratch, sg, V, n, false, s);
+        } else {
+            dense_fwht_rows(y, rot_scratch, sg, V, n, false, s);
+        }
+        quantize(rot_scratch, V, n, s);
+    } else {
+        quantize(y, V, n, s);
+    }
     gemv(L.ssm_out, mix, n, s);
 }
 
 void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QMat& wk, const QMat& wv, const QMat& wo,
-                                  const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, void* s) {
+                                  const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0,
+                                  uint16_t rot, void* s) {
     const int E = c.n_embd, H = c.n_head, HK = c.n_head_kv, D = c.head_dim;
-    quantize(xn, E, n, s);
+    if (rot & (ROT_Q | ROT_K | ROT_V)) {
+        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
+        quantize(rot_scratch, E, n, s);
+    } else {
+        quantize(xn, E, n, s);
+    }
     gemv(wq, q_full, n, s);
     gemv(wk, kcur, n, s);
     gemv(wv, vcur, n, s);
@@ -565,20 +624,35 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     }
     dense_gate_apply(attn, q_full, attn32, n * H, H, D, s);
     }
-    quantize(attn32, H * D, n, s);
+    if (rot & ROT_O) {
+        dense_fwht_rows(attn32, rot_scratch, ham_signs(H * D), H * D, n, false, s);
+        quantize(rot_scratch, H * D, n, s);
+    } else {
+        quantize(attn32, H * D, n, s);
+    }
     gemv(wo, mix, n, s);
 }
 
 // x += ffn(rms_norm(x, post_norm)), for n columns
 void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
-                                 int n, void* s) {
+                                 int n, uint16_t rot, void* s) {
     const int E = c.n_embd;
     dense_rms_norm(x, post_norm, xn, n, E, c.rms_eps, s);
-    quantize(xn, E, n, s);
+    if (rot & (ROT_FFN_GATE | ROT_FFN_UP)) {
+        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
+        quantize(rot_scratch, E, n, s);
+    } else {
+        quantize(xn, E, n, s);
+    }
     gemv(g, ffn_g, n, s);
     gemv(u, ffn_u, n, s);
     dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
-    quantize(ffn_h, c.n_ff, n, s);
+    if (rot & ROT_FFN_DOWN) {
+        dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), c.n_ff, n, false, s);
+        quantize(rot_scratch, c.n_ff, n, s);
+    } else {
+        quantize(ffn_h, c.n_ff, n, s);
+    }
     gemv(d, mix, n, s);
     add_inplace(x, mix, (int64_t) n * E, s);
 }
@@ -700,9 +774,9 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
     quantize(cat, 2 * E, n, s);
     gemv(M.eh_proj, x, n, s);                       // x = the block's input and its attention residual
     dense_rms_norm(x, M.attn_norm, xn, n, E, c.rms_eps, s);
-    attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, s);
+    attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, 0, s);   // the MTP block is never folded
     add_inplace(x, mix, (int64_t) n * E, s);
-    ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, s);
+    ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, 0, s);
     if (want_logits) {
         dense_rms_norm(x + (size_t) (n - 1) * E, M.head_norm, xn, 1, E, c.rms_eps, s);
         cudaMemcpyAsync(mtp_h, xn, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
@@ -812,6 +886,69 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         max_context_ = max_context;
         I.max_context = max_context;
         if (max_context < 16) { err = "dense model: context must be at least 16"; return false; }
+
+        // ---- the folded basis (PrismML's prism.hadamard.*): the weights are stored as D = W R^T and their
+        // activations carry R at run time.  Read the sign tables now; they are tiny (one vector per width).
+        if (const strata::MetaValue* hv = g0.get("prism.hadamard.version")) {
+            if (hv->u != 1) { err = "dense model: unsupported prism.hadamard.version"; return false; }
+            const strata::MetaValue* block = g0.get("prism.hadamard.block_size");
+            const strata::MetaValue* trans = g0.get("prism.hadamard.transform");
+            const strata::MetaValue* mode = g0.get("prism.hadamard.sign_mode");
+            const strata::MetaValue* widths = g0.get("prism.hadamard.sign_widths");
+            const strata::MetaValue* values = g0.get("prism.hadamard.sign_values");
+            if (!block || !trans || !mode || !widths || !values) {
+                err = "dense model: prism.hadamard metadata is incomplete"; return false;
+            }
+            I.rot_block = (int) block->u;
+            if (I.rot_block != 1024) { err = "dense model: prism.hadamard.block_size must be 1024"; return false; }
+            if (trans->s != "normalized-sylvester-walsh-hadamard" || mode->s != "explicit") {
+                err = "dense model: unsupported prism.hadamard transform or sign mode"; return false;
+            }
+            if (const strata::MetaValue* gv = g0.get("prism.hadamard.gdn_v_grouped")) I.rot_gdn_v_grouped = gv->u != 0;
+            if (const strata::MetaValue* inv = g0.get("prism.hadamard.inverse_weight_names"))
+                for (const strata::MetaValue& v : inv->items) if (v.s == "token_embd.weight") I.rot_inverse_embd = true;
+            uint64_t off = 0;
+            for (const strata::MetaValue& w : widths->items) {
+                const int width = (int) w.u;
+                if (width <= 0 || width % I.rot_block != 0 || off + (uint64_t) width > values->count) {
+                    err = "dense model: bad prism.hadamard sign table"; return false;
+                }
+                std::vector<float> host((size_t) width);
+                if (values->items.size() < (size_t) (off + (uint64_t) width)) {
+                    err = "dense model: prism.hadamard sign table was not read whole"; return false;
+                }
+                for (int i = 0; i < width; ++i) {
+                    const int64_t s = (int64_t) values->items[(size_t) (off + i)].u;
+                    if (s != 1 && s != -1) {
+                        err = "dense model: prism.hadamard signs must be +/-1 (index " + std::to_string(off + i) +
+                              ", value " + std::to_string((long long) s) + ", elem " + std::to_string((int) values->elem) +
+                              ", count " + std::to_string(values->count) + ")";
+                        return false;
+                    }
+                    host[(size_t) i] = (float) s;
+                }
+                off += (uint64_t) width;
+                void* dev = nullptr;
+                if (cudaMalloc(&dev, (size_t) width * sizeof(float)) != cudaSuccess ||
+                    cudaMemcpy(dev, host.data(), (size_t) width * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    if (dev) cudaFree(dev);
+                    err = "dense model: prism.hadamard signs do not fit in VRAM"; return false;
+                }
+                I.rot_allocs.push_back(dev);
+                I.rot_signs.push_back({width, (float*) dev});
+            }
+            I.hadamard = true;
+        }
+        std::unordered_set<std::string> rot_names;
+        if (I.hadamard) {
+            const strata::MetaValue* wn = g0.get("prism.hadamard.weight_names");
+            if (!wn || wn->items.empty()) { err = "dense model: prism.hadamard.weight_names is empty"; return false; }
+            if (wn->items.size() != wn->count) { err = "dense model: prism.hadamard.weight_names was not read whole"; return false; }
+            for (const strata::MetaValue& v : wn->items) rot_names.insert(v.s);
+            if (!I.ham_signs(cfg_.n_embd) || !I.ham_signs(cfg_.value_dim()) || !I.ham_signs(cfg_.n_ff)) {
+                err = "dense model: prism.hadamard signs do not cover this model's widths"; return false;
+            }
+        }
         const int E = cfg_.n_embd;
         const int mtp_block_idx = cfg_.n_layer;           // the MTP block follows the trunk
         const std::string mp = "blk." + std::to_string(mtp_block_idx) + ".";
@@ -976,11 +1113,17 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                 !I.upload_mat(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, L.ffn_up, total, err) ||
                 !I.upload_mat(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, L.ffn_down, total, err))
                 return false;
+            if (rot_names.count(p + "ffn_gate.weight")) L.rot |= ROT_FFN_GATE;
+            if (rot_names.count(p + "ffn_up.weight")) L.rot |= ROT_FFN_UP;
+            if (rot_names.count(p + "ffn_down.weight")) L.rot |= ROT_FFN_DOWN;
             if (!L.attn) {
                 if (!I.upload_mat(I.find(p + "attn_qkv.weight"), p + "attn_qkv.weight", E, C, L.qkv, total, err) ||
                     !I.upload_mat(I.find(p + "attn_gate.weight"), p + "attn_gate.weight", E, V, L.z, total, err) ||
                     !I.upload_mat(I.find(p + "ssm_out.weight"), p + "ssm_out.weight", V, E, L.ssm_out, total, err))
                     return false;
+                if (rot_names.count(p + "attn_qkv.weight")) L.rot |= ROT_QKV;
+                if (rot_names.count(p + "attn_gate.weight")) L.rot |= ROT_Z;
+                if (rot_names.count(p + "ssm_out.weight")) L.rot |= ROT_SSM_OUT;
                 if (!I.upload_floats(I.find(p + "ssm_conv1d.weight"), p + "ssm_conv1d.weight", (uint64_t) C * cfg_.ssm_d_conv, &L.conv_w, err) ||
                     !I.upload_floats(I.find_any({"ssm_dt.bias", "ssm_dt"}, p), p + "ssm_dt.bias", cfg_.ssm_v_heads, &L.dt, err) ||
                     !I.upload_floats(I.find_any({"ssm_a", "ssm_a.weight"}, p), p + "ssm_a", cfg_.ssm_v_heads, &L.ssm_a, err) ||
@@ -1021,6 +1164,10 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                     !I.upload_mat(I.find(p + "attn_v.weight"), p + "attn_v.weight", E, HK * D, L.v, total, err) ||
                     !I.upload_mat(I.find(p + "attn_output.weight"), p + "attn_output.weight", H * D, E, L.o, total, err))
                     return false;
+                if (rot_names.count(p + "attn_q.weight")) L.rot |= ROT_Q;
+                if (rot_names.count(p + "attn_k.weight")) L.rot |= ROT_K;
+                if (rot_names.count(p + "attn_v.weight")) L.rot |= ROT_V;
+                if (rot_names.count(p + "attn_output.weight")) L.rot |= ROT_O;
                 if (!I.upload_floats(I.find(p + "attn_q_norm.weight"), p + "attn_q_norm.weight", D, &L.q_norm, err) ||
                     !I.upload_floats(I.find(p + "attn_k_norm.weight"), p + "attn_k_norm.weight", D, &L.k_norm, err))
                     return false;
@@ -1037,6 +1184,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (!I.upload_mat(head, head == tok ? "token_embd.weight (tied head)" : "output.weight", E, cfg_.n_vocab,
                           I.head, total, err))
             return false;
+        I.head_rot = rot_names.count("output.weight") != 0;
         if (with_mtp && !I.mtp.head.dev) I.mtp.head = I.head;    // the MTP block shares the trunk's head
         weight_bytes_ = total;
         host_bytes_ = I.host_bytes;
@@ -1049,6 +1197,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         const int max_in = std::max({2 * E, cfg_.n_ff, V, H * D});
         const uint64_t f = 4, K = NC;
         bool ok = I.alloc(&I.q8_1, native_q8_1_bytes(max_in, NC), err, "q8_1 scratch") &&
+                  I.alloc(&I.rot_scratch, K * (uint64_t) max_in * f, err, "rotation scratch") &&
                   I.alloc(&I.x, K * E * f, err, "x") && I.alloc(&I.xn, K * E * f, err, "xn") &&
                   I.alloc(&I.mix, K * E * f, err, "mix") && I.alloc(&I.qkv, K * C * f, err, "qkv") &&
                   I.alloc(&I.h, K * C * f, err, "h") &&
@@ -1206,9 +1355,9 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
             Layer& L = I.layers[(size_t) l];
             dense_rms_norm(I.x, L.attn_norm, I.xn, n, E, cfg_.rms_eps, s);
             if (!L.attn) I.gdn_block(cfg_, L, n, snapshot, s);
-            else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, s);
+            else I.attn_block(cfg_, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, L.rot, s);
             add_inplace(I.x, I.mix, (int64_t) n * E, s);
-            I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, s);
+            I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
             if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
         }
         pos_ += n;
@@ -1219,10 +1368,14 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
         if (lg != Logits::None || keep_hidden) {
             dense_rms_norm(I.x, I.output_norm, I.hid, n, E, cfg_.rms_eps, s);     // h_nextn: the post-norm hidden
             if (lg == Logits::Last) {
-                I.quantize(I.hid + (size_t) (n - 1) * E, E, 1, s);
+                const float* src = I.hid + (size_t) (n - 1) * E;
+                if (I.head_rot) { dense_fwht_rows(src, I.rot_scratch, I.ham_signs(E), E, 1, false, s); src = I.rot_scratch; }
+                I.quantize(src, E, 1, s);
                 I.gemv(I.head, I.logits, 1, s);
             } else if (lg == Logits::All) {
-                I.quantize(I.hid, E, n, s);
+                const float* src = I.hid;
+                if (I.head_rot) { dense_fwht_rows(src, I.rot_scratch, I.ham_signs(E), E, n, false, s); src = I.rot_scratch; }
+                I.quantize(src, E, n, s);
                 I.gemv(I.head, I.logits, n, s);
             }
             if (dbg && lg != Logits::None) trace_logits(pos0 + n - 1, I.logits, cfg_.n_vocab, s);

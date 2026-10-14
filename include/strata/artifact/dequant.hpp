@@ -77,6 +77,18 @@ inline void dequantize_q2_0(const uint8_t* block, float* out) {
     }
 }
 
+// ---- PQ2_0 (Bonsai 2): the same 2-bit codec as Q2_0, one scale per 128 values (a 34-byte block).
+inline void dequantize_pq2_0(const uint8_t* block, float* out) {
+    const float d = fp16_to_fp32(read_u16(block));
+    const uint8_t* qs = block + 2;
+    for (int j = 0; j < 128; ++j) {
+        const int byte_index = j / 4;
+        const int bit_offset = (j % 4) * 2;
+        const int code = (qs[byte_index] >> bit_offset) & 0x03;
+        out[j] = (float)(code - 1) * d;
+    }
+}
+
 // ---- Q8_0: 32 elements from a 34-byte block.
 inline void dequantize_q8_0(const uint8_t* block, float* out) {
     const float d = fp16_to_fp32(read_u16(block));

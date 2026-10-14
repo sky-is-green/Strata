@@ -115,6 +115,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0";
     case 42:
         return "Q2_0";
+    case 142:
+        return "PQ2_0";
     case 143:
         return "PTQ1_0";
     case 144:
@@ -148,6 +150,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 143:
         elems = 128;
         bytes = 28;
+        return true;
+    case 142:
+        elems = 128;
+        bytes = 34;
         return true;
     case 144:
         elems = 32;
@@ -359,10 +365,13 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        // Small arrays are kept whole (prism.hadamard.sign_values and weight_names are read back element by
+        // element); the tokenizer's are kept as a sample, their count is what the engine uses.
+        constexpr uint64_t kKeepAll = 1u << 16;
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, 256));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (v.count <= kKeepAll || i < 64) v.items.push_back(std::move(e));
         }
         break;
     }

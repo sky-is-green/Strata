@@ -60,6 +60,15 @@ enum DenseKvFormat : int { DENSE_KV_F16 = 0, DENSE_KV_Q8 = 1, DENSE_KV_Q4 = 2 };
 /// Bytes of ONE head's ONE cell in `fmt` (a cache is [n_kv][max_ctx][this]).
 uint64_t dense_kv_cell_bytes(int fmt, int head_dim);
 
+/// The folded-basis activation transform (PrismML's prism.hadamard.*; Bonsai 2).  Block 1024, explicit +/-1
+/// signs: forward computes y = H (s . x) / 32 per block (R x), inverse y = s . (H x / 32) (R^T x).  x and y are
+/// [rows, width] row-major, width a multiple of 1024; x == y is allowed (in place).
+void dense_fwht_rows(const float* x, float* y, const float* signs, int width, int rows, bool inverse, void* stream);
+
+/// Prism's grouped GDN V layout: gather every row's [hd, nk, rep] tiled view into the [hd, rep, nk] order the
+/// ssm_out rotation uses (llama-graph.cpp's reshape/permute/reshape on the activation).
+void dense_permute_gdn_v(const float* x, float* y, int width, int rows, int hd, int nk, int rep, void* stream);
+
 /// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
 void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
                          int n_kv, int head_dim, int max_ctx, void* stream);
