@@ -24,6 +24,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
@@ -81,6 +82,25 @@ constexpr int kChunkCells = 256;   // attention split-K chunk
 __device__ __forceinline__ float silu(float v) { return v / (1.0f + expf(-v)); }
 __device__ __forceinline__ float sigm(float v) { return 1.0f / (1.0f + expf(-v)); }
 __device__ __forceinline__ float softplus(float v) { return v > 20.f ? v : log1pf(expf(v)); }
+
+/// The q8_1 activation block (native_mmvq's Q81Block layout): fp16 scale and sum, then 32 int8.
+struct __align__(4) Q81Block {
+    __half2 ds;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q81Block) == 36, "the q8_1 block is 36 bytes");
+
+// native_mmvq.cu's warp_max / warp_sum: the same XOR tree, so a block's scale and sum are the same bits.
+__device__ __forceinline__ float warp_max32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float warp_sum32(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
 
 __device__ float block_sum(float v, float* sh) {
     sh[threadIdx.x] = v;
@@ -149,7 +169,7 @@ __global__ void k_add_rms(float* x, const float* y, const float* w, float* h, in
 /// Replaces combine + gate + add + rms.
 __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, const float* wts, int K_,
                           const float* shared, const float* sgate, int sg_stride, const float* wn, float* h, int n,
-                          float eps, const float* branch) {
+                          float eps, const float* branch, Q81Block* hq) {
     __shared__ float sh[kThreads];
     __shared__ const float* pk[16];
     const int t = blockIdx.x;
@@ -172,7 +192,19 @@ __global__ void k_moe_out(float* x, const float* parts, const int32_t* prow, con
     if (wn == nullptr) return;
     s = block_sum(s, sh);
     const float r = rsqrtf(s / (float) n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) h[(size_t) t * n + i] = xr[i] * r * wn[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i] * r * wn[i];
+        h[(size_t) t * n + i] = v;
+        if (hq != nullptr) {   // the next layer's mixer quantizes exactly this h: stage its q8_1 image here, blocks
+            const float amax = warp_max32(fabsf(v));
+            const float sum = warp_sum32(v);
+            const float d = K::q8_1_finite(amax / 127.0f);
+            const int8_t q = K::q8_1_quant(v, d, amax);
+            const size_t b = (size_t) t * (n / 32) + i / 32;
+            hq[b].qs[i % 32] = q;
+            if (i % 32 == 0) hq[b].ds = K::q8_1_ds(d, sum);
+        }
+    }
 }
 /// dst[t][ld_dst] += src[t][n]: the correction branch's B output into its destination (y or the router logits,
 /// whose row stride is n + 1 in the one-row decode where the shared expert's gate shares the row).
@@ -339,12 +371,28 @@ __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl
     out[gi] = num / den * sigm(gate[gi]);
 }
 
-/// The routed entries (T tokens x K picks, entry e = t * K + k) grouped per expert, on the device: one group per
-/// expert used (ascending id), its blob address, its entries in entry order.  One block.
-__global__ void k_group(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs, unsigned long long blob,
-                        unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
-                        int32_t* ent_tok) {
+/// The expert setup's two launches in one: block 0 builds the group tables (the routed entries T tokens x K picks,
+/// entry e = t * K + k, grouped per expert: one group per expert used, its blob address, its entries in entry
+/// order), blocks 1.. quantize
+/// h for the experts and the shared expert (native_quantize_q8_1_kernel's blocks, shifted by one block).  The two
+/// are independent; the values are bitwise the two calls.
+__global__ void k_group_quant(const int32_t* ids, int n_ent, int K_, int n_expert, const uint8_t* blobs,
+                              unsigned long long blob, unsigned long long* grp_ptr, int32_t* grp_start,
+                              int32_t* n_groups, int32_t* ent_dst, int32_t* ent_tok, const float* qin, Q81Block* qout,
+                              int n) {
     __shared__ int cnt[512], off[512];
+    if (blockIdx.x != 0) {
+        const int i = ((int) blockIdx.x - 1) * kThreads + (int) threadIdx.x;
+        if (i >= n) return;
+        const float xi = qin[i];
+        const float amax = warp_max32(fabsf(xi));
+        const float sum = warp_sum32(xi);
+        const float d = K::q8_1_finite(amax / 127.0f);
+        const int8_t q = K::q8_1_quant(xi, d, amax);
+        qout[i / 32].qs[i % 32] = q;
+        if (i % 32 == 0) qout[i / 32].ds = K::q8_1_ds(d, sum);
+        return;
+    }
     for (int x = threadIdx.x; x < n_expert; x += blockDim.x) cnt[x] = 0;
     __syncthreads();
     for (int e = threadIdx.x; e < n_ent; e += blockDim.x) atomicAdd(&cnt[ids[e]], 1);
@@ -1443,7 +1491,7 @@ struct Engine {
     /// `li` indexes the layer's state; positions *dpos .. + T - 1 (device), p0 the same on the host (eager grids);
     /// `verify`: a verify window - the GDN state is read, not written (commit() writes it for the kept rows).
     void layer(const Layer& L, size_t li, int T, int64_t p0, const int32_t* dpos, bool graph_mode, bool verify,
-               const float* wn, float* hout) {
+               const float* wn, float* hout, bool& xq_staged) {
         const auto& g = m->g;
         const int N = (int) g.n_embd, Kp = (int) m->top_k, FF = (int) g.n_ff, FS = (int) g.n_ff_shexp;
         const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, D = (int) g.ssm_state_size;
@@ -1454,12 +1502,16 @@ struct Engine {
             if (tt) cudaEventRecord(ev_cls[((size_t) li * kTimeCls + cls) * 2 + (start ? 0 : 1)], st);
         };
         tick(0, true);   // the mixer: attention / GDN through its out projection
+        // the previous layer's k_moe_out wrote this mixer input and staged its q8_1 image (single-row windows):
+        // the quantize is already done then
+        const bool xq_hot = xq_staged && T <= kGemmT;
+        xq_staged = false;
         if (!L.attn) {
             float* qkv_b = verify ? v_qkv[li] : qkv;
             float* hc_b = verify ? v_hc[li] : hc;
             float* al_b = verify ? v_alpha[li] : alpha;
             float* be_b = verify ? v_beta[li] : beta;
-            prep(h, N, T, xq);
+            if (!xq_hot) prep(h, N, T, xq);
             apply(L.qkv, xq, qkv_b, T);
             apply(L.zg, xq, z, T);
             tick(0, false);
@@ -1494,7 +1546,7 @@ struct Engine {
             if (L.corr_a.d) corr_add(L.corr_a, L.corr_b, T, gdn_y, y, N);
             tick(3, false);
         } else {
-            prep(h, N, T, xq);
+            if (!xq_hot) prep(h, N, T, xq);
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
@@ -1614,9 +1666,10 @@ struct Engine {
             if (lhy(li)) stream_done();
             prow = rinv;
         } else {
-            k_group<<<1, kThreads, 0, st>>>(ids, (int) n_ent, Kp, (int) g.n_expert, L.blobs, L.stride, grp_ptr, grp_start,
-                                            n_groups, ent_dst, ent_tok);
-            quant(h, N, T, xq);   // the experts' and the shared expert's input
+            // the group tables and the q8_1 image of h in one node (k_group_quant: block 0 groups, the rest quantize)
+            k_group_quant<<<1 + (unsigned) (((int64_t) N * T + kThreads - 1) / kThreads), kThreads, 0, st>>>(
+                ids, (int) n_ent, Kp, (int) g.n_expert, L.blobs, L.stride, grp_ptr, grp_start, n_groups, ent_dst,
+                ent_tok, h, (Q81Block*) xq, (int) (N * T));
             tick(5, false);
             tick(6, true);
             K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
@@ -1654,7 +1707,9 @@ struct Engine {
             else corr_branch(L.moe_corr_a, L.moe_corr_b, T, h, corr, false);
         }
         k_moe_out<<<T, kThreads, 0, st>>>(x, eparts, prow, ewts, Kp, sy, one ? logits_r + g.n_expert : sgate, 1, wn, hout,
-                                          N, m->eps, L.moe_corr_a.d ? corr : nullptr);
+                                          N, m->eps, L.moe_corr_a.d ? corr : nullptr,
+                                          (wn != nullptr && T <= kGemmT) ? (Q81Block*) xq : nullptr);
+        xq_staged = wn != nullptr && T <= kGemmT;   // xq now holds q8_1(hout) for the next layer's mixer
         tick(8, false);
     }
 
@@ -1672,10 +1727,11 @@ struct Engine {
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
+        bool xq_staged = false;   // layer 0's h is fresh; each layer stages the next one's q8_1 image
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
             layer(m->layers[l], l, T, p0, pos0, graph_mode, verify, last ? m->out_norm : m->layers[l + 1].attn_norm,
-                  last ? hmain : h);
+                  last ? hmain : h, xq_staged);
         }
         if (heads > 0) head_rows(hmain + (size_t) (T - heads) * N, heads, logits, pick);
     }
@@ -1699,7 +1755,8 @@ struct Engine {
         k_rms_ld<<<T, kThreads, 0, st>>>(seeds, N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);      // [... | h]
         mm(m->eh_proj, mtp_cat, x, T);
         k_rms<<<T, kThreads, 0, st>>>(x, m->mtp.attn_norm, h, N, m->eps);
-        layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp);
+        bool xq_staged = false;
+        layer(m->mtp, m->layers.size(), T, p0, pos0_m, graph_mode, false, m->mtp_shnorm, hmtp, xq_staged);
         if (draft) head_rows(hmtp + (size_t) (T - 1) * N, 1, logits_m, pick_m);
     }
 
