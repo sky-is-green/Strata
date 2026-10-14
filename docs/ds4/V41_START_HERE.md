@@ -94,6 +94,50 @@ quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft pen
 
 ## 5c. Session 7 (2026-10-13 evening) - READ FIRST, supersedes 5b where they differ
 
+### Session 11 (2026-10-14 21:00 - 2026-10-15, overnight) - DSpark conf trim, FP4 KV, serve turns 2x faster
+**Read this block first.**  Mal's brief: make the NVMe reads and PCIe as efficient as possible, look for novel solutions,
+then serve defaults + Quetza.  Logs / scripts: `~/AI/v41-dev/s11/` (run1-6b, gate*, e2e/).  Commits afbc3f3c, d91c69a7,
+ee2845ca (+ serve defaults / docs).
+- **DSpark gallocr fix VERIFIED** (crash2_reqs at 256K: 3/3 requests; one-shot tokens/pass unchanged 4.267).
+- **Confidence-head verify trim** (`STRATA_DSPARK_CONF=0.6`, one-shot + serve; serve default now): the sidecar's
+  `mtp.2.confidence_head` was computed and ignored.  It is well calibrated (p >= 0.9: 119/119 accepted; 0.3-0.6: 40-75%)
+  and every verified draft costs ~20-27 ms of expert bytes (verify ms by width, docs: 72 / 91 / 118 / 135).  256 tok,
+  x0.5 + aa + K=64, depth 4 -> tau 0.6: **prose 9.48 -> 17.25, code 18.80 -> 25.54, docs 29.89 -> 30.30, python
+  26.57 -> 29.07** (tau 0.7 same within noise).  Exact routing: deterministic; it leaves depth 4's stream only at a
+  0.0009-logit tie - and depth 2 / plain decode leave depth 4's stream EARLIER (#7 / #8 of 64): the greedy stream depends
+  on the verify width (rounding), for DSpark itself - "DSpark output = plain greedy output" holds up to ties only.
+- **FreeToken q* (CPU share of the misses, `STRATA_TIER_BATCH_PCIE`)**: 0.85 neutral (159.2 -> 158.9 ms/pass), 0.75
+  -8%.  Our CPU pool spends ~1.1-1.4 ms per expert (PTQ1_0 ternary base-3 decode) vs ~0.4 ms a DMA - q* only pays
+  with a ~3x faster ternary CPU kernel (a project; DRAM-bound ideal ~0.25 ms).  Parked.
+- **Compression**: zstd on the expert region = 0.92 ratio (7.5%): not worth a decode stage.  Dropped.
+- **NVMe** (PM9A1 Gen4 x4, ntfs3, 1226 extents = not fragmented; MDTS 128 KiB): O_DIRECT microbench 9.4 MB blobs:
+  1 pread 5.4 GB/s, 8-way 4.2, 32-way 5.5.  Engine file-tier reads now **32 readers x 32 parts** (were 8 x 8,
+  `STRATA_D3_READERS` / `STRATA_D3_PARTS`): -17% ms per blob, decode +4-5% (code 24.72 -> 25.66, prose 15.75 ->
+  16.62).  NVME1TB has 16 GB free, so striping the file tier over two drives is impossible without freeing space.
+- **`--kv-fp4` (BIT-EXACT, serve default)**: the compressed KV is fake-quantized to e2m1 x E4M3/16 (NVFP4's grid) and
+  the indexer keys to e2m1 x 2^k/32 (MXFP4's) before they are stored as BF16.  Now stored as NVFP4 / MXFP4: exact
+  packers in the ggml fork (`tools/v41/ggml/kv-fp4.patch`, applied).  `test_ds41_kvfp4 --cuda` 0 / 5.2M differ;
+  engine gate (8000 tokens, exact routing, prestage pinned) last-row logits bitwise identical.  512K serve: free VRAM
+  after the dense half 10.46 -> 11.59 GiB.  **Gotcha found on the way:** the prompt's prestage region is sized from
+  FREE VRAM, so ANY VRAM change (KV size, ctx, desktop) moves prompt numerics (KL ~1e-4, same argmax) - pin
+  `STRATA_PRESTAGE_GIB` when A/B-ing bitwise.
+- **Serve turns** (`serve: prompt phases` stderr line): the DSpark seed tail (last 128 prompt tokens as 16-token EXACT
+  passes, ~2 s each) was half of every turn.  Now a turn that goes to the layer-major batch anyway takes the tail into
+  the batch and the seed rows are read off x_state (`Ds41Dense::read_state_cols`; `STRATA_SERVE_BATCH_TAIL=0` = old).
+  512K, DSpark + conf 0.6 + kv-fp4: **fresh 8000 51.2 -> 37.9 s, +272 tokens 33.5 -> 18.8 s, +1000 40.2 -> 19.7 s**
+  (+61 tokens = step path 8.4 s, unchanged); seed quality the same (tokens/pass 2.2-4.9), decode 22-30 tok/s.
+- **--prompt-batch trade** (serve, 512K): 8192 / 2048 / 1024 -> free VRAM 10.46 / 12.39 / 12.71 GiB but an 8000-token
+  prompt 44.6 / 83.5 / 132.7 s, decode no visible gain -> keep 8192.  The NC-sized prompt state is ~0.31 MiB/column
+  (~2.6 GiB): giving it back during decode needs VMM map/unmap (stable addresses: cached graphs keep view pointers) -
+  queued, low priority (more slots did not show in decode).
+- **Merge question (Mal)**: `~/AI/research/MERGE_REPORT.md` (deepseek-quetza pro, spot-checked): two object stores
+  (Strata = main/qwen; Strata-DS4 = deepseek4/glm/mimo + worktrees), dense vs Niko1221 histories joined by grafts;
+  glm <-> deepseek4 share base fb58e0db, 26 modified shared files, one real conflict (iq_kernels/native_mmvq split into
+  fork/*.cuh).  Code has not diverged much; history has.  Monorepo on one trunk + tools/<model>/ + a shared kernel tier
+  ~3-5 days.
+- Relay: the overnight chronos wake works (cron 17 * * * * ds4-overnight-nudge.sh -> `relay wait` background task,
+  re-armed after every wake; nudge fired from cron/systemd-run, never from the target window).
+
 ### Session 10b (2026-10-14 19:40-21:10) - DSpark IN --serve (speculative SAMPLING), crash fix UNTESTED; research
 **Read this block first.**  Mal's go 2026-10-14: (1) default x0.5 + arena-adapt + draft K=64 + arena 64 GiB, (2) DSpark
 in --serve, (3) Quetza wrapper with those settings, (4) GitHub update, (5) research FreeToken / llama.cpp.

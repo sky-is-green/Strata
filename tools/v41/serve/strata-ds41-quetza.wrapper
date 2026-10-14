@@ -3,9 +3,10 @@
 # STRATA-DS41-QUETZA - DeepSeek-V4.1-Flash (uncensored, GSQ mixed tiers) on the Strata-DS4 engine, QuetzaCodetl in front
 #
 # Engine:  build-ds4-gpu/ds41_generate --serve (Strata's engine line protocol) via tools/v41/serve/ds41-engine.sh
-#          (shared GPU lock with strata-glm, 84 GiB RAM cap, refuses while ComfyUI runs).  Tuned defaults: long
-#          prompts layer-major (~250 tok/s at 8K, exact), turns of <= 384 new tokens as decode steps (~25 tok/s),
-#          decode ~22-26 tok/s (route bias 1.0 + file penalty 0.6), same prompt again = no prefill
+#          (shared GPU lock with strata-glm, 84 GiB RAM cap, refuses while ComfyUI runs).  Defaults (2026-10-15):
+#          route bias x0.5 + file 0.3 + --arena-adapt (HumanEval 20/21, tools 10/10), DSpark speculative decode
+#          (exact sampling, confidence trim 0.6) ~17-30 tok/s, --kv-fp4 (bit-exact 4-bit KV), long prompts
+#          layer-major (~250 tok/s, exact), turns <= 96 new tokens as exact passes, bigger turns ~19 s at 512K
 # Server:  Strata's serve.server through tools/v41/serve/serve_ds41.py (DeepSeek encoder, DSML tool calls,
 #          reasoning effort 1-100) - OpenAI (/v1) + Anthropic (/v1/messages) + /health + llama.cpp-style /metrics
 # Context: 524288 (V4.1's caches are shared across layers: ~1.5 GB at 512K)

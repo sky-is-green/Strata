@@ -14,7 +14,15 @@
   "--ctx",
   "524288",
   "--stop",
-  "1"
+  "1",
+  "--arena-adapt",
+  "--kv-fp4",
+  "--route-bias",
+  "0.5",
+  "--route-bias-file",
+  "0.3",
+  "--arena-gib",
+  "64"
  ],
  "cwd": "/home/mal/AI/Strata-DS4",
  "tokenizer": "/media/mal/SSD NVME/AI/V41-GSQ/tokenizer",

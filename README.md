@@ -3,7 +3,7 @@
 <p align="center"><b>DeepSeek-V4.1-Flash (40 layers × 384 experts) on one gaming PC - 152 GiB of experts across VRAM, pinned RAM and NVMe</b><br>
 DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
 
-<p align="center"><b>RTX 4090 + 90 GB RAM:&nbsp; prefill ~250 tok/s (exact) &nbsp;·&nbsp; decode ~26 tok/s &nbsp;·&nbsp; DSpark speculative decode 31.7-39.5 tok/s</b></p>
+<p align="center"><b>RTX 4090 + 90 GB RAM:&nbsp; prefill ~250 tok/s (exact) &nbsp;·&nbsp; DSpark decode 17-30 tok/s at the coding-safe bias (x0.5) &nbsp;·&nbsp; 512K context</b></p>
 
 > **Status: experimental, single-developer research code, measured on one PC.** The V4.1 engine generates correct
 > text, its GPU prompt path is deterministic (byte-identical logits run to run), and it serves an OpenAI / Anthropic
@@ -12,6 +12,29 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
 > (upload complete 2026-10-13; all 16 parts, the vision/MTP sidecar and the small files are on the Hub).
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
+
+## Latest (2026-10-15)
+
+- **Coding quality vs speed, measured on real tasks** (21 HumanEval + 10 tool calls, greedy; `~/AI/v41-dev/taskeval`):
+  the decode route bias trades correctness for speed, so the default is now **x0.5** (`--route-bias 0.5
+  --route-bias-file 0.3 --arena-adapt`).
+  | route bias | HumanEval (21) | tool calls | DSpark tok/s (docs / python) |
+  | --- | ---: | ---: | ---: |
+  | x0.25 | 20/21 | 8/8 | 13.7 / 16.1 |
+  | **x0.5 (default)** | **20/21** | **10/10** | 22.3 / 22.9 -> **30.3 / 29.1** (below) |
+  | x0.75 | 19/21 | 10/10 | 28.3 / 35.2 |
+  | 1.0 (old default) | 16/21 | 10/10 | 37.7 / 39.1 |
+- **DSpark in `--serve`** (`STRATA_SERVE_DSPARK`, on by default in `ds41-engine.sh`): exact speculative sampling (the
+  output distribution is the model's at any temperature; unit-tested over 400k draws per case).
+- **Confidence-gated verify** (`STRATA_DSPARK_CONF=0.6`): the draft head's confidence output decides how many drafts a
+  verify pass checks - a rejected draft still costs its experts' PCIe/NVMe bytes (~25 ms each).  Same tokens up to
+  rounding ties; 256-token decode, x0.5: prose 9.5 -> **17.3**, code 18.8 -> **25.5**, docs 29.9 -> 30.3, python 26.6 -> **29.1** tok/s.
+- **Bit-exact 4-bit KV cache** (`--kv-fp4`): V4.1 already rounds its compressed KV to an NVFP4 grid and its indexer keys to
+  an MXFP4 grid; they are now stored that way (exact packers in the ggml fork, `tools/v41/ggml/kv-fp4.patch`) instead of
+  BF16 - logits bitwise identical, **+1.1 GiB of VRAM at 512K context**.
+- **Serve turns ~2x faster**: DSpark's seed rows come off the prompt batch instead of re-running the last 128 tokens.
+  512K context: +272-token turn 33.5 -> **18.8 s**, +1000-token turn 40.2 -> **19.7 s**, fresh 8000 tokens 51 -> 38 s.
+- NVMe: 32 concurrent reads per call (was 8): -17% per expert read, decode +4-5%.
 
 ## Latest (2026-10-14)
 

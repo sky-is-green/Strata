@@ -17,5 +17,15 @@ export STRATA_NO_LARGEPAGES="${STRATA_NO_LARGEPAGES:-1}"
 # STRATA_SERVE_STEP_MAX=768 STRATA_SERVE_PASS_BIAS=1
 export STRATA_SERVE_STEP_MAX="${STRATA_SERVE_STEP_MAX:-96}"
 export STRATA_SERVE_PASS_BIAS="${STRATA_SERVE_PASS_BIAS:-0}"
+# DSpark speculative decode in --serve (Mal's go 2026-10-14; exact speculative sampling, the output distribution is the
+# trunk's): the Q2_K sidecar, the draft's experts pruned to the 64 most used per layer (dspark_expert_counts.txt),
+# depth 4 with the confidence-head trim at 0.6 (s11: +30% avg, prose 9.5 -> 17.3 tok/s).  STRATA_SERVE_DSPARK= (empty)
+# turns it off.  The engine args (strata-ds41.json): route bias x0.5 + file 0.3, --arena-adapt, arena 64 GiB, --kv-fp4.
+DSPARK_SIDECAR=/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.Q2_K.gguf
+export STRATA_SERVE_DSPARK="${STRATA_SERVE_DSPARK-$DSPARK_SIDECAR}"
+export STRATA_DSPARK_KEEP="${STRATA_DSPARK_KEEP:-$PWD/tools/v41/serve/dspark_expert_counts.txt:64}"
+export STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}"
+export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
+[ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
 exec flock "$LOCK" systemd-run --user --scope -q --unit="ds41-serve-$$" -p MemoryMax=84G -p MemorySwapMax=0 \
     "$PWD/build-ds4-gpu/ds41_generate" "$@"
