@@ -25,7 +25,9 @@ OPEN / IDEAS (ask Mal before big ones):
    (fast PTQ1_0 kernel now; Q3_K / Q2_0 CPU paths unchanged), compression (7.5%), striping (no free NVMe).  Untried:
    in-pass draft pruning (drop trailing draft tokens mid-pass when their unique misses are expensive - lossless,
    they are just not verified); a smarter VRAM replacement than LRU.
-2. Small turns (<= 224 new tokens) run as exact 16-token passes (~7 tok/s; +60 tokens = 8 s).
+2. Small turns: < 128 new tokens run as exact 16-token passes (~7-12 tok/s; +60 = 6.6 s), >= 128 as a batch (+150 =
+   ~10 s, was 17.6).  Decode right after a batch turn starts colder (the VRAM cache is re-seeded from the rank list,
+   losing the LRU warmth) - keeping the cache's residency across a batch would help both.
 3. Prefill floor for batch turns: +272 tokens = dense ~3 s + experts ~7.7 s, the experts = NVMe reads of the routed
    file tier now at ~5.3 GB/s (the drive's ceiling ~5.4) - next: read fewer bytes (bigger RAM arena) or overlap the
    reads with the dense half of the same layer.

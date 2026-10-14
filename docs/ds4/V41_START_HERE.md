@@ -134,7 +134,8 @@ ee2845ca (+ serve defaults / docs).
   10/10, agentic 3/3**, and a headless Quetza turn (write sum100.py, run it, report 5050) worked: 15.4K-token system
   prompt 50.5 s, tool-result turns of 17 / 27 / 89 tokens 1.9 / 2.3 / 7.2 s, decode 17-27 tok/s.  Re-run after the
   elastic columns + PTQ1_0 kernel + prefetch gate (03:30): again 20/21 / 10/10 / 3/3 + the Quetza turn, suite 858 ->
-  792 s, decode 21-30 tok/s.
+  792 s, decode 21-30 tok/s.  Third run (04:30, + wave parts, prefetch off, small-turn batches): again 20/21 / 10/10
+  / 3/3 + the Quetza turn; suite **599 s** (first run 858 s); agent turns of 133 / 188 new tokens 7.1 / 7.8 s.
 - **Decode vs expert-slot VRAM** (one-shot, `--vram-margin` 1.0 / 2.3 / 3.6 = 13.44 / 12.13 / 10.83 GiB of slots):
   verify ms python 131 / 136 / 145, prose 71 / 73 / 78, code 89 / 93 / 107 -> every 2.6 GiB is 10-20% of a pass.
 - **Elastic state columns** (serve default, `STRATA_ELASTIC_COLS=0` = off): Ds41Dense's NC-column tensors (~0.31
@@ -160,6 +161,10 @@ ee2845ca (+ serve defaults / docs).
   stopped paying at every size (gate 640 / never: fresh 8000 33.6 / 32.4 s, +1000 19.1 / 16.6 s, +272 10.5 / 10.5) ->
   **default never** (`STRATA_CHUNK_PF_MIN=<rows>` brings it back); its 2 x 2.71 GiB pinned slabs are no longer
   allocated: serve min MemAvailable 15 GiB (arena 64).  Arena 68 then: no visible decode gain, min 11 GiB -> stays 64.
+- **Small turns** (`STRATA_SERVE_BATCH_MIN`, default 128 tokens): every turn up to 224 new tokens ran as exact 16-token
+  passes (the 128-token DSpark tail + STEP_MAX 96).  512K, prompt s (+ 32-token decode) passes / batch: +30 5.0 (1.7)
+  / 6.0 (2.0), +60 6.6 (1.7) / 7.0 (2.0), +90 9.7 (1.0) / 7.7 (1.7), **+150 17.6 (1.4) / 9.8 (1.6)**.  Decode right
+  after a batch starts colder (the cache is re-seeded), so the cut sits above the ~80-token crossover.
 - **Relay fix** (`~/AI/QuetzaCodetl/wrappers/tools/relay`, untracked file - live via ~/.local/bin/relay; skill text
   regenerated): `ask/reply/broadcast --name X` from a window with another name now gets an UNBOUND daemon instead of
   renaming the window (the session-10 gotcha).  Not committed in QuetzaCodetl (its tree has others' uncommitted work).

@@ -1055,7 +1055,7 @@ int main(int argc, char ** argv) {
             }
 #endif
             int dh = delta - sp_tail;   // the part the passes / batch feed
-            const bool by_step = defer_vram && dh >= 1 && dh <= step_max;
+            bool by_step = defer_vram && dh >= 1 && dh <= step_max;
             // STRATA_SERVE_BATCH_TAIL (default on, =0 the old way): a turn that runs as a layer-major batch anyway takes
             // its DSpark tail INTO the batch and the seed rows are read off the batch's state (bcap_vh) - the tail as
             // 16-token exact passes was half of every turn (s11 2026-10-15: +273 tokens 33.5 s = batch 17.1 + tail 15.8).
@@ -1063,6 +1063,18 @@ int main(int argc, char ** argv) {
             static const bool batch_tail = !(std::getenv("STRATA_SERVE_BATCH_TAIL") && std::getenv("STRATA_SERVE_BATCH_TAIL")[0] == '0');
             int bcap = 0;
             if (batch_tail && sp_tail > 0 && !by_step && dh >= 2 && PB > 1) { bcap = sp_tail; dh = delta; }
+            // STRATA_SERVE_BATCH_MIN (tokens; default 128, 0 = off): a turn of at least this many new tokens runs as a
+            // layer-major batch even when the passes would take it (every turn up to 128 + STEP_MAX = 224 tokens did:
+            // the DSpark tail + the step path).  The batch's floor fell with the routed-only reads.  s11, 512K, prompt s
+            // (+ 32-token decode) passes / batch: +30 5.0 (1.7) / 6.0 (2.0), +60 6.6 (1.7) / 7.0 (2.0), +90 9.7 (1.0) /
+            // 7.7 (1.7), +150 17.6 (1.4) / 9.8 (1.6).  Decode right after a batch starts colder (the VRAM cache is
+            // re-seeded), hence the margin above the ~80-token crossover.
+            static const int batch_min = std::getenv("STRATA_SERVE_BATCH_MIN") ? std::atoi(std::getenv("STRATA_SERVE_BATCH_MIN")) : 128;
+            bool force_batch = false;
+            if (batch_min > 0 && batch_tail && sp_tail > 0 && bcap == 0 && delta >= batch_min && PB > 1 && delta >= 2) {
+                bcap = sp_tail; dh = delta; force_batch = true; by_step = false;
+            }
+            (void) force_batch;
             if (by_step && !cache_open) {
                 if (!open_cache()) { std::printf("ERR VRAM seed failed: %s\n", err.c_str()); std::fflush(stdout); continue; }
                 cache_open = true;
