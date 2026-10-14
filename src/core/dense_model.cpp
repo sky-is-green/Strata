@@ -932,16 +932,13 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         // handoff then cannot win or lose a race, which is how a visibility bug in the device-side doorbell
         // shows itself.  Slow by design: a debug switch.
         const bool hsync = [] { const char* e = std::getenv("STRATA_DENSE_SPLIT_SYNC"); return e && e[0] != '0'; }();
-        // STRATA_DENSE_SPLIT_EVWAIT=1: replace the device-side poll with a host wait on the producer's ring
-        // event.  Same ordering, through the event path instead of the doorbell -- the doorbell is what is left
-        // when the data path has been changed three ways and the reply is still the previous layer's work.
-        const bool evwait = [] { const char* e = std::getenv("STRATA_DENSE_SPLIT_EVWAIT"); return e && e[0] != '0'; }();
-        // The wait itself: spin on the doorbell in pinned host memory.  It is coherent for the CPU, and the ring
-        // kernel's system-fence store makes it visible in fractions of a microsecond (measured 0.59 us), while a
-        // cudaEventSynchronize round trip costs tens of microseconds -- four of those per layer was most of the
-        // distance to the single card.  This keeps the ordering the event wait gave (the data work of the
-        // producing stream is complete), with a much cheaper host side.
-        auto wait_bell = [](const uint32_t* bell, uint32_t seq) {
+        // STRATA_DENSE_SPLIT_EVWAIT: how the host waits for the producer's stream before the consumer's fetch.
+        //   1 (the split config's mode) = the verified mode: cudaEventSynchronize on the producer's ring event.
+        //   2 = the doorbell spin.  Measured wrong on this box (2026-10-14): the pinned bell becomes visible long
+        //       before the DMA's posted writes to the staged payload do, so every layer's fetch reads a torn or
+        //       stale payload and the reply degenerates into one repeated token.  Kept to reproduce that.
+        const int evwait = [] { const char* e = std::getenv("STRATA_DENSE_SPLIT_EVWAIT"); return e ? std::atoi(e) : 0; }();
+        auto wait_bell = [](const uint32_t* bell, uint32_t seq) {         // mode 2
             while (*reinterpret_cast<const volatile uint32_t*>(bell) - seq > 0x80000000u) {
             }
         };
@@ -957,7 +954,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         // split runs but every layer hands over the previous layer's data.
         cudaMemcpyAsync(hx_stage, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
         dense_split_ring(split_bell_dev, seq_x, s);
-
+        if (evwait == 1) cudaEventRecord(ev_x, s0);
 
         QMat g0 = L.ffn_gate, u0 = L.ffn_up;
         g0.n_out = r0;
@@ -973,6 +970,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         dense_split_copy(hs0, h_full, r0, n, c.n_ff, 0, s);
         cudaMemcpyAsync(hh0_stage, hs0, (size_t) n * r0 * 4, cudaMemcpyDeviceToHost, s0);
         dense_split_ring(split_bell_dev + 32, seq_h0, s);
+        if (evwait == 1) cudaEventRecord(ev_h0, s0);
 
         if (trb) {
             trace_head("s0_g", cur_layer, "split0", ffn_g, r0, s);
@@ -982,7 +980,8 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         int prev = 0;
         cudaGetDevice(&prev);
         cudaSetDevice(1);
-        if (evwait) wait_bell(split_bell, seq_x);
+        if (evwait == 1) cudaEventSynchronize(ev_x);
+        else if (evwait == 2) wait_bell(split_bell, seq_x);
         dense_split_poll(split_bell_dev, seq_x, stream1);
         if (hsync) cudaStreamSynchronize(s0);
         cudaMemcpyAsync(x1, hx_stage, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream1);
@@ -998,8 +997,10 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         dense_split_copy(hs1, h_full1, r1, n, c.n_ff, r0, stream1);
         cudaMemcpyAsync(hh1_stage, hs1, (size_t) n * r1 * 4, cudaMemcpyDeviceToHost, stream1);
         dense_split_ring(split_bell_dev + 16, seq_h1, stream1);
+        if (evwait == 1) cudaEventRecord(ev_h1, stream1);
 
-        if (evwait) wait_bell(split_bell + 32, seq_h0);
+        if (evwait == 1) cudaEventSynchronize(ev_h0);
+        else if (evwait == 2) wait_bell(split_bell + 32, seq_h0);
         dense_split_poll(split_bell_dev + 32, seq_h0, stream1);
         if (hsync) cudaStreamSynchronize(s0);
         cudaMemcpyAsync(h_peer0, hh0_stage, (size_t) n * r0 * 4, cudaMemcpyHostToDevice, stream1);
@@ -1009,6 +1010,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
             native_mmvq(L.ffn_down1.type, L.ffn_down1.dev, q8_1_1, mix1, c.n_ff, E - half, n, stream1);
             cudaMemcpyAsync(hm1_stage, mix1, (size_t) n * (E - half) * 4, cudaMemcpyDeviceToHost, stream1);
             dense_split_ring(split_bell_dev + 48, seq_o, stream1);
+            if (evwait == 1) cudaEventRecord(ev_o, stream1);
         }
         if (trb) {
             trace_head("s1_g", cur_layer, "split1", ffn_g1, r1, stream1);
@@ -1020,7 +1022,8 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         cudaSetDevice(prev);
         SDBG("card1 leg enqueued");
 
-        if (evwait) wait_bell(split_bell + 16, seq_h1);
+        if (evwait == 1) cudaEventSynchronize(ev_h1);
+        else if (evwait == 2) wait_bell(split_bell + 16, seq_h1);
         dense_split_poll(split_bell_dev + 16, seq_h1, s);
         if (hsync) cudaStreamSynchronize(stream1);
         cudaMemcpyAsync(h_peer, hh1_stage, (size_t) n * r1 * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
@@ -1036,7 +1039,8 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         } else if (smode == 2) {
             QMat d0 = L.ffn_down;
             gemv(d0, mix, n, s);                                     // bisect: card 0 alone ...
-            if (evwait) wait_bell(split_bell + 48, seq_o);
+            if (evwait == 1) cudaEventSynchronize(ev_o);
+            else if (evwait == 2) wait_bell(split_bell + 48, seq_o);
             dense_split_poll(split_bell_dev + 48, seq_o, s);
             if (hsync) cudaStreamSynchronize(stream1);
             cudaMemcpyAsync(dx_dev, hm1_stage, (size_t) n * (E - half) * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
@@ -1047,7 +1051,8 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
                 d0.n_out = half;
                 gemv(d0, mix_lo, n, s);                              // card 0's half of the output rows, compact
             }
-            if (evwait) wait_bell(split_bell + 48, seq_o);
+            if (evwait == 1) cudaEventSynchronize(ev_o);
+            else if (evwait == 2) wait_bell(split_bell + 48, seq_o);
             dense_split_poll(split_bell_dev + 48, seq_o, s);
             if (hsync) cudaStreamSynchronize(stream1);
             cudaMemcpyAsync(dx_dev, hm1_stage, (size_t) n * (E - half) * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
