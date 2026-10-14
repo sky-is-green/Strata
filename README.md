@@ -37,7 +37,10 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
   +272-token turn 33.5 -> **14.7 s**, +1000-token turn 40.2 -> **19.4 s**, fresh 8000 tokens 51 -> 37 s.
 - End to end through the server (the defaults): HumanEval 20/21, tool calls 10/10, agentic bug-fix loops 3/3, and real
   QuetzaCodetl agent turns.
-- NVMe: 32 concurrent reads per call (was 8): -17% per expert read, decode +4-5%.
+- **+2.4 GiB of expert slots while serving**: the prompt batch's 8192-column state is allocated only while a batch runs
+  (512K: 1227 -> 1509 experts in VRAM; every 2.6 GiB of slots is 10-20% of a verify pass).
+- NVMe: 32 concurrent reads per call (was 8): -17% per expert read, decode +4-5%.  Ternary (PTQ1_0) CPU expert kernel
+  3.9-7.7x faster.
 
 ## Latest (2026-10-14)
 

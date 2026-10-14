@@ -132,7 +132,24 @@ ee2845ca (+ serve defaults / docs).
   start: 51.2 / 33.5 / 40.2).
 - **E2E on the production stack** (build-ds4-gpu + strata-ds41.json, port 8150): smoke OK, **HumanEval 20/21, tools
   10/10, agentic 3/3**, and a headless Quetza turn (write sum100.py, run it, report 5050) worked: 15.4K-token system
-  prompt 50.5 s, tool-result turns of 17 / 27 / 89 tokens 1.9 / 2.3 / 7.2 s, decode 17-27 tok/s.
+  prompt 50.5 s, tool-result turns of 17 / 27 / 89 tokens 1.9 / 2.3 / 7.2 s, decode 17-27 tok/s.  Re-run after the
+  elastic columns + PTQ1_0 kernel + prefetch gate (03:30): again 20/21 / 10/10 / 3/3 + the Quetza turn, suite 858 ->
+  792 s, decode 21-30 tok/s.
+- **Decode vs expert-slot VRAM** (one-shot, `--vram-margin` 1.0 / 2.3 / 3.6 = 13.44 / 12.13 / 10.83 GiB of slots):
+  verify ms python 131 / 136 / 145, prose 71 / 73 / 78, code 89 / 93 / 107 -> every 2.6 GiB is 10-20% of a pass.
+- **Elastic state columns** (serve default, `STRATA_ELASTIC_COLS=0` = off): Ds41Dense's NC-column tensors (~0.31
+  MiB a column) live in their own buffer; `set_columns()` resizes them between passes (drops every cached graph and
+  both gallocrs - views keep their first addresses; generate re-reads `rdev1` = routed_dev() after a resize, which
+  was the first crash).  Serve decodes with S = 512 columns, grows to the batch for a layer-major prompt.  512K:
+  **11.59 -> 14.00 GiB free after the dense half, 1227 -> 1509 VRAM experts**, 4-turn bench decode +5-11%.  Gate
+  (exact routing, no DSpark, prestage pinned, 8000 + 272 tokens): tokens identical on / off.
+- **PTQ1_0 CPU kernel** (`ptq1_0_rows_q8_0`, src/kernels/cpu/ptq1_0.cpp; the pool takes it for ternary gate/up and
+  down, `STRATA_NO_PTQ1_ROWS=1` = old): every digit SIMD-decoded once per block for all tokens, sub-block sums exact
+  int32, F16C - **3.9x at 1 token, 6-8x at 2-3** (0.74 -> 2.90 GB/s a core).  ptq1_0_test ALL PASS.
+- **q* re-test with it** (`STRATA_TIER_BATCH_PCIE`, + recurring-first selection, `STRATA_TIER_QSTAR_RECENCY`):
+  verify ms summed over python / prose / code: 1.0 291.3, 0.5 275.9 (old order) / 274.3 (recency), 0.7 285.1 ->
+  ~-5%, at the noise floor -> default stays 1.0.  FreeToken's own rule says the same: hybrid only when CPU GEMV
+  bandwidth > 2x PCIe; here ~24 GB/s (8 cores x ~3) vs 21.6.
 - **Relay fix** (`~/AI/QuetzaCodetl/wrappers/tools/relay`, untracked file - live via ~/.local/bin/relay; skill text
   regenerated): `ask/reply/broadcast --name X` from a window with another name now gets an UNBOUND daemon instead of
   renaming the window (the session-10 gotcha).  Not committed in QuetzaCodetl (its tree has others' uncommitted work).

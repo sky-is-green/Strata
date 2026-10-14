@@ -3,6 +3,40 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-15 ~03:30 (end of session 11) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4 deepseek4:main
+- pushing is OK'd; GitHub = Indras-Mirror/Strata-DSV4.1).  READ FIRST: docs/ds4/V41_START_HERE.md section 5c block
+"Session 11" (newest; the complete record of the overnight session), then only what a question needs.
+
+STATE (RTX 4090 + 90 GB RAM), all committed + pushed, production build-ds4-gpu rebuilt:
+- Serve defaults (tools/v41/serve/ds41-engine.sh + strata-ds41.json, used by the strata-ds41-quetza wrapper): route
+  bias x0.5 + file 0.3 + --arena-adapt + arena 64 GiB, DSpark speculative decode (exact sampling) + confidence trim
+  0.6, --kv-fp4 (bit-exact), elastic state columns, batch-seeded DSpark tail, chunk prefetch only >= 640 rows, D3 file
+  reads 32 x 32.  Production e2e: HumanEval 20/21, tools 10/10, agentic 3/3, real Quetza turns work.
+- 512K serve: 14.00 GiB free after the dense half (was 10.46), turns: fresh 8000 ~37 s, +272 ~15 s, +1000 ~20 s
+  (were 51 / 33.5 / 40), decode ~21-34 tok/s on the 4-turn bench.
+- third_party/llama.cpp is UNTRACKED: ggml changes ship as tools/v41/ggml/*.patch (kv-fp4.patch is applied).
+- When A/B-ing bitwise: pin STRATA_PRESTAGE_GIB (the prompt prestage region follows free VRAM and moves numerics).
+
+OPEN / IDEAS (ask Mal before big ones):
+1. Decode is PCIe-bound (~70 of ~130 ms a python verify pass is expert DMA).  Measured, no clear gain: q* CPU share
+   (fast PTQ1_0 kernel now; Q3_K / Q2_0 CPU paths unchanged), compression (7.5%), striping (no free NVMe).  Untried:
+   in-pass draft pruning (drop trailing draft tokens mid-pass when their unique misses are expensive - lossless,
+   they are just not verified); a smarter VRAM replacement than LRU.
+2. Small turns (<= 224 new tokens) run as exact 16-token passes (~7 tok/s; +60 tokens = 8 s).
+3. Prefill floor ~15-19 s for any batch turn (NVMe-bound).
+4. Merge question: ~/AI/research/MERGE_REPORT.md (glm <-> deepseek4 closest; monorepo ~3-5 days).
+5. Relay: --name fix is live in ~/AI/QuetzaCodetl/wrappers/tools/relay (untracked); Quetza's bundled relay.ts was
+   regenerated but needs a Quetza rebuild (not committed - that tree has others' uncommitted work).
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes the GPU lock; never wrap it in flock);
+--serve runs NOT through memguard (engine.sh / ds41-engine.sh: flock + systemd-run scope).  Need >= 75 GB MemAvailable.
+Kill by exact PID only; never pkill -f a pattern in your own command line.  Never rebuild a build dir while a run
+launches from it (the binary swap fails the launch: "Permission denied").  ninja with an unknown target builds NOTHING.
+```
+
 ## RESUME PROMPT 2026-10-14 ~21:10 (end of session 10) - paste the block below into a new session
 
 ```
