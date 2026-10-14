@@ -73,7 +73,7 @@ void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
     for (float& v : ha) v = d(rng) * 0.5f;
     for (float& v : hw) v = 0.5f + d(rng) * 0.1f;
     for (float& v : hs) v = (rng() & 1) ? 1.0f : -1.0f;
-    float *x = nullptr, *add = nullptr, *w = nullptr, *s = nullptr, *xn1 = nullptr, *xn2 = nullptr;
+    float *x = nullptr, *add = nullptr, *w = nullptr, *s = nullptr, *xn1 = nullptr, *xn2 = nullptr, *xn3 = nullptr;
     void *q1 = nullptr, *q2 = nullptr, *q3 = nullptr, *q3ref = nullptr;
     const size_t qb = strata::kernels::native_q8_1_bytes(width, rows);
     cudaMalloc(&x, hx.size() * 4);
@@ -82,6 +82,7 @@ void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
     cudaMalloc(&s, (size_t) width * 4);
     cudaMalloc(&xn1, hx.size() * 4);
     cudaMalloc(&xn2, hx.size() * 4);
+    cudaMalloc(&xn3, hx.size() * 4);
     cudaMalloc(&q1, qb);
     cudaMalloc(&q2, qb);
     cudaMalloc(&q3, qb);
@@ -93,6 +94,18 @@ void rmsfq_case(int rows, int width, bool with_add, std::mt19937& rng) {
 
     if (with_add) strata::kernels::add_inplace(x, add, (int64_t) rows * width, g_st);
     strata::kernels::dense_rms_norm(x, w, xn1, rows, width, 1e-6f, g_st);
+    if (with_add) {                                          // the folded form the pass now uses must match the pair
+        cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+        cudaStreamSynchronize(g_st);
+        strata::kernels::dense_rms_norm(x, w, xn3, rows, width, 1e-6f, g_st, add);
+        cudaStreamSynchronize(g_st);
+        std::vector<float> c3((size_t) rows * width), d3((size_t) rows * width);
+        cudaMemcpy(c3.data(), xn1, c3.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(d3.data(), xn3, d3.size() * 4, cudaMemcpyDeviceToHost);
+        char w3[96];
+        std::snprintf(w3, sizeof w3, "rms_norm add rows=%d width=%d", rows, width);
+        check(w3, c3, d3);
+    }
     strata::kernels::dense_fwht_quantize_rows(xn1, q1, nullptr, s, width, rows, 0, 0, 0, g_st);
     cudaStreamSynchronize(g_st);
     if (with_add) cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);   // same pre-add state

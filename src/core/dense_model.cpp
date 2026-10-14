@@ -851,7 +851,8 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     gemv(wo, mix, n, s);
 }
 
-// x += ffn(rms_norm(x, post_norm)), for n columns
+// mix = ffn(rms_norm(x + pre_add, post_norm)) for n columns; the caller folds the mix into x through the next
+// block's rms (see enqueue_pass: the residual add is deferred, one launch per layer less).
 void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm,
                                  int n, uint16_t rot, void* s, const float* pre_add) {
     const int E = c.n_embd;
@@ -894,10 +895,8 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     if (trb) trace_head("ffn_hrot_r0", cur_layer, "single", rot_scratch + ffn_r0, c.n_ff - ffn_r0, s);
     if (trb) trace_head("ffn_g_r0", cur_layer, "single", ffn_g + ffn_r0, c.n_ff - ffn_r0, s);
     if (trb) trace_head("ffn_vs", cur_layer, "single", rot_scratch, c.n_ff, s);
-    {
-        PScope ps(&prof, Prof::ADD, s);
-        add_inplace(x, mix, (int64_t) n * E, s);
-    }
+    // The residual add is DEFERRED: x += mix happens inside the next block's input rms (or the output norm),
+    // whose `add` argument is this mix.  Nothing else reads x between here and there.
 }
 
 // Debug (STRATA_DENSE_FFN_SELFCHECK=1): the same layer, computed twice.  `mix` holds the split's own down output;
@@ -913,7 +912,7 @@ void DenseModel::Impl::ffn_selfcheck(const DenseConfig& c, const Layer& L, int n
     // buffer is a stale read on this box, which is what made the first self-check lie.
     dense_split_stage_out(x, dbg_x, (int64_t) tot, s);               // the pre-add residual
     dense_split_stage_out(mix, dbg_mix, (int64_t) tot, s);           // the split's own down output
-    ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s);   // the reference (adds its mix to x)
+    ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s);   // the reference; the restore below adds
     dense_split_stage_out(mix, dbg_b, (int64_t) tot, s);             // the reference's down output
     cudaStreamSynchronize(st);
     size_t first = tot, ndiff = 0;
@@ -1131,6 +1130,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     // honest fallback is the plain block.
     if (trb) std::fprintf(stderr, "dbg layer=%d split fallback (peer path off)\n", cur_layer);
     ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s, pre_add);
+    add_inplace(x, mix, (int64_t) n * E, s);        // ffn_block defers its residual add past this point
 #undef SDBG
 }
 
@@ -1254,6 +1254,7 @@ bool DenseModel::Impl::mtp_block(const DenseConfig& c, int n, int pos0, bool wan
     attn_block(c, M.q, M.k, M.v, M.o, M.q_norm, M.k_norm, M.kc, M.vc, n, pos0, nullptr, 0, s);   // the MTP block is never folded
     add_inplace(x, mix, (int64_t) n * E, s);
     ffn_block(c, M.ffn_gate, M.ffn_up, M.ffn_down, M.post_norm, n, 0, s);
+    add_inplace(x, mix, (int64_t) n * E, s);        // ffn_block defers its residual add; the head below reads x
     if (want_logits) {
         dense_rms_norm(x + (size_t) (n - 1) * E, M.head_norm, xn, 1, E, c.rms_eps, s);
         cudaMemcpyAsync(mtp_h, xn, (size_t) E * 4, cudaMemcpyDeviceToDevice, (cudaStream_t) s);
@@ -1987,6 +1988,10 @@ bool DenseModel::Impl::enqueue_pass(const DenseConfig& c, int n, int64_t pos0, L
     if (pos_slot) cudaMemcpyAsync((void*) pos_slot, pos_slot_host, sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) s);
     const bool dbg = dbg_from >= 0 && pos0 < dbg_to && pos0 + n > dbg_from;
     if (dbg) trace_vec("embed", pos0, -1, "", x, n * E, s);
+    // The FFN's residual add is deferred: its down output (mix) rides in the NEXT block's input rms, which is the
+    // only reader of x before that block's own output overwrites mix.  One launch less per layer (and the output
+    // norm folds the last one).
+    const float* pending = nullptr;
     for (int l = 0; l < c.n_layer; ++l) {
         Layer& L = layers[(size_t) l];
         // The pre-block rms and the folded-basis rotation of its output are one launch when the block needs the
@@ -1998,39 +2003,47 @@ bool DenseModel::Impl::enqueue_pass(const DenseConfig& c, int n, int64_t pos0, L
         const bool pre_ab = !L.attn && L.ab_quant && rot_pre;
         if (pre_rot) {
             PScope ps(&prof, Prof::QUANT, s);
-            dense_rms_fwht_quant_rows(x, nullptr, L.attn_norm, xn, q8_1, ham_signs(E), E, n, c.rms_eps, s,
+            dense_rms_fwht_quant_rows(x, pending, L.attn_norm, xn, q8_1, ham_signs(E), E, n, c.rms_eps, s,
                                       pre_ab ? q8_1_ab : nullptr);
         } else {
             PScope ps(&prof, Prof::RMS, s);
-            dense_rms_norm(x, L.attn_norm, xn, n, E, c.rms_eps, s);
+            dense_rms_norm(x, L.attn_norm, xn, n, E, c.rms_eps, s, pending);
         }
+        pending = nullptr;
         if (!L.attn) gdn_block(c, L, n, snapshot, s, pre_rot);
         else attn_block(c, L.q, L.k, L.v, L.o, L.q_norm, L.k_norm, L.kc, L.vc, n, (int) pos0, pos_slot, L.rot, s,
                         pre_rot);
         cur_layer = l;
         // The mixed block's residual add rides in the FFN's input rms (the only reader of mix before the FFN's
-        // own down GEMV overwrites it), one launch instead of two.
+        // own down GEMV overwrites it), one launch instead of two.  The FFN's own add is deferred the same way.
         // STRATA_DENSE_SPLIT_OFF=1: keep the split load (so ffn_r0 and the traces are the split's) but run the
         // plain single-card FFN.  The reference side of the part-by-part comparison.
         static const bool split_off = std::getenv("STRATA_DENSE_SPLIT_OFF") && std::getenv("STRATA_DENSE_SPLIT_OFF")[0] != '0';
-        if (ffn_split && !split_off) ffn_block_split(c, L, n, L.rot, s, mix);
-        else ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s, mix);
+        if (ffn_split && !split_off) {
+            ffn_block_split(c, L, n, L.rot, s, mix);            // adds its own output to x
+        } else {
+            ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s, mix);
+            // The x trace reads the post-add residual; with the debug trace on, add like before and keep the
+            // next rms reading its own x.
+            if (dbg) add_inplace(x, mix, (int64_t) n * E, s);
+            else pending = mix;
+        }
         if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", x, n * E, s);
     }
     if (lg != Logits::None || keep_hidden) {
         {
             PScope ps(&prof, Prof::RMS, s);
-            dense_rms_norm(x, output_norm, hid, n, E, c.rms_eps, s);     // h_nextn: the post-norm hidden
+            dense_rms_norm(x, output_norm, hid, n, E, c.rms_eps, s, pending);   // h_nextn: the post-norm hidden
         }
         if (lg == Logits::Last) {
             const float* src = hid + (size_t) (n - 1) * E;
-            if (head_rot) { dense_fwht_rows(src, rot_scratch, ham_signs(E), E, 1, false, s); src = rot_scratch; }
-            quantize(src, E, 1, s);
+            if (head_rot) fwht_quantize(src, E, 1, ham_signs(E), nullptr, 0, 0, 0, s);  // rotation + q8_1, one launch
+            else quantize(src, E, 1, s);
             gemv(head, logits, 1, s);
         } else if (lg == Logits::All) {
             const float* src = hid;
-            if (head_rot) { dense_fwht_rows(src, rot_scratch, ham_signs(E), E, n, false, s); src = rot_scratch; }
-            quantize(src, E, n, s);
+            if (head_rot) fwht_quantize(src, E, n, ham_signs(E), nullptr, 0, 0, 0, s);
+            else quantize(src, E, n, s);
             gemv(head, logits, n, s);
         }
         if (dbg && lg != Logits::None) trace_logits(pos0 + n - 1, logits, c.n_vocab, s);
