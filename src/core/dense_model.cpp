@@ -47,6 +47,7 @@ struct QMat {
     void* dev = nullptr;
     int type = -1;
     int n_in = 0, n_out = 0;
+    int row0 = 0;                   // the first weight row this slice holds (a matrix split across GPUs)
 };
 
 /// Which of a layer's matrices are stored in the folded (rotated) basis; see prism.hadamard.weight_names.
@@ -62,6 +63,7 @@ struct Layer {
     float* attn_norm = nullptr;
     float* post_norm = nullptr;
     QMat ffn_gate, ffn_up, ffn_down;
+    QMat ffn_gate1, ffn_up1, ffn_down_s0, ffn_down1;   // the FFN split across GPUs (card1 rows, card0's packed slice)
     // GDN mixer
     QMat qkv, z, ssm_out;
     float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *ssm_norm = nullptr;
@@ -301,6 +303,24 @@ struct DenseModel::Impl {
         return nullptr;
     }
 
+    // ---- phase 1 of the split across GPUs: the FFN's gate/up/down on a second card.  Card 0 keeps the whole
+    // model and computes its share (attention/GDN/embeddings plus the first ffn_r0 FFN rows); card 1 owns the
+    // remaining FFN rows (and a packed input-column slice of down) and receives the rotated activation per layer.
+    bool ffn_split = false;
+    int ffn_r0 = 0;                                 // card 0's FFN row count; card 1 gets [ffn_r0, n_ff)
+    cudaStream_t stream1 = nullptr;
+    cudaEvent_t ev_x = nullptr, ev_dx = nullptr;    // card0 -> card1 handoff, card1 -> card0 handoff
+    float* stage_x = nullptr;                       // pinned, NC * n_embd floats
+    float* stage_dx = nullptr;                      // pinned, NC * n_embd floats
+    float* dx_dev = nullptr;                        // card 0: the staged partial sum
+    float* mix1 = nullptr;                          // card 1: its down output
+    void* q8_1_1 = nullptr;                         // card 1: activation scratch
+    float* x1 = nullptr;                            // card 1: the received activation
+    float* ffn_g1 = nullptr, *ffn_u1 = nullptr, *ffn_h1 = nullptr, *h1_rot = nullptr;
+    float* signs1 = nullptr;                        // card 1: the n_ff sign table from ffn_r0 on
+    std::vector<float> signs_ffn_host;              // host copy of the n_ff signs, for signs1 at load
+    std::vector<void*> allocs1;                     // card 1 allocations, freed on device 1
+
     float* output_norm = nullptr;
     QMat head;
     void* q8_1 = nullptr;                           // shared activation scratch of the native GEMVs
@@ -383,6 +403,110 @@ struct DenseModel::Impl {
     }
 
     // A float vector or matrix (F32, F16, BF16 or any type the host can dequantize) uploaded as F32.
+    // A row range of a quantized matrix, allocated and filled on `device` (one side of a split across GPUs).
+    // Rows are contiguous in the GGUF, so a slice is one memcpy from the mapped file.
+    bool upload_mat_slice(const Found* f, const std::string& name, int n_in, int n_out, int row0, int rows, int device,
+                          QMat& out, std::string& err) {
+        if (!f) { err = "dense model: missing tensor " + name; return false; }
+        const strata::TensorInfo& t = *f->tensor;
+        if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
+            err = "dense model: " + name + " has an unexpected shape";
+            return false;
+        }
+        if (!native_mmvq_supported((int) t.type)) {
+            err = "dense model: " + name + " is " + upper_type(t.type) + ", which the native GEMVs do not take";
+            return false;
+        }
+        if (row0 < 0 || rows <= 0 || row0 + rows > n_out) { err = "dense model: " + name + ": bad row range"; return false; }
+        const uint64_t row_bytes = native_mmvq_weight_bytes((int) t.type, n_in, 1);
+        const uint64_t bytes = row_bytes * (uint64_t) rows;
+        const uint64_t off = row_bytes * (uint64_t) row0;
+        const uint64_t payload = f->file->file_size() - f->file->data_start();
+        if (t.offset > payload || off + bytes > payload - t.offset) {
+            err = "dense model: " + name + ": slice outside the file";
+            return false;
+        }
+        int prev = 0;
+        cudaGetDevice(&prev);
+        cudaSetDevice(device);
+        void* dev = nullptr;
+        cudaError_t s = cudaMalloc(&dev, bytes);
+        if (s == cudaSuccess) s = cudaMemcpy(dev, f->file->tensor_data(t) + off, bytes, cudaMemcpyHostToDevice);
+        cudaSetDevice(prev);
+        if (s != cudaSuccess) {
+            if (dev) {
+                cudaSetDevice(device);
+                cudaFree(dev);
+                cudaSetDevice(prev);
+            }
+            err = "dense model: " + name + " slice does not fit on device " + std::to_string(device);
+            return false;
+        }
+        out.dev = dev;
+        out.type = (int) t.type;
+        out.n_in = n_in;
+        out.n_out = rows;
+        out.row0 = 0;
+        (device == 0 ? allocations : allocs1).push_back(dev);
+        return true;
+    }
+
+    // Input-column range of a quantized matrix, packed so the slice keeps the standard row layout: one memcpy
+    // per output row.  col0 and cols must be whole blocks (128 values for PQ2_0) and, for the folded basis, a
+    // multiple of the 1024-wide rotation block so the slice can be rotated on its own.
+    bool upload_mat_slice_cols(const Found* f, const std::string& name, int n_in, int n_out, int col0, int cols,
+                               int device, QMat& out, std::string& err) {
+        if (!f) { err = "dense model: missing tensor " + name; return false; }
+        const strata::TensorInfo& t = *f->tensor;
+        if (t.shape.size() != 2 || t.shape[0] != (uint64_t) n_in || t.shape[1] != (uint64_t) n_out) {
+            err = "dense model: " + name + " has an unexpected shape";
+            return false;
+        }
+        if (!native_mmvq_supported((int) t.type)) {
+            err = "dense model: " + name + " is " + upper_type(t.type) + ", which the native GEMVs do not take";
+            return false;
+        }
+        if (col0 < 0 || cols <= 0 || col0 + cols > n_in || col0 % 128 || cols % 128 || n_in % 128) {
+            err = "dense model: " + name + ": bad column range";
+            return false;
+        }
+        const uint64_t src_row = native_mmvq_weight_bytes((int) t.type, n_in, 1);
+        const uint64_t dst_row = native_mmvq_weight_bytes((int) t.type, cols, 1);
+        const uint64_t blk = src_row / (uint64_t) (n_in / 128);            // bytes of one 128-value block
+        const uint64_t off = (uint64_t) (col0 / 128) * blk;
+        const uint64_t payload = f->file->file_size() - f->file->data_start();
+        if (t.offset > payload || (uint64_t) (n_out - 1) * src_row + off + dst_row > payload - t.offset) {
+            err = "dense model: " + name + ": slice outside the file";
+            return false;
+        }
+        int prev = 0;
+        cudaGetDevice(&prev);
+        cudaSetDevice(device);
+        void* dev = nullptr;
+        cudaError_t s = cudaMalloc(&dev, dst_row * (uint64_t) n_out);
+        const uint8_t* base = f->file->tensor_data(t) + off;
+        for (int r = 0; s == cudaSuccess && r < n_out; ++r)
+            s = cudaMemcpy((uint8_t*) dev + (uint64_t) r * dst_row, base + (uint64_t) r * src_row, dst_row,
+                           cudaMemcpyHostToDevice);
+        cudaSetDevice(prev);
+        if (s != cudaSuccess) {
+            if (dev) {
+                cudaSetDevice(device);
+                cudaFree(dev);
+                cudaSetDevice(prev);
+            }
+            err = "dense model: " + name + " slice does not fit on device " + std::to_string(device);
+            return false;
+        }
+        out.dev = dev;
+        out.type = (int) t.type;
+        out.n_in = cols;
+        out.n_out = n_out;
+        out.row0 = 0;
+        (device == 0 ? allocations : allocs1).push_back(dev);
+        return true;
+    }
+
     bool upload_floats(const Found* f, const std::string& name, uint64_t expect, float** out, std::string& err) {
         if (!f) { err = "dense model: missing tensor " + name; return false; }
         uint64_t n = 1;
@@ -507,7 +631,9 @@ struct DenseModel::Impl {
     // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.
     void gemv(const QMat& w, float* y, int n, void* s) {
         PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
-        native_mmvq(w.type, w.dev, q8_1, y, w.n_in, w.n_out, n, s);
+        const uint8_t* base = (const uint8_t*) w.dev;
+        if (w.row0) base += (size_t) w.row0 * native_mmvq_weight_bytes(w.type, w.n_in, 1);
+        native_mmvq(w.type, base, q8_1, y, w.n_in, w.n_out, n, s);
     }
     void quantize(const float* x, int n_in, int n, void* s) {
         PScope ps(&prof, Prof::QUANT, s);
@@ -520,6 +646,7 @@ struct DenseModel::Impl {
                     const float* qn, const float* kn, uint16_t* kc, uint16_t* vc, int n, int pos0, uint16_t rot, void* s);
     void ffn_block(const DenseConfig& c, const QMat& g, const QMat& u, const QMat& d, const float* post_norm, int n,
                    uint16_t rot, void* s);
+    void ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s);   // phase 1: FFN across GPUs
     bool mtp_block(const DenseConfig& c, int n, int pos0, bool want_logits, void* s);
 
 #ifdef STRATA_DENSE_MMQ
@@ -668,6 +795,97 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     }
 }
 
+// Phase 1 of the multi-card work: card 0 keeps the whole model and computes the first ffn_r0 FFN rows; card 1
+// holds the rest (gate/up row slices and a packed input-column slice of down).  Card 0 rotates the activation
+// and sends it; card 1 returns its partial down output; card 0 sums and adds the residual.  Both cards work in
+// parallel: card 0 issues its share on the main stream and card 1 on stream1.
+void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int n, uint16_t rot, void* s) {
+    const int E = c.n_embd, r0 = ffn_r0, r1 = c.n_ff - ffn_r0;
+    const cudaStream_t s0 = (cudaStream_t) s;
+    const bool dbg = [] { const char* e = std::getenv("STRATA_DENSE_FFN_DEBUG"); return e && e[0] != '0'; }();
+#define SDBG(...) do { if (dbg) { std::fprintf(stderr, "[ffn-split] " __VA_ARGS__); std::fprintf(stderr, "\n"); std::fflush(stderr); } } while (0)
+    {
+        PScope ps(&prof, Prof::RMS, s);
+        dense_rms_norm(x, L.post_norm, xn, n, E, c.rms_eps, s);
+    }
+    // card 0: the (rotated) activation, quantized for its own gate/up and staged for card 1
+    const float* xsend = xn;
+    if (rot & (ROT_FFN_GATE | ROT_FFN_UP)) {
+        dense_fwht_rows(xn, rot_scratch, ham_signs(E), E, n, false, s);
+        xsend = rot_scratch;
+    }
+    quantize(xsend, E, n, s);
+    SDBG("s0 activation quantized (n=%d)", n);
+    cudaMemcpyAsync(stage_x, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
+    cudaEventRecord(ev_x, s0);
+    SDBG("s0 stage_x recorded: %s", cudaGetErrorString(cudaGetLastError()));
+
+    // card 0's share of gate/up and its input slice of down
+    QMat g0 = L.ffn_gate, u0 = L.ffn_up;
+    g0.n_out = r0;
+    u0.n_out = r0;
+    gemv(g0, ffn_g, n, s);
+    gemv(u0, ffn_u, n, s);
+    {
+        PScope ps(&prof, Prof::SWIGLU, s);
+        dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * r0, s);
+    }
+    const float* hsend = ffn_h;
+    if (rot & ROT_FFN_DOWN) {
+        dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), r0, n, false, s);
+        hsend = rot_scratch;
+    }
+    quantize(hsend, r0, n, s);
+    gemv(L.ffn_down_s0, mix, n, s);
+    SDBG("s0 own share done (r0=%d)", r0);
+
+    // card 1: its share of gate/up and down, on its own stream.  The handoff is synchronized on the host: a
+    // cross-device hipStreamWaitEvent deadlocks when the event is not yet complete (measured), while an event
+    // sync only waits for the copy -- card 0's own FFN chain keeps running on the GPU meanwhile.
+    const cudaError_t sx = cudaEventSynchronize(ev_x);
+    SDBG("ev_x synced: %s", cudaGetErrorString(sx));
+    int prev = 0;
+    cudaGetDevice(&prev);
+    const cudaError_t sd = cudaSetDevice(1);
+    SDBG("set device 1: %s (prev %d)", cudaGetErrorString(sd), prev);
+    const cudaError_t c1 = cudaMemcpyAsync(x1, stage_x, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream1);
+    SDBG("card1 x H2D: %s", cudaGetErrorString(c1));
+    native_quantize_q8_1(x1, q8_1_1, E, n, stream1);
+    SDBG("card1 quantize: %s", cudaGetErrorString(cudaGetLastError()));
+    native_mmvq(L.ffn_gate1.type, L.ffn_gate1.dev, q8_1_1, ffn_g1, E, r1, n, stream1);
+    native_mmvq(L.ffn_up1.type, L.ffn_up1.dev, q8_1_1, ffn_u1, E, r1, n, stream1);
+    SDBG("card1 gate/up: %s", cudaGetErrorString(cudaGetLastError()));
+    dense_swiglu(ffn_g1, ffn_u1, ffn_h1, (int64_t) n * r1, stream1);
+    const float* hsend1 = ffn_h1;
+    if (rot & ROT_FFN_DOWN) {
+        // its slice of the folded basis: the signs from ffn_r0 on, its own 1024-blocks
+        dense_fwht_rows(ffn_h1, h1_rot, signs1, r1, n, false, stream1);
+        hsend1 = h1_rot;
+    }
+    native_quantize_q8_1(hsend1, q8_1_1, r1, n, stream1);
+    native_mmvq(L.ffn_down1.type, L.ffn_down1.dev, q8_1_1, mix1, r1, E, n, stream1);
+    SDBG("card1 down: %s", cudaGetErrorString(cudaGetLastError()));
+    cudaMemcpyAsync(stage_dx, mix1, (size_t) n * E * 4, cudaMemcpyDeviceToHost, stream1);
+    cudaEventRecord(ev_dx, stream1);
+    const cudaError_t sxd = cudaEventSynchronize(ev_dx);
+    SDBG("ev_dx synced: %s", cudaGetErrorString(sxd));
+    const cudaError_t sr = cudaSetDevice(prev);
+    int now = -1;
+    cudaGetDevice(&now);
+    SDBG("restored device: set=%s current=%d", cudaGetErrorString(sr), now);
+
+    // card 0: sum card 1's partial and add the residual
+    const cudaError_t m2 = cudaMemcpyAsync(dx_dev, stage_dx, (size_t) n * E * 4, cudaMemcpyHostToDevice, s0);
+    SDBG("s0 dx H2D: %s", cudaGetErrorString(m2));
+    {
+        PScope ps(&prof, Prof::ADD, s);
+        add_inplace(mix, dx_dev, (int64_t) n * E, s);
+        add_inplace(x, mix, (int64_t) n * E, s);
+    }
+    SDBG("s0 adds done");
+#undef SDBG
+}
+
 #ifdef STRATA_DENSE_MMQ
 // ============================================================================ the batched prompt blocks
 // The same arithmetic as the blocks above over a chunk of T tokens.  The projections go through MMQ: the weights
@@ -802,6 +1020,24 @@ DenseModel::DenseModel() : impl_(new Impl) {}
 DenseModel::~DenseModel() {
     if (!impl_) return;
     if (impl_->stream) cudaStreamSynchronize(impl_->stream);
+    if (impl_->stream1) {
+        cudaSetDevice(1);
+        cudaStreamDestroy(impl_->stream1);
+        cudaSetDevice(0);
+    }
+    if (impl_->ev_x) cudaEventDestroy(impl_->ev_x);
+    if (impl_->ev_dx) {
+        cudaSetDevice(1);
+        cudaEventDestroy(impl_->ev_dx);
+        cudaSetDevice(0);
+    }
+    if (!impl_->allocs1.empty()) {
+        cudaSetDevice(1);
+        for (void* p : impl_->allocs1) cudaFree(p);
+        cudaSetDevice(0);
+    }
+    if (impl_->stage_x) cudaFreeHost(impl_->stage_x);
+    if (impl_->stage_dx) cudaFreeHost(impl_->stage_dx);
     for (void* p : impl_->allocations) cudaFree(p);
     for (void* p : impl_->host_allocs) cudaFreeHost(p);
     for (auto& c : impl_->ckpt) if (c.host) cudaFreeHost(c.host);
@@ -938,6 +1174,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                     }
                     host[(size_t) i] = (float) s;
                 }
+                if (width == cfg_.n_ff) I.signs_ffn_host = host;
                 off += (uint64_t) width;
                 void* dev = nullptr;
                 if (cudaMalloc(&dev, (size_t) width * sizeof(float)) != cudaSuccess ||
@@ -958,6 +1195,28 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             for (const strata::MetaValue& v : wn->items) rot_names.insert(v.s);
             if (!I.ham_signs(cfg_.n_embd) || !I.ham_signs(cfg_.value_dim()) || !I.ham_signs(cfg_.n_ff)) {
                 err = "dense model: prism.hadamard signs do not cover this model's widths"; return false;
+            }
+        }
+        // the optional FFN split across GPUs (phase 1 of the multi-card work): opt-in while it is measured
+        if (const char* e = std::getenv("STRATA_DENSE_FFN_SPLIT"); e && e[0] != '0') {
+            int nd = 0;
+            if (cudaGetDeviceCount(&nd) == cudaSuccess && nd >= 2) {
+                double share = 0.25;
+                if (const char* sh = std::getenv("STRATA_DENSE_FFN_SHARE0")) share = std::atof(sh);
+                share = std::min(0.9, std::max(0.05, share));
+                int r0 = (int) (share * cfg_.n_ff / 1024.0 + 0.5) * 1024;
+                if (r0 < 1024) r0 = 1024;
+                if (r0 > cfg_.n_ff - 1024) r0 = cfg_.n_ff - 1024;
+                if (!I.hadamard || I.signs_ffn_host.empty()) {
+                    std::fprintf(stderr, "strata-dense: FFN split needs a folded (prism.hadamard) file; staying on one card\n");
+                } else {
+                    I.ffn_split = true;
+                    I.ffn_r0 = r0;
+                    std::fprintf(stderr, "strata-dense: FFN split across GPUs: card0 %d of %d rows, card1 %d\n", r0,
+                                 cfg_.n_ff, cfg_.n_ff - r0);
+                }
+            } else {
+                std::fprintf(stderr, "strata-dense: STRATA_DENSE_FFN_SPLIT set but fewer than two GPUs are visible\n");
             }
         }
         const int E = cfg_.n_embd;
@@ -1127,6 +1386,18 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             if (rot_names.count(p + "ffn_gate.weight")) L.rot |= ROT_FFN_GATE;
             if (rot_names.count(p + "ffn_up.weight")) L.rot |= ROT_FFN_UP;
             if (rot_names.count(p + "ffn_down.weight")) L.rot |= ROT_FFN_DOWN;
+            if (I.ffn_split) {
+                const int r0 = I.ffn_r0, r1 = cfg_.n_ff - I.ffn_r0;
+                if (!I.upload_mat_slice(I.find(p + "ffn_gate.weight"), p + "ffn_gate.weight", E, cfg_.n_ff, r0, r1, 1,
+                                        L.ffn_gate1, err) ||
+                    !I.upload_mat_slice(I.find(p + "ffn_up.weight"), p + "ffn_up.weight", E, cfg_.n_ff, r0, r1, 1,
+                                        L.ffn_up1, err) ||
+                    !I.upload_mat_slice_cols(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, 0, r0,
+                                             0, L.ffn_down_s0, err) ||
+                    !I.upload_mat_slice_cols(I.find(p + "ffn_down.weight"), p + "ffn_down.weight", cfg_.n_ff, E, r0, r1,
+                                             1, L.ffn_down1, err))
+                    return false;
+            }
             if (!L.attn) {
                 if (!I.upload_mat(I.find(p + "attn_qkv.weight"), p + "attn_qkv.weight", E, C, L.qkv, total, err) ||
                     !I.upload_mat(I.find(p + "attn_gate.weight"), p + "attn_gate.weight", E, V, L.z, total, err) ||
@@ -1229,6 +1500,37 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             ok = I.alloc(&I.m_e, K * E * f, err, "MTP embeddings") && I.alloc(&I.hin, K * E * f, err, "MTP hidden input") &&
                  I.alloc(&I.cat, K * 2 * E * f, err, "MTP concat") && I.alloc(&I.mtp_logits, (uint64_t) cfg_.n_vocab * f, err, "MTP logits") &&
                  I.alloc(&I.mtp_h, (uint64_t) E * f, err, "MTP output hidden");
+        if (ok && I.ffn_split) {
+            const int r1 = cfg_.n_ff - I.ffn_r0;
+            int prev = 0;
+            cudaGetDevice(&prev);
+            cudaSetDevice(1);
+            const bool ok1 = cudaStreamCreate(&I.stream1) == cudaSuccess &&
+                             cudaMalloc(&I.q8_1_1, native_q8_1_bytes(cfg_.n_ff, NC)) == cudaSuccess &&
+                             cudaMalloc((void**) &I.x1, K * E * f) == cudaSuccess &&
+                             cudaMalloc((void**) &I.mix1, K * E * f) == cudaSuccess &&
+                             cudaMalloc((void**) &I.ffn_g1, K * (uint64_t) r1 * f) == cudaSuccess &&
+                             cudaMalloc((void**) &I.ffn_u1, K * (uint64_t) r1 * f) == cudaSuccess &&
+                             cudaMalloc((void**) &I.ffn_h1, K * (uint64_t) r1 * f) == cudaSuccess &&
+                             cudaMalloc((void**) &I.h1_rot, K * (uint64_t) r1 * f) == cudaSuccess &&
+                             cudaMalloc((void**) &I.signs1, (uint64_t) r1 * f) == cudaSuccess;
+            if (ok1) cudaMemcpy(I.signs1, I.signs_ffn_host.data() + I.ffn_r0, (size_t) r1 * 4, cudaMemcpyHostToDevice);
+            I.allocs1 = {I.q8_1_1, I.x1, I.mix1, I.ffn_g1, I.ffn_u1, I.ffn_h1, I.h1_rot, I.signs1};
+            cudaSetDevice(prev);
+            ok = ok1 && cudaHostAlloc(&I.stage_x, (size_t) K * E * 4, cudaHostAllocPortable) == cudaSuccess &&
+                 cudaHostAlloc(&I.stage_dx, (size_t) K * E * 4, cudaHostAllocPortable) == cudaSuccess &&
+                 cudaMalloc((void**) &I.dx_dev, (size_t) K * E * 4) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&I.ev_x, cudaEventDisableTiming) == cudaSuccess;   // device 0, main stream
+            if (ok) {
+                cudaSetDevice(1);
+                ok = cudaEventCreateWithFlags(&I.ev_dx, cudaEventDisableTiming) == cudaSuccess;   // device 1, stream1
+                cudaSetDevice(prev);
+            }
+            if (!ok) { err = "dense model: the FFN split could not allocate its scratch"; return false; }
+            I.allocations.push_back(I.dx_dev);
+            std::fprintf(stderr, "strata-dense: FFN split ready (card0 %d rows, card1 %d rows)\n", I.ffn_r0,
+                         cfg_.n_ff - I.ffn_r0);
+        }
         if (!ok) return false;
 
         native_gdn_set_enabled(true);
@@ -1376,7 +1678,8 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
                 PScope ps(&I.prof, Prof::ADD, s);
                 add_inplace(I.x, I.mix, (int64_t) n * E, s);
             }
-            I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
+            if (I.ffn_split) I.ffn_block_split(cfg_, L, n, L.rot, s);
+            else I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
             if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
         }
         pos_ += n;
