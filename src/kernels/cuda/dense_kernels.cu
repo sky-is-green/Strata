@@ -514,6 +514,19 @@ __global__ void kv_append_kernel(uint8_t* __restrict__ kc, uint8_t* __restrict__
 // With Q4 keys q is rotated (Walsh-Hadamard) first; the scores q . k are the same in the rotated space.
 constexpr int kStagedCellBytes = 512;                    // the largest K or V cell (head_dim 256, F16)
 
+// One cell's raw bytes into the stage.  The dense pass's cells (head_dim 256, F16) are exactly 512 bytes: two
+// independent 8-byte loads per lane, issued together, instead of a runtime loop that waits per iteration.
+__device__ __forceinline__ void attn_stage_cell(uint8_t* dst, const uint8_t* src, int bytes, int lane) {
+    if (bytes == 512) {
+        const int o = lane * 8;
+        *reinterpret_cast<uint2*>(dst + o) = *reinterpret_cast<const uint2*>(src + o);
+        *reinterpret_cast<uint2*>(dst + o + 256) = *reinterpret_cast<const uint2*>(src + o + 256);
+        return;
+    }
+    for (int o = lane * 8; o < bytes; o += 32 * 8)
+        *reinterpret_cast<uint2*>(dst + o) = *reinterpret_cast<const uint2*>(src + o);
+}
+
 // Stage one pair (NC cells) of raw K and V bytes into `dst` with 8-byte cooperative loads.  The cells are the
 // cache's own bytes, so kv_val reads exactly what the direct load did.
 __device__ __forceinline__ void attn_stage_pair(const uint8_t* Kb, const uint8_t* Vb, size_t kcell, size_t vcell,
@@ -524,12 +537,8 @@ __device__ __forceinline__ void attn_stage_pair(const uint8_t* Kb, const uint8_t
         const int t = t0 + c * kWarps;
         if (t >= end) break;
         uint8_t* d = dst + c * SLOT;
-        const uint8_t* ksrc = Kb + (size_t) t * kcell;
-        const uint8_t* vsrc = Vb + (size_t) t * vcell;
-        for (int o = lane * 8; o < (int) kcell; o += 32 * 8)
-            *reinterpret_cast<uint2*>(d + o) = *reinterpret_cast<const uint2*>(ksrc + o);
-        for (int o = lane * 8; o < (int) vcell; o += 32 * 8)
-            *reinterpret_cast<uint2*>(d + kStagedCellBytes + o) = *reinterpret_cast<const uint2*>(vsrc + o);
+        attn_stage_cell(d, Kb + (size_t) t * kcell, (int) kcell, lane);
+        attn_stage_cell(d + kStagedCellBytes, Vb + (size_t) t * vcell, (int) vcell, lane);
     }
 }
 
@@ -561,9 +570,13 @@ __device__ __forceinline__ void attn_partial_walk(const uint8_t* Kb, const uint8
             two[c] = t < end;
             d[c] = 0.0f;
             const uint8_t* kcl = cur + c * SLOT;
+            float kk[8];                                     // batch the cell's reads, then the same fma chain
 #pragma unroll
             for (int i = 0; i < 8; ++i)
-                if (two[c] && i < per) d[c] += qv[i] * kv_val<KF>(kcl, i, lane);
+                kk[i] = (two[c] && i < per) ? kv_val<KF>(kcl, i, lane) : 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                if (two[c] && i < per) d[c] += qv[i] * kk[i];
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
@@ -612,11 +625,17 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* 
         sq[threadIdx.x] = q[(size_t) h * head_dim + threadIdx.x];
         __syncthreads();
         fwht256_shared(sq);
+        float qt[8];
 #pragma unroll
-        for (int i = 0; i < 8; ++i) qv[i] = i < per ? sq[lane + 32 * i] * scale : 0.0f;
+        for (int i = 0; i < 8; ++i) qt[i] = i < per ? sq[lane + 32 * i] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) qv[i] = i < per ? qt[i] * scale : 0.0f;
     } else {
+        float qt[8];                                      // all eight loads issue together; then the scale
 #pragma unroll
-        for (int i = 0; i < 8; ++i) qv[i] = i < per ? q[(size_t) h * head_dim + lane + 32 * i] * scale : 0.0f;
+        for (int i = 0; i < 8; ++i) qt[i] = i < per ? q[(size_t) h * head_dim + lane + 32 * i] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) qv[i] = i < per ? qt[i] * scale : 0.0f;
     }
 
     const size_t kcell = (size_t) cell_bytes(KF, head_dim), vcell = (size_t) cell_bytes(VF, head_dim);
