@@ -83,6 +83,7 @@ void dense_split_copy(const float* src, float* dst, int w, int n, int dst_stride
 // doorbell in the same kernel, so the bell cannot reach the consumer before the payload's stores are visible.
 // dst must be cudaHostAllocMapped memory.
 void dense_split_stage_out(const float* src, float* dst, int64_t n, void* stream);
+void dense_split_stage_in(const float* src, float* dst, int64_t n, void* stream);
 void dense_split_stage_ring(const float* src, float* dst, int64_t n, uint32_t* bell, uint32_t seq, void* stream);/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
 void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
                          int n_kv, int head_dim, int max_ctx, void* stream);

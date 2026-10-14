@@ -1348,60 +1348,41 @@ void dense_split_ring(uint32_t* bell, uint32_t seq, void* stream) {
 // mapped host memory (the coherent domain both cards can read back).  The DMA engine would do neither: its reads
 // of VRAM on this box miss whatever is still dirty in the owner's L2, which is how a handoff delivers the
 // previous layer's payload instead of this one's.
-// A load that cannot come from a stale L1 line: the payload's writers put it in the L2.
-__device__ __forceinline__ float split_ld_cg(const float* p) {
+// The same staging copy without the doorbell: the pieces of a handoff can be enqueued separately (debug paths).
+__global__ void split_stage_out_kernel(const float* __restrict__ src, float* __restrict__ dst, long long n) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x) {
+        const float v = src[i];         // plain: a .glc load of VRAM reads DRAM and misses the L2's fresh lines
+        // VOLATILE, exactly like the doorbell: a plain store plus a system fence still sits in the SM's write
+        // buffer long enough for the other card's fetch to miss it, which is what makes the handoff deliver the
+        // previous layer's payload.  The bell's volatile store has always been seen immediately.
+        *(volatile float*) (dst + i) = v;
+    }
+    __threadfence_system();
+}
+// The consumer side of a handoff: fetch the staged payload with system-coherent loads (the same path the
+// doorbell uses) and store it into VRAM.  A cudaMemcpy H2D is not ordered with the producer's volatile stores
+// and its fence, and this box will hand over the previous layer's bytes in that window.
+__device__ __forceinline__ float split_nt_load_f(const float* p) {
     uint32_t u;
-    asm volatile("flat_load_dword %0, %1 glc" : "=v"(u)
+    asm volatile("flat_load_dword %0, %1 glc slc" : "=v"(u)
                  : "v"(reinterpret_cast<const unsigned long long>(p)) : "memory");
     return __uint_as_float(u);
 }
-// One handoff in one kernel: stage the payload from VRAM to mapped host memory (SM loads see the writers' L2
-// lines, the DMA engine's do not), then ring the doorbell.  It is a SINGLE block, so a per-thread system fence
-// plus __syncthreads() covers every store the block made before thread 0 writes the bell.  A fence in a *later*
-// kernel cannot cover the staging kernel's write-combined stores, and that is exactly how a handoff ends up
-// delivering the previous layer's payload: the consumer reads a fresh bell while the stores are still buffered.
-__global__ void split_stage_ring_kernel(const float* __restrict__ src, float* __restrict__ dst, long long n,
-                                        uint32_t* bell, uint32_t seq) {
-    const long long total = n / 4;
-    for (long long i = threadIdx.x; i < total; i += blockDim.x) {
-        float4 v;
-        v.x = split_ld_cg(src + i * 4 + 0);
-        v.y = split_ld_cg(src + i * 4 + 1);
-        v.z = split_ld_cg(src + i * 4 + 2);
-        v.w = split_ld_cg(src + i * 4 + 3);
-        reinterpret_cast<float4*>(dst)[i] = v;
-    }
-    __threadfence_system();
-    __syncthreads();
-    if (threadIdx.x == 0) *(volatile uint32_t*) bell = seq;
+__global__ void split_stage_in_kernel(const float* __restrict__ src, float* __restrict__ dst, long long n) {
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long) gridDim.x * blockDim.x)
+        dst[i] = split_nt_load_f(src + i);
 }
-// The same staging copy without the doorbell: the pieces of a handoff can be enqueued separately (debug paths).
-__global__ void split_stage_out_kernel(const float* __restrict__ src, float* __restrict__ dst, long long n) {
-    const long long total = n / 4;
-    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long) gridDim.x * blockDim.x) {
-        float4 v;
-        v.x = split_ld_cg(src + i * 4 + 0);
-        v.y = split_ld_cg(src + i * 4 + 1);
-        v.z = split_ld_cg(src + i * 4 + 2);
-        v.w = split_ld_cg(src + i * 4 + 3);
-        reinterpret_cast<float4*>(dst)[i] = v;
-    }
-    // System scope: the consumer (the other card's DMA engine, or its kernels) must see these stores once this
-    // kernel completes, and the doorbell is rung by the kernel after it on the same stream.
-    __threadfence_system();
+void dense_split_stage_in(const float* src, float* dst, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const unsigned blocks = (unsigned) std::min<int64_t>((n + 255) / 256, 4096);
+    split_stage_in_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, dst, n);
+    check("dense_split_stage_in");
 }
 void dense_split_stage_out(const float* src, float* dst, int64_t n, void* stream) {
     if (n <= 0) return;
-    if (n % 4) throw std::runtime_error("dense_split_stage_out: the payload must be a multiple of 16 bytes");
-    const unsigned blocks = (unsigned) std::min<int64_t>(((n / 4) + 255) / 256, 4096);
+    const unsigned blocks = (unsigned) std::min<int64_t>((n + 255) / 256, 4096);
     split_stage_out_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(src, dst, n);
     check("dense_split_stage_out");
-}
-void dense_split_stage_ring(const float* src, float* dst, int64_t n, uint32_t* bell, uint32_t seq, void* stream) {
-    if (n <= 0) throw std::runtime_error("dense_split_stage_ring: an empty payload");
-    if (n % 4) throw std::runtime_error("dense_split_stage_ring: the payload must be a multiple of 16 bytes");
-    split_stage_ring_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(src, dst, n, bell, seq);
-    check("dense_split_stage_ring");
 }
 void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream) {
     split_poll_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(bell, seq);

@@ -330,8 +330,9 @@ struct DenseModel::Impl {
     bool peer_ok = false;                           // direct GPU-to-GPU DMA is available (large-BAR + p2p)
     int split_trace = -1;                            // STRATA_DENSE_FFN_TRACE=<layer>: trace the FFN split's parts
     bool split_check = false;                        // STRATA_DENSE_FFN_SELFCHECK=1: compare with the plain FFN per layer
-    float* dbg_mix = nullptr;                        // the self-check's scratch: the split's own down output
-    float* dbg_x = nullptr;                          // the self-check's scratch: the residual before the split's add
+    float* dbg_mix = nullptr;                        // mapped host: the self-check's copy of the split's output
+    float* dbg_b = nullptr;                          // mapped host: the self-check's copy of the reference output
+    float* dbg_x = nullptr;                          // mapped host: the self-check's copy of the pre-add residual
     int cur_layer = -1;                             // the layer run() is on (for the split trace)
     // Every payload is staged in MAPPED PINNED HOST memory: the producer's kernels write it with a system
     // fence plus a block-wide barrier before the doorbell, the consumer reads it back with its own kernel.
@@ -349,6 +350,7 @@ struct DenseModel::Impl {
     uint32_t* split_bell = nullptr;                 // pinned host: [0] card 0's doorbell, [64] card 1's
     uint32_t* split_bell_dev = nullptr;             // the same memory through a device pointer
     uint32_t split_seq = 0;                         // monotonic handoff counter (both cards share it)
+    cudaEvent_t ev_x = nullptr, ev_h0 = nullptr, ev_h1 = nullptr, ev_o = nullptr;   // ring events (EVWAIT)
     cudaStream_t stream1 = nullptr;
     float* dx_dev = nullptr;                        // card 0: card 1's pulled down output, compact
     float* mix1 = nullptr;                          // card 1: its down output
@@ -854,22 +856,19 @@ void DenseModel::Impl::ffn_selfcheck(const DenseConfig& c, const Layer& L, int n
     const int E = c.n_embd;
     const size_t tot = (size_t) n * E;
     const cudaStream_t st = (cudaStream_t) s;
-    cudaMemcpyAsync(dbg_mix, mix, tot * 4, cudaMemcpyDeviceToDevice, st);
-    cudaMemcpyAsync(dbg_x, x, tot * 4, cudaMemcpyDeviceToDevice, st);
-    ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s);   // the reference (adds its own mix to x)
+    // Read both sides through the same volatile-staging path the handoff uses: a cudaMemcpy of a just-written
+    // buffer is a stale read on this box, which is what made the first self-check lie.
+    dense_split_stage_out(x, dbg_x, (int64_t) tot, s);               // the pre-add residual
+    dense_split_stage_out(mix, dbg_mix, (int64_t) tot, s);           // the split's own down output
+    ffn_block(c, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, rot, s);   // the reference (adds its mix to x)
+    dense_split_stage_out(mix, dbg_b, (int64_t) tot, s);             // the reference's down output
     cudaStreamSynchronize(st);
-    std::vector<float> a(tot), b(tot);
-    if (cudaMemcpy(a.data(), dbg_mix, tot * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(b.data(), mix, tot * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        std::fprintf(stderr, "dbg layer=%d split-check: the copy failed\n", cur_layer);
-        return;
-    }
     size_t first = tot, ndiff = 0;
     uint32_t ba = 0, bb = 0;
-    for (size_t i = 0; i < tot; ++i) {
+    for (size_t i = 0; i < tot; ++i) {                               // the buffers are mapped: read them on the CPU
         uint32_t ua = 0, ub = 0;
-        std::memcpy(&ua, &a[i], 4);
-        std::memcpy(&ub, &b[i], 4);
+        std::memcpy(&ua, &dbg_mix[i], 4);
+        std::memcpy(&ub, &dbg_b[i], 4);
         if (ua != ub) {
             if (first == tot) { first = i; ba = ua; bb = ub; }
             ++ndiff;
@@ -880,8 +879,10 @@ void DenseModel::Impl::ffn_selfcheck(const DenseConfig& c, const Layer& L, int n
     else
         std::fprintf(stderr, "dbg layer=%d split-check: %zu of %zu differ, first at col=%zu row=%zu split=%08x ref=%08x\n",
                      cur_layer, ndiff, tot, first / (size_t) E, first % (size_t) E, ba, bb);
-    cudaMemcpyAsync(x, dbg_x, tot * 4, cudaMemcpyDeviceToDevice, st);          // back to the split's own result
-    add_inplace(x, dbg_mix, (int64_t) tot, st);
+    // put the split's own result back: x = pre-add residual + the split's output
+    cudaMemcpyAsync(x, dbg_x, tot * 4, cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(mix, dbg_mix, tot * 4, cudaMemcpyHostToDevice, st);
+    add_inplace(x, mix, (int64_t) tot, st);
 }
 
 // Phase 1 of the multi-card work: card 0 keeps the whole model and computes the first ffn_r0 FFN rows; card 1
@@ -931,6 +932,10 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         // handoff then cannot win or lose a race, which is how a visibility bug in the device-side doorbell
         // shows itself.  Slow by design: a debug switch.
         const bool hsync = [] { const char* e = std::getenv("STRATA_DENSE_SPLIT_SYNC"); return e && e[0] != '0'; }();
+        // STRATA_DENSE_SPLIT_EVWAIT=1: replace the device-side poll with a host wait on the producer's ring
+        // event.  Same ordering, through the event path instead of the doorbell -- the doorbell is what is left
+        // when the data path has been changed three ways and the reply is still the previous layer's work.
+        const bool evwait = [] { const char* e = std::getenv("STRATA_DENSE_SPLIT_EVWAIT"); return e && e[0] != '0'; }();
         // The staged handoff: every payload goes to pinned host memory on the producer's stream and comes back on
         // the consumer's, so neither card ever reads the other's VRAM -- a peer read is not coherent with the
         // owner's L2 on this box, so a pull of a just-written buffer can return a stale line.  There is still no
@@ -941,8 +946,9 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         // tiny read-back on the producer's stream cannot pass its own posted writes (PCIe ordering), so once it
         // completes the payload is at the host's ordering point; only then is the doorbell rung.  Without this the
         // split runs but every layer hands over the previous layer's data.
-        dense_split_stage_out(xsend, hx_stage, (int64_t) n * E, s0);
+        cudaMemcpyAsync(hx_stage, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
         dense_split_ring(split_bell_dev, seq_x, s);
+        if (evwait) cudaEventRecord(ev_x, (cudaStream_t) s);
 
         QMat g0 = L.ffn_gate, u0 = L.ffn_up;
         g0.n_out = r0;
@@ -956,8 +962,9 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
             hs0 = rot_scratch;
         }
         dense_split_copy(hs0, h_full, r0, n, c.n_ff, 0, s);
-        dense_split_stage_out(hs0, hh0_stage, (int64_t) n * r0, s0);
+        cudaMemcpyAsync(hh0_stage, hs0, (size_t) n * r0 * 4, cudaMemcpyDeviceToHost, s0);
         dense_split_ring(split_bell_dev + 32, seq_h0, s);
+        if (evwait) cudaEventRecord(ev_h0, (cudaStream_t) s);
         if (trb) {
             trace_head("s0_g", cur_layer, "split0", ffn_g, r0, s);
             trace_head("s0_hrot", cur_layer, "split0", hs0, r0, s);
@@ -966,6 +973,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         int prev = 0;
         cudaGetDevice(&prev);
         cudaSetDevice(1);
+        if (evwait) cudaEventSynchronize(ev_x);
         dense_split_poll(split_bell_dev, seq_x, stream1);
         if (hsync) cudaStreamSynchronize(s0);
         cudaMemcpyAsync(x1, hx_stage, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream1);
@@ -979,8 +987,10 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
             hs1 = h1_rot;
         }
         dense_split_copy(hs1, h_full1, r1, n, c.n_ff, r0, stream1);
-        dense_split_stage_out(hs1, hh1_stage, (int64_t) n * r1, stream1);
+        cudaMemcpyAsync(hh1_stage, hs1, (size_t) n * r1 * 4, cudaMemcpyDeviceToHost, stream1);
         dense_split_ring(split_bell_dev + 16, seq_h1, stream1);
+        if (evwait) cudaEventRecord(ev_h1, stream1);
+        if (evwait) cudaEventSynchronize(ev_h0);
         dense_split_poll(split_bell_dev + 32, seq_h0, stream1);
         if (hsync) cudaStreamSynchronize(s0);
         cudaMemcpyAsync(h_peer0, hh0_stage, (size_t) n * r0 * 4, cudaMemcpyHostToDevice, stream1);
@@ -988,8 +998,9 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         if (smode != 1) {
             native_quantize_q8_1(h_full1, q8_1_1, c.n_ff, n, stream1);
             native_mmvq(L.ffn_down1.type, L.ffn_down1.dev, q8_1_1, mix1, c.n_ff, E - half, n, stream1);
-            dense_split_stage_out(mix1, hm1_stage, (int64_t) n * (E - half), stream1);
+            cudaMemcpyAsync(hm1_stage, mix1, (size_t) n * (E - half) * 4, cudaMemcpyDeviceToHost, stream1);
             dense_split_ring(split_bell_dev + 48, seq_o, stream1);
+            if (evwait) cudaEventRecord(ev_o, stream1);
         }
         if (trb) {
             trace_head("s1_g", cur_layer, "split1", ffn_g1, r1, stream1);
@@ -1001,6 +1012,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         cudaSetDevice(prev);
         SDBG("card1 leg enqueued");
 
+        if (evwait) cudaEventSynchronize(ev_h1);
         dense_split_poll(split_bell_dev + 16, seq_h1, s);
         if (hsync) cudaStreamSynchronize(stream1);
         cudaMemcpyAsync(h_peer, hh1_stage, (size_t) n * r1 * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
@@ -1016,6 +1028,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
         } else if (smode == 2) {
             QMat d0 = L.ffn_down;
             gemv(d0, mix, n, s);                                     // bisect: card 0 alone ...
+            if (evwait) cudaEventSynchronize(ev_o);
             dense_split_poll(split_bell_dev + 48, seq_o, s);
             if (hsync) cudaStreamSynchronize(stream1);
             cudaMemcpyAsync(dx_dev, hm1_stage, (size_t) n * (E - half) * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
@@ -1026,6 +1039,7 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
                 d0.n_out = half;
                 gemv(d0, mix_lo, n, s);                              // card 0's half of the output rows, compact
             }
+            if (evwait) cudaEventSynchronize(ev_o);
             dense_split_poll(split_bell_dev + 48, seq_o, s);
             if (hsync) cudaStreamSynchronize(stream1);
             cudaMemcpyAsync(dx_dev, hm1_stage, (size_t) n * (E - half) * 4, cudaMemcpyHostToDevice, (cudaStream_t) s);
@@ -1192,6 +1206,10 @@ DenseModel::~DenseModel() {
         cudaStreamDestroy(impl_->stream1);
         cudaSetDevice(0);
     }
+    if (impl_->ev_x) cudaEventDestroy(impl_->ev_x);
+    if (impl_->ev_h0) cudaEventDestroy(impl_->ev_h0);
+    if (impl_->ev_h1) { cudaSetDevice(1); cudaEventDestroy(impl_->ev_h1); cudaSetDevice(0); }
+    if (impl_->ev_o) { cudaSetDevice(1); cudaEventDestroy(impl_->ev_o); cudaSetDevice(0); }
     if (!impl_->allocs1.empty()) {
         cudaSetDevice(1);
         for (void* p : impl_->allocs1) cudaFree(p);
@@ -1660,6 +1678,16 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                  I.alloc(&I.cat, K * 2 * E * f, err, "MTP concat") && I.alloc(&I.mtp_logits, (uint64_t) cfg_.n_vocab * f, err, "MTP logits") &&
                  I.alloc(&I.mtp_h, (uint64_t) E * f, err, "MTP output hidden");
         if (ok && I.ffn_split) {
+            int prev_ev = 0;
+            cudaGetDevice(&prev_ev);
+            ok = cudaEventCreateWithFlags(&I.ev_x, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&I.ev_h0, cudaEventDisableTiming) == cudaSuccess;
+            cudaSetDevice(1);
+            ok = ok && cudaEventCreateWithFlags(&I.ev_h1, cudaEventDisableTiming) == cudaSuccess &&
+                 cudaEventCreateWithFlags(&I.ev_o, cudaEventDisableTiming) == cudaSuccess;
+            cudaSetDevice(prev_ev);
+        }
+        if (ok && I.ffn_split) {
             const int r1 = cfg_.n_ff - I.ffn_r0;
             int prev = 0;
             cudaGetDevice(&prev);
@@ -1687,11 +1715,13 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                  cudaHostAlloc(&I.hh1_stage, (size_t) K * (uint64_t) r1 * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
                  cudaHostAlloc(&I.hm1_stage, (size_t) K * E * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess;
             if (ok && (I.split_trace >= 0 || I.split_check))
-                ok = cudaMalloc((void**) &I.dbg_mix, (size_t) K * E * 4) == cudaSuccess &&
-                     cudaMalloc((void**) &I.dbg_x, (size_t) K * E * 4) == cudaSuccess;
+                ok = cudaHostAlloc(&I.dbg_mix, (size_t) K * E * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+                     cudaHostAlloc(&I.dbg_b, (size_t) K * E * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+                     cudaHostAlloc(&I.dbg_x, (size_t) K * E * 4, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess;
             if (!ok) { err = "dense model: the FFN split could not allocate its scratch"; return false; }
-            if (I.dbg_mix) I.allocations.push_back(I.dbg_mix);
-            if (I.dbg_x) I.allocations.push_back(I.dbg_x);
+            if (I.dbg_mix) I.host_allocs.push_back(I.dbg_mix);
+            if (I.dbg_b) I.host_allocs.push_back(I.dbg_b);
+            if (I.dbg_x) I.host_allocs.push_back(I.dbg_x);
             I.allocations.push_back(I.dx_dev);
             I.allocations.push_back(I.mix_lo);
             I.allocations.push_back(I.h_full);
