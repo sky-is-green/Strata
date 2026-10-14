@@ -494,18 +494,47 @@ __global__ void kv_append_kernel(uint8_t* __restrict__ kc, uint8_t* __restrict__
 // dims each (strided by 32 so the loads coalesce), the dot product is a warp reduction, and the warp's
 // running (m, l, acc) is the online softmax over the cells it visited (cells t = begin + warp, +8, ...).
 // With Q4 keys q is rotated (Walsh-Hadamard) first; the scores q . k are the same in the rotated space.
+constexpr int kStagedCellBytes = 512;                    // the largest K or V cell (head_dim 256, F16)
+
+// Stage one pair (NC cells) of raw K and V bytes into `dst` with 8-byte cooperative loads.  The cells are the
+// cache's own bytes, so kv_val reads exactly what the direct load did.
+__device__ __forceinline__ void attn_stage_pair(const uint8_t* Kb, const uint8_t* Vb, size_t kcell, size_t vcell,
+                                                int end, int t0, int warp, int lane, uint8_t* dst) {
+    constexpr int SLOT = 2 * kStagedCellBytes;
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+        const int t = t0 + c * kWarps;
+        if (t >= end) break;
+        uint8_t* d = dst + c * SLOT;
+        const uint8_t* ksrc = Kb + (size_t) t * kcell;
+        const uint8_t* vsrc = Vb + (size_t) t * vcell;
+        for (int o = lane * 8; o < (int) kcell; o += 32 * 8)
+            *reinterpret_cast<uint2*>(d + o) = *reinterpret_cast<const uint2*>(ksrc + o);
+        for (int o = lane * 8; o < (int) vcell; o += 32 * 8)
+            *reinterpret_cast<uint2*>(d + kStagedCellBytes + o) = *reinterpret_cast<const uint2*>(vsrc + o);
+    }
+}
+
 // The per-cell walk of attn_partial_kernel, templated on the dims-per-lane so the `i < per` guards fold away for
-// the model geometries (head_dim 256 -> 8, 128 -> 4), and walking four of the warp's cells per iteration so a whole
-// iteration's K and V loads issue as one cluster.  PER == 0 keeps the runtime guard for other head_dims.
+// the model geometries (head_dim 256 -> 8, 128 -> 4; PER == 0 keeps the runtime guard) and walking two of the
+// warp's cells per iteration.  Each pair's raw bytes are staged into the warp's own shared slot by 8-byte
+// cooperative loads, and the pair AFTER the one being processed is staged first, so the DRAM latency of a pair's
+// fetch overlaps the previous pair's dots and softmax updates.  The staged bytes are the cache's own, read with the
+// same kv_val and updated in the same order, so the result is bit-identical to the direct-load walk.
 template <int KF, int VF, int PER>
 __device__ __forceinline__ void attn_partial_walk(const uint8_t* Kb, const uint8_t* Vb, const float (&qv)[8],
                                                   int begin, int end, size_t kcell, size_t vcell, int per_rt,
-                                                  int warp, int lane, float& m, float& l, float (&acc)[8]) {
-    constexpr int NC = 2;                                    // the warp's cells in flight per iteration
+                                                  int warp, int lane, uint8_t* stage, float& m, float& l,
+                                                  float (&acc)[8]) {
+    constexpr int NC = 2;                                // the warp's cells in flight per iteration
+    constexpr int SLOT = 2 * kStagedCellBytes;           // [K cell][V cell] per staged cell
     const int per = PER ? PER : per_rt;
-    // The cells' K dots and V values come in first; only then the sequential softmax updates, in cell order.  Loads
-    // move, every cell's own update (and its operand order) stays the one-cell loop's, so the result is bit-identical.
+    uint8_t* cur = stage;                                // ping-pong: cur is processed, nxt is staged
+    uint8_t* nxt = stage + NC * SLOT;
+    attn_stage_pair(Kb, Vb, kcell, vcell, end, begin + warp, warp, lane, cur);
+    __syncwarp();
     for (int t0 = begin + warp; t0 < end; t0 += NC * kWarps) {
+        attn_stage_pair(Kb, Vb, kcell, vcell, end, t0 + NC * kWarps, warp, lane, nxt);
         float d[NC], vv[NC][8];
         bool two[NC];
 #pragma unroll
@@ -513,14 +542,14 @@ __device__ __forceinline__ void attn_partial_walk(const uint8_t* Kb, const uint8
             const int t = t0 + c * kWarps;
             two[c] = t < end;
             d[c] = 0.0f;
-            const uint8_t* kcl = Kb + (size_t) t * kcell;
+            const uint8_t* kcl = cur + c * SLOT;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
                 if (two[c] && i < per) d[c] += qv[i] * kv_val<KF>(kcl, i, lane);
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
-            const uint8_t* vcl = Vb + (size_t) (t0 + c * kWarps) * vcell;
+            const uint8_t* vcl = cur + c * SLOT + kStagedCellBytes;
 #pragma unroll
             for (int i = 0; i < 8; ++i)
                 vv[c][i] = (two[c] && i < per) ? kv_val<VF>(vcl, i, lane) : 0.0f;
@@ -538,6 +567,8 @@ __device__ __forceinline__ void attn_partial_walk(const uint8_t* Kb, const uint8
                 if (i < per) acc[i] = acc[i] * corr + p * vv[c][i];
             m = mn;
         }
+        __syncwarp();                                    // nxt's stores are complete; cur is free to be overwritten
+        uint8_t* tmp = cur; cur = nxt; nxt = tmp;
     }
 }
 
@@ -556,6 +587,8 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* 
     const int per = head_dim >> 5;                       // dims per lane, <= 8
 
     __shared__ float sq[kMaxHeadDim];
+    // two iteration slots per warp, each staging two cells of up to 2*512 bytes
+    __shared__ __align__(16) uint8_t stage[kWarps][2 * 2 * 2 * kStagedCellBytes];
     float qv[8];
     if (KF == kQ4) {                                      // head_dim == 256: one thread per dim
         sq[threadIdx.x] = q[(size_t) h * head_dim + threadIdx.x];
@@ -579,11 +612,11 @@ __global__ void attn_partial_kernel(const float* __restrict__ q, const uint8_t* 
     for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
 
     if (per == 8)
-        attn_partial_walk<KF, VF, 8>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, m, l, acc);
+        attn_partial_walk<KF, VF, 8>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, stage[warp], m, l, acc);
     else if (per == 4)
-        attn_partial_walk<KF, VF, 4>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, m, l, acc);
+        attn_partial_walk<KF, VF, 4>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, stage[warp], m, l, acc);
     else
-        attn_partial_walk<KF, VF, 0>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, m, l, acc);
+        attn_partial_walk<KF, VF, 0>(Kb, Vb, qv, begin, end, kcell, vcell, per, warp, lane, stage[warp], m, l, acc);
 
     __shared__ float sm[kWarps], sl[kWarps];
     __shared__ float sacc[kWarps][kMaxHeadDim];
@@ -739,6 +772,8 @@ __global__ void attn_chunk_kernel(const float* __restrict__ q, const uint8_t* __
     const int per = head_dim >> 5;
 
     __shared__ float sq[kMaxHeadDim];
+    // two iteration slots per warp, each staging two cells of up to 2*512 bytes
+    __shared__ __align__(16) uint8_t stage[kWarps][2 * 2 * 2 * kStagedCellBytes];
     float qv[8];
     if (KF == kQ4) {                                      // head_dim == 256: one thread per dim
         sq[threadIdx.x] = q[((size_t) t * n_head + h) * head_dim + threadIdx.x];
