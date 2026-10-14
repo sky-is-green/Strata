@@ -1310,4 +1310,43 @@ void dense_gdn_rec_chunk(float* state, const float* h, const float* gate, const 
     check("dense_gdn_rec_chunk");
 }
 
+// ---- two-GPU handoff doorbells (used by ffn_block_split in src/core/dense_model.cpp) -------------------
+// A doorbell lives in pinned host memory.  ring() stores `seq` behind a system fence, so everything the
+// calling stream wrote earlier is visible before the bell; poll() spins with a cache-bypassing load
+// (`flat_load ... glc slc`).  On this box (2x RX 7900 XT, kernel 7.2.9, large BAR) that is the only
+// cross-device signal that works: device-local caches do not see the peer's writes or the DMA engine's,
+// hipStreamWaitValue32/WaitEvent and cross-device event waits are silently ignored or misbehave, and
+// polling VRAM (own or peer) reads stale lines.  Measured: 0.59 us one way, 2.95 us round trip.
+namespace {
+__device__ __forceinline__ uint32_t split_nt_load(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("flat_load_dword %0, %1 glc slc" : "=v"(v)
+                 : "v"(reinterpret_cast<const unsigned long long>(p)) : "memory");
+    return v;
+}
+__device__ __forceinline__ void split_backoff() {
+    float x = 1.0f;
+    for (int k = 0; k < 400; ++k) x = fmaf(x, 1.0000001f, 1e-7f);
+    if (x == 12345.6789f) asm volatile("" ::: "memory");   // keep the loop
+}
+__global__ void split_ring_kernel(uint32_t* bell, uint32_t seq) {
+    if (blockIdx.x || threadIdx.x) return;
+    __threadfence_system();
+    *(volatile uint32_t*) bell = seq;
+}
+__global__ void split_poll_kernel(const uint32_t* bell, uint32_t seq) {
+    if (blockIdx.x || threadIdx.x) return;
+    while (split_nt_load(bell) - seq > 0x80000000u) split_backoff();   // wrap-safe: seq is monotonic
+}
+}  // namespace
+
+void dense_split_ring(uint32_t* bell, uint32_t seq, void* stream) {
+    split_ring_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(bell, seq);
+    check("dense_split_ring");
+}
+void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream) {
+    split_poll_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(bell, seq);
+    check("dense_split_poll");
+}
+
 }  // namespace strata::kernels

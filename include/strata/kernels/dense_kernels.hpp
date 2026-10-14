@@ -69,7 +69,12 @@ void dense_fwht_rows(const float* x, float* y, const float* signs, int width, in
 /// ssm_out rotation uses (llama-graph.cpp's reshape/permute/reshape on the activation).
 void dense_permute_gdn_v(const float* x, float* y, int width, int rows, int hd, int nk, int rep, void* stream);
 
-/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
+/// Two-GPU handoff doorbells.  `bell` is a slot in PINNED HOST memory (pinned because it is the only
+/// cross-device channel that works on this stack: see the comment in dense_kernels.cu).  ring() stores `seq`
+/// behind a system fence (ordered behind the stream's earlier writes); poll() spins with a cache-bypassing
+/// load until the peer's bell has reached `seq`.  Both are one tiny kernel on the calling stream.
+void dense_split_ring(uint32_t* bell, uint32_t seq, void* stream);
+void dense_split_poll(const uint32_t* bell, uint32_t seq, void* stream);/// dense_kv_append for any format: k_cache / v_cache are [n_kv][max_ctx][dense_kv_cell_bytes(fmt)] bytes.
 void dense_kv_append_fmt(void* k_cache, void* v_cache, int k_fmt, int v_fmt, const float* k, const float* v, int pos,
                          int n_kv, int head_dim, int max_ctx, void* stream);
 

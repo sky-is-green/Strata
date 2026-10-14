@@ -21,6 +21,7 @@
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"

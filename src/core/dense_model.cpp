@@ -309,6 +309,13 @@ struct DenseModel::Impl {
     bool ffn_split = false;
     int ffn_r0 = 0;                                 // card 0's FFN row count; card 1 gets [ffn_r0, n_ff)
     bool peer_ok = false;                           // direct GPU-to-GPU DMA is available (large-BAR + p2p)
+    bool split_stage = false;                       // handoff through pinned memory instead of peer DMA pulls
+    int split_trace = -1;                           // STRATA_DENSE_FFN_TRACE=<layer>: trace the FFN split's parts
+    int cur_layer = -1;                             // the layer run() is on (for the split trace)
+    float* xho = nullptr;                           // card 0: the dedicated pull source (its share overwrites rot_scratch)
+    uint32_t* split_bell = nullptr;                 // pinned host: [0] card 0's doorbell, [64] card 1's
+    uint32_t* split_bell_dev = nullptr;             // the same memory through a device pointer
+    uint32_t split_seq = 0;                         // monotonic handoff counter (both cards share it)
     cudaStream_t stream1 = nullptr;
     cudaEvent_t ev_x = nullptr, ev_dx = nullptr;    // card0 -> card1 handoff, card1 -> card0 handoff
     float* stage_x = nullptr;                       // pinned, NC * n_embd floats
@@ -779,17 +786,22 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
     }
     gemv(g, ffn_g, n, s);
     gemv(u, ffn_u, n, s);
+    const bool trb = split_trace == cur_layer && cur_layer >= 0;
+    if (trb) trace_vec("ffn_g", -1, cur_layer, "single", ffn_g, c.n_ff, s);
     {
         PScope ps(&prof, Prof::SWIGLU, s);
         dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * c.n_ff, s);
     }
+    if (trb) trace_vec("ffn_h", -1, cur_layer, "single", ffn_h, c.n_ff, s);
     if (rot & ROT_FFN_DOWN) {
         dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), c.n_ff, n, false, s);
+        if (trb) trace_vec("ffn_hrot", -1, cur_layer, "single", rot_scratch, c.n_ff, s);
         quantize(rot_scratch, c.n_ff, n, s);
     } else {
         quantize(ffn_h, c.n_ff, n, s);
     }
     gemv(d, mix, n, s);
+    if (trb) trace_vec("ffn_mix", -1, cur_layer, "single", mix, n * E, s);
     {
         PScope ps(&prof, Prof::ADD, s);
         add_inplace(x, mix, (int64_t) n * E, s);
@@ -817,6 +829,98 @@ void DenseModel::Impl::ffn_block_split(const DenseConfig& c, const Layer& L, int
     }
     quantize(xsend, E, n, s);
     SDBG("s0 activation quantized (n=%d)", n);
+
+    if (peer_ok && split_bell) {
+        // ---- the two-card handoff without any host round trip.  Card 0 rings its doorbell once the activation
+        // is quantized (the ring kernel's system fence orders the bell behind everything on s0 so far); card 1's
+        // poll kernel spins on that bell with a cache-bypassing load, then pulls the activation with a peer DMA
+        // enqueued on its OWN stream (a peer copy enqueued on the source's stream silently does nothing on this
+        // stack, measured).  The return leg is the same in the other direction.  The poll kernels block their
+        // streams, not the host: this thread just enqueues both legs and moves on.
+        const uint32_t seq_x = ++split_seq;             // card 0 -> card 1: the activation
+        const uint32_t seq_dx = ++split_seq;            // card 1 -> card 0: its partial down output
+        // The activation must survive card 0's own share (the down rotation overwrites rot_scratch, and that is
+        // exactly what `xsend` points at when the gate/up fold is on): stage it in a dedicated buffer first.
+        const float* xpull = xsend;
+        if (!split_stage) {
+            cudaMemcpyAsync(xho, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToDevice, s0);
+            xpull = xho;
+        } else {
+            cudaMemcpyAsync(stage_x, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
+        }
+        dense_split_ring(split_bell_dev, seq_x, s);
+        const bool tr0 = split_trace == cur_layer && cur_layer >= 0;
+        if (tr0) trace_vec("ffn_xsend", -1, cur_layer, "rot", xsend, E, s);
+
+        // card 0's share of gate/up and its input slice of down
+        QMat g0 = L.ffn_gate, u0 = L.ffn_up;
+        g0.n_out = r0;
+        u0.n_out = r0;
+        gemv(g0, ffn_g, n, s);
+        gemv(u0, ffn_u, n, s);
+        {
+            PScope ps(&prof, Prof::SWIGLU, s);
+            dense_swiglu(ffn_g, ffn_u, ffn_h, (int64_t) n * r0, s);
+        }
+        const float* hsend = ffn_h;
+        if (tr0) trace_vec("ffn_g0", -1, cur_layer, "card0", ffn_g, r0, s);
+        if (tr0) trace_vec("ffn_h0", -1, cur_layer, "card0", ffn_h, r0, s);
+        if (rot & ROT_FFN_DOWN) {
+            dense_fwht_rows(ffn_h, rot_scratch, ham_signs(c.n_ff), r0, n, false, s);
+            hsend = rot_scratch;
+        }
+        if (tr0) trace_vec("ffn_hs0", -1, cur_layer, "card0", hsend, r0, s);
+        quantize(hsend, r0, n, s);
+        gemv(L.ffn_down_s0, mix, n, s);
+        SDBG("s0 own share done (r0=%d)", r0);
+        const bool tr = tr0;
+        if (tr) trace_vec("ffn_mix0", -1, cur_layer, "card0", mix, n * E, s);
+
+        // card 1's leg: wait for the activation, pull it, run its share, ring the return bell
+        int prev = 0;
+        cudaGetDevice(&prev);
+        cudaSetDevice(1);
+        dense_split_poll(split_bell_dev, seq_x, stream1);
+        if (split_stage) cudaMemcpyAsync(x1, stage_x, (size_t) n * E * 4, cudaMemcpyHostToDevice, stream1);
+        else             cudaMemcpyPeerAsync(x1, 1, (const void*) xpull, 0, (size_t) n * E * 4, stream1);
+        if (tr) trace_vec("ffn_x1", -1, cur_layer, "pulled", x1, E, stream1);
+        native_quantize_q8_1(x1, q8_1_1, E, n, stream1);
+        native_mmvq(L.ffn_gate1.type, L.ffn_gate1.dev, q8_1_1, ffn_g1, E, r1, n, stream1);
+        native_mmvq(L.ffn_up1.type, L.ffn_up1.dev, q8_1_1, ffn_u1, E, r1, n, stream1);
+        dense_swiglu(ffn_g1, ffn_u1, ffn_h1, (int64_t) n * r1, stream1);
+        if (tr) trace_vec("ffn_h1", -1, cur_layer, "card1", ffn_h1, r1, stream1);
+        const float* hsend1 = ffn_h1;
+        if (rot & ROT_FFN_DOWN) {
+            // its slice of the folded basis: the signs from ffn_r0 on, its own 1024-blocks
+            dense_fwht_rows(ffn_h1, h1_rot, signs1, r1, n, false, stream1);
+            hsend1 = h1_rot;
+        }
+        if (tr) trace_vec("ffn_hs1", -1, cur_layer, "card1", hsend1, r1, stream1);
+        native_quantize_q8_1(hsend1, q8_1_1, r1, n, stream1);
+        native_mmvq(L.ffn_down1.type, L.ffn_down1.dev, q8_1_1, mix1, r1, E, n, stream1);
+        if (tr) trace_vec("ffn_mix1", -1, cur_layer, "card1", mix1, n * E, stream1);
+        if (split_stage) cudaMemcpyAsync(stage_dx, mix1, (size_t) n * E * 4, cudaMemcpyDeviceToHost, stream1);
+        dense_split_ring(split_bell_dev + 16, seq_dx, stream1);
+        cudaSetDevice(prev);
+        SDBG("card1 leg enqueued");
+
+        // card 0: wait for card 1's partial, pull it, sum and add the residual
+        dense_split_poll(split_bell_dev + 16, seq_dx, s);
+        const cudaError_t m2 = split_stage
+                                   ? cudaMemcpyAsync(dx_dev, stage_dx, (size_t) n * E * 4, cudaMemcpyHostToDevice, s0)
+                                   : cudaMemcpyPeerAsync(dx_dev, 0, mix1, 1, (size_t) n * E * 4, s0);
+        SDBG("s0 dx handoff: %s", cudaGetErrorString(m2));
+        if (tr) trace_vec("ffn_dx", -1, cur_layer, "pulled1", dx_dev, n * E, s);
+        {
+            PScope ps(&prof, Prof::ADD, s);
+            add_inplace(mix, dx_dev, (int64_t) n * E, s);
+            if (tr) trace_vec("ffn_sum", -1, cur_layer, "sum", mix, n * E, s);
+            add_inplace(x, mix, (int64_t) n * E, s);
+        }
+        SDBG("s0 adds done");
+        return;
+    }
+
     if (!peer_ok) cudaMemcpyAsync(stage_x, xsend, (size_t) n * E * 4, cudaMemcpyDeviceToHost, s0);
     cudaEventRecord(ev_x, s0);
     SDBG("s0 stage_x recorded: %s", cudaGetErrorString(cudaGetLastError()));
@@ -1236,6 +1340,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         if (cs == cudaSuccess) cs = cudaHostAlloc((void**) &I.embd_stage, (size_t) NC * E * 4, cudaHostAllocDefault);
         if (cs != cudaSuccess) { err = std::string("dense model: CUDA setup: ") + cudaGetErrorString(cs); return false; }
         if (const char* e = std::getenv("STRATA_DENSE_PROF")) I.prof.enabled = e[0] && e[0] != '0';
+        if (const char* e = std::getenv("STRATA_DENSE_FFN_TRACE")) I.split_trace = std::atoi(e);
         if (const char* e = std::getenv("STRATA_DENSE_MMVQ_FAST"))      // the multi-column layout that is faster but not bitwise equal to 1 column
             if (e[0] && e[0] != '0') { native_mmvq_set_multi_exact(false); std::fprintf(stderr, "strata-dense: multi-column GEMV: upstream layout\n"); }
         if (const char* e = std::getenv("STRATA_DENSE_DEBUG")) {
@@ -1523,6 +1628,7 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             ok = ok1 && cudaHostAlloc(&I.stage_x, (size_t) K * E * 4, cudaHostAllocPortable) == cudaSuccess &&
                  cudaHostAlloc(&I.stage_dx, (size_t) K * E * 4, cudaHostAllocPortable) == cudaSuccess &&
                  cudaMalloc((void**) &I.dx_dev, (size_t) K * E * 4) == cudaSuccess &&
+                 cudaMalloc((void**) &I.xho, (size_t) K * E * 4) == cudaSuccess &&
                  cudaEventCreateWithFlags(&I.ev_x, cudaEventDisableTiming) == cudaSuccess;   // device 0, main stream
             if (ok) {
                 cudaSetDevice(1);
@@ -1531,6 +1637,8 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
             }
             if (!ok) { err = "dense model: the FFN split could not allocate its scratch"; return false; }
             I.allocations.push_back(I.dx_dev);
+            I.allocations.push_back(I.xho);
+            if (const char* e = std::getenv("STRATA_DENSE_SPLIT_STAGE")) I.split_stage = e[0] != '0';
             {
                 int can = 0;
                 I.peer_ok = cudaDeviceCanAccessPeer(&can, 1, 0) == cudaSuccess && can != 0;
@@ -1540,8 +1648,24 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
                     cudaSetDevice(prev);
                 }
             }
+            if (I.peer_ok) {
+                // the doorbells the two cards ring for each other: pinned host memory (the one channel that works)
+                void* bell = nullptr;
+                uint32_t* bell_dev = nullptr;
+                ok = cudaHostAlloc(&bell, 128, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+                     cudaHostGetDevicePointer((void**) &bell_dev, bell, 0) == cudaSuccess;
+                if (ok) {
+                    std::memset(bell, 0, 128);
+                    I.split_bell = (uint32_t*) bell;
+                    I.split_bell_dev = bell_dev;
+                    I.host_allocs.push_back(bell);
+                } else {
+                    std::fprintf(stderr, "strata-dense: the FFN split doorbells could not be allocated: %s\n",
+                                 cudaGetErrorString(cudaGetLastError()));
+                }
+            }
             std::fprintf(stderr, "strata-dense: FFN split ready (card0 %d rows, card1 %d rows, handoff: %s)\n", I.ffn_r0,
-                         cfg_.n_ff - I.ffn_r0, I.peer_ok ? "direct peer DMA" : "host-staged");
+                         cfg_.n_ff - I.ffn_r0, I.peer_ok ? "doorbell + peer DMA" : "host-staged");
         }
         if (!ok) return false;
 
@@ -1690,6 +1814,7 @@ bool DenseModel::run(const int32_t* tokens, int n, Logits lg, bool keep_hidden, 
                 PScope ps(&I.prof, Prof::ADD, s);
                 add_inplace(I.x, I.mix, (int64_t) n * E, s);
             }
+            I.cur_layer = l;
             if (I.ffn_split) I.ffn_block_split(cfg_, L, n, L.rot, s);
             else I.ffn_block(cfg_, L.ffn_gate, L.ffn_up, L.ffn_down, L.post_norm, n, L.rot, s);
             if (dbg) trace_vec("x", pos0, l, L.attn ? "attn" : "gdn", I.x, n * E, s);
