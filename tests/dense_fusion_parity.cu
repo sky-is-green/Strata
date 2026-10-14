@@ -211,6 +211,46 @@ void swigluq_case(int rows, int width, bool with_signs, std::mt19937& rng) {
     std::snprintf(what, sizeof what, "swiglu_quant q8_1 rows=%d width=%d%s", rows, width, with_signs ? " + rotation" : "");
     check_bytes(what, qa, qbb);
 }
+// native_pq2_0_mmvq_pair (two PQ2_0 GEMVs over one activation; the row counts may differ) against the two single
+// native_mmvq calls.  Every value is compared as raw bits, NaNs included.
+void mmvqpair_case(int n_in, int na, int nb, std::mt19937& rng) {
+    const size_t wba = strata::kernels::native_mmvq_weight_bytes(142, n_in, na);
+    const size_t wbb = strata::kernels::native_mmvq_weight_bytes(142, n_in, nb);
+    const size_t xb = strata::kernels::native_q8_1_bytes(n_in, 1);
+    std::vector<uint8_t> hwa(wba), hwb(wbb), hx(xb);
+    for (uint8_t& v : hwa) v = (uint8_t) (rng() & 0xff);
+    for (uint8_t& v : hwb) v = (uint8_t) (rng() & 0xff);
+    for (uint8_t& v : hx) v = (uint8_t) (rng() & 0xff);
+    for (size_t o = 0; o + 34 <= wba; o += 34) { hwa[o] = 0x00; hwa[o + 1] = 0x3C; }   // fp16 d = 1.0
+    for (size_t o = 0; o + 34 <= wbb; o += 34) { hwb[o] = 0x00; hwb[o + 1] = 0x3C; }
+    for (size_t o = 0; o + 36 <= xb; o += 36) { hx[o] = 0x00; hx[o + 1] = 0x3C; hx[o + 2] = 0x00; hx[o + 3] = 0x3C; }
+    void *wa = nullptr, *wb = nullptr, *x = nullptr;
+    float *ya1 = nullptr, *yb1 = nullptr, *ya2 = nullptr, *yb2 = nullptr;
+    cudaMalloc(&wa, wba);
+    cudaMalloc(&wb, wbb);
+    cudaMalloc(&x, xb);
+    cudaMalloc(&ya1, (size_t) na * 4);
+    cudaMalloc(&yb1, (size_t) nb * 4);
+    cudaMalloc(&ya2, (size_t) na * 4);
+    cudaMalloc(&yb2, (size_t) nb * 4);
+    cudaMemcpy(wa, hwa.data(), wba, cudaMemcpyHostToDevice);
+    cudaMemcpy(wb, hwb.data(), wbb, cudaMemcpyHostToDevice);
+    cudaMemcpy(x, hx.data(), xb, cudaMemcpyHostToDevice);
+    strata::kernels::native_mmvq(142, wa, x, ya1, n_in, na, 1, g_st);
+    strata::kernels::native_mmvq(142, wb, x, yb1, n_in, nb, 1, g_st);
+    strata::kernels::native_pq2_0_mmvq_pair(wa, wb, x, ya2, yb2, n_in, na, nb, g_st);
+    cudaStreamSynchronize(g_st);
+    std::vector<float> v1((size_t) na), v2((size_t) nb), v3((size_t) na), v4((size_t) nb);
+    cudaMemcpy(v1.data(), ya1, v1.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(v2.data(), yb1, v2.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(v3.data(), ya2, v3.size() * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(v4.data(), yb2, v4.size() * 4, cudaMemcpyDeviceToHost);
+    char what[128];
+    std::snprintf(what, sizeof what, "mmvq_pair A n_in=%d n_out=%d", n_in, na);
+    check(what, v1, v3);
+    std::snprintf(what, sizeof what, "mmvq_pair B n_in=%d n_out=%d", n_in, nb);
+    check(what, v2, v4);
+}
 }  // namespace
 
 int main() {
@@ -233,6 +273,10 @@ int main() {
     swigluq_case(1, 17408, true, rng);
     swigluq_case(2, 17408, true, rng);
     swigluq_case(1, 17408, false, rng);
+    mmvqpair_case(5120, 1024, 1024, rng);      // the attention k+v pair
+    mmvqpair_case(5120, 48, 48, rng);          // ssm_alpha + ssm_beta
+    mmvqpair_case(5120, 10240, 6144, rng);     // qkv + z (different row counts)
+    mmvqpair_case(5120, 17408, 17408, rng);    // ffn gate + up
     if (g_fail) { std::printf("%d case(s) FAILED\n", g_fail); return 1; }
     std::printf("all dense fusion parities identical\n");
     return 0;

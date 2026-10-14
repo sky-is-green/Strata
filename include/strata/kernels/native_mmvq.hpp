@@ -54,6 +54,13 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 
+/// Two PQ2_0 (Bonsai 2's type 142) GEMVs over the SAME activation in one launch -- the dense decode pass's pairs
+/// (ssm_alpha+ssm_beta, qkv+z, gate+up, k+v).  The matrices may differ in row count; each warp computes its row of
+/// both with the single kernel's own chunk order, so yA and yB are bitwise two native_mmvq calls.  The pair exists
+/// because a GEMV below ~20 MB is mostly its own launch: one launch instead of two.  ncols must be 1.
+void native_pq2_0_mmvq_pair(const void* wA, const void* wB, const void* x_q8_1, float* yA, float* yB,
+                            int n_in, int n_outA, int n_outB, void* stream);
+
 void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 

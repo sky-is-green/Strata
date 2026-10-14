@@ -135,7 +135,9 @@ __global__ void __launch_bounds__(256, 1) gemv_warp_rows(const WB* __restrict__ 
 int main(int argc, char** argv) {
     const int type = argc > 1 ? std::atoi(argv[1]) : 142;
     const int variant = argc > 2 ? std::atoi(argv[2]) : 0;
-    const int n_in = 17408, n_out = 110000;                 // ~512 MiB of PQ2_0 weights
+    const int n_in = argc > 3 ? std::atoi(argv[3]) : 17408;
+    const int n_out = argc > 4 ? std::atoi(argv[4]) : 110000;   // default ~512 MiB of PQ2_0 weights
+    const int R = argc > 5 ? std::atoi(argv[5]) : 30;
     const size_t wb_bytes = strata::kernels::native_mmvq_weight_bytes(type, n_in, n_out);
     void* w = nullptr;
     void* x = nullptr;
@@ -149,7 +151,6 @@ int main(int argc, char** argv) {
     cudaMemset(x, 0x11, strata::kernels::native_q8_1_bytes(n_in, 1));
     cudaStream_t st = nullptr;
     cudaStreamCreate(&st);
-    const int R = 30;
 
     auto run = [&](int v) {
         auto launch = [&](int vv) {

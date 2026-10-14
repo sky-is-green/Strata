@@ -374,6 +374,11 @@ struct DenseModel::Impl {
     std::vector<cudaGraphExec_t> graph_exec;        // [bucket], bucket = splits_for(pos0 + 1); lazily captured
     int32_t* pos_slot = nullptr;                    // device: this pass's pos0, read by rope/kv/attention
     int32_t* pos_slot_host = nullptr;               // pinned source of the slot's memcpy node
+    // STRATA_DENSE_GRAPH_TIME=1: per-replay GPU span (events around the launch) and the host prep split around it.
+    cudaEvent_t ev_g0 = nullptr, ev_g1 = nullptr;
+    bool gtime_pending = false;
+    int gtime_steps = 0;
+    double gtime_gpu = 0.0, gtime_dequant = 0.0, gtime_launch = 0.0, gtime_wait = 0.0;
 
     // ---- the batched prompt path (prefill_setup() / prefill()); see the block definitions below.
 #ifdef STRATA_DENSE_MMQ
@@ -688,10 +693,28 @@ struct DenseModel::Impl {
     // y = W x for n columns; the activation must already be quantized (quantize()) with the same n.  `act` picks a
     // different q8_1 scratch (the GDN layer's plain-quantized xn lives in one while q8_1 holds the rotated one).
     void gemv(const QMat& w, float* y, int n, void* s, const void* act = nullptr) {
+        // bench-only ablation (STRATA_DENSE_ABLATE=1): every GEMV is skipped so the graph-time instrument can
+        // split a replay into "weights" and "everything else".  The output is garbage; timing runs only.
+        static const bool no_gemv = [] { const char* e = std::getenv("STRATA_DENSE_ABLATE"); return e && e[0] == '1'; }();
+        if (no_gemv) return;
         PScope ps(&prof, w.type == 12 ? Prof::GEMV_Q4K : w.type == 14 ? Prof::GEMV_Q6K : w.type == 8 ? Prof::GEMV_Q80 : Prof::GEMV_OTHER, s);
         const uint8_t* base = (const uint8_t*) w.dev;
         if (w.row0) base += (size_t) w.row0 * native_mmvq_weight_bytes(w.type, w.n_in, 1);
         native_mmvq(w.type, base, act ? act : q8_1, y, w.n_in, w.n_out, n, s);
+    }
+    // Two GEMVs over one activation in one launch where the pair kernel can take them (the dense pass's PQ2_0
+    // pairs: ssm_alpha+ssm_beta, qkv+z, ffn gate+up, k+v), two plain calls otherwise.
+    void gemv_pair(const QMat& wa, const QMat& wb, float* ya, float* yb, int n, void* s, const void* act = nullptr) {
+        static const bool no_gemv = [] { const char* e = std::getenv("STRATA_DENSE_ABLATE"); return e && e[0] == '1'; }();
+        if (no_gemv) return;
+        if (n == 1 && wa.type == 142 && wb.type == 142 && wa.n_in == wb.n_in && !wa.row0 && !wb.row0) {
+            PScope ps(&prof, Prof::GEMV_OTHER, s);
+            native_pq2_0_mmvq_pair((const uint8_t*) wa.dev, (const uint8_t*) wb.dev, act ? act : q8_1, ya, yb,
+                                   wa.n_in, wa.n_out, wb.n_out, s);
+            return;
+        }
+        gemv(wa, ya, n, s, act);
+        gemv(wb, yb, n, s, act);
     }
     void quantize(const float* x, int n_in, int n, void* s) {
         PScope ps(&prof, Prof::QUANT, s);
@@ -747,14 +770,8 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     const int C = c.conv_channels(), V = c.value_dim(), E = c.n_embd;
     const int S = c.ssm_state, KH = c.ssm_k_heads, VH = c.ssm_v_heads, qk = S * KH;
     if (L.ab_quant) {                               // the scratch holds q8_1(xn) for the two quantized projections
-        if (pre_rot) {                              // the caller's rms wrote q8_1_ab for these two
-            gemv(L.alpha_q, alpha, n, s, q8_1_ab);
-            gemv(L.beta_q, beta, n, s, q8_1_ab);
-        } else {
-            quantize(xn, E, n, s);
-            gemv(L.alpha_q, alpha, n, s);
-            gemv(L.beta_q, beta, n, s);
-        }
+        if (!pre_rot) quantize(xn, E, n, s);        // pre_rot: the caller's rms wrote q8_1_ab for these two
+        gemv_pair(L.alpha_q, L.beta_q, alpha, beta, n, s, pre_rot ? q8_1_ab : nullptr);
     } else {
         // The file stores alpha/beta as floats: the pair reads `xn` itself, and the rotation below overwrites
         // q8_1 -- quantizing xn first (as this used to) was a dead launch on every GDN layer of such a file.
@@ -769,8 +786,7 @@ void DenseModel::Impl::gdn_block(const DenseConfig& c, Layer& L, int n, bool sna
     } else if (!L.ab_quant) {
         quantize(xn, E, n, s);                      // not folded: the qkv/z GEMVs' activation is q8_1(xn)
     }
-    gemv(L.qkv, qkv, n, s);
-    gemv(L.z, z, n, s);
+    gemv_pair(L.qkv, L.z, qkv, z, n, s);
     {
     PScope ps_gdn(&prof, Prof::GDN_LOOP, s);
     // slot[j] receives the state right after column j, which is what rollback(j) restores.  run() guarantees
@@ -807,8 +823,7 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
         quantize(xn, E, n, s);
     }
     gemv(wq, q_full, n, s);
-    gemv(wk, kcur, n, s);
-    gemv(wv, vcur, n, s);
+    gemv_pair(wk, wv, kcur, vcur, n, s);
     const float scale = 1.0f / std::sqrt((float) D);
     {
     PScope ps_attn(&prof, Prof::ATTN_LOOP, s);
@@ -867,8 +882,7 @@ void DenseModel::Impl::ffn_block(const DenseConfig& c, const QMat& g, const QMat
         }
         quantize(xn, E, n, s);
     }
-    gemv(g, ffn_g, n, s);
-    gemv(u, ffn_u, n, s);
+    gemv_pair(g, u, ffn_g, ffn_u, n, s);
     const bool trb = split_trace == cur_layer && cur_layer >= 0;
     if (trb) trace_vec("ffn_g", -1, cur_layer, "single", ffn_g, c.n_ff, s);
     {
@@ -2073,6 +2087,12 @@ bool DenseModel::Impl::capture_graph(const DenseConfig& c, int bucket, int64_t p
         return false;
     }
     if (!ok) { if (built) cudaGraphDestroy(built); return false; }
+    if (const char* e = std::getenv("STRATA_DENSE_GRAPH_TIME"))
+        if (e[0] != '\0' && e[0] != '0') {
+            size_t nn = 0;
+            cudaGraphGetNodes(built, nullptr, &nn);
+            std::fprintf(stderr, "strata-dense: graph bucket %d: %zu nodes\n", bucket, nn);
+        }
     cudaGraphExec_t exec = nullptr;
     if (cudaGraphInstantiate(&exec, built, nullptr, nullptr, 0) != cudaSuccess) {
         err = std::string("dense model: graph instantiate: ") + cudaGetErrorString(cudaGetLastError());
@@ -2088,8 +2108,26 @@ bool DenseModel::Impl::capture_graph(const DenseConfig& c, int bucket, int64_t p
 // first use, and replays it.  False with an empty err means the capture failed and the caller should run the plain
 // path (graph_on is off for good); false with an err is a real failure.
 bool DenseModel::Impl::run_graphed(const DenseConfig& c, int32_t token, int64_t pos0, std::string& err) {
+    static const bool gtime = [] {                              // STRATA_DENSE_GRAPH_TIME=1: the graph lane's gap meter
+        const char* e = std::getenv("STRATA_DENSE_GRAPH_TIME");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (gtime && !ev_g0) { cudaEventCreate(&ev_g0); cudaEventCreate(&ev_g1); }
+    if (gtime && gtime_pending) {                               // the previous replay's events are complete by now
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_g0, ev_g1);
+        gtime_gpu += ms;
+        if (gtime_steps <= 3 || gtime_steps % 128 == 0)
+            std::fprintf(stderr, "strata-dense: replay %d gpu %.2f ms (avg %.2f); host wait %.3f, dequant %.3f, "
+                         "launch %.3f ms (avgs)\n", gtime_steps, ms, gtime_gpu / gtime_steps,
+                         gtime_wait / gtime_steps, gtime_dequant / gtime_steps, gtime_launch / gtime_steps);
+        gtime_pending = false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
     if (cudaEventSynchronize(embed_done) != cudaSuccess) { err = "dense model: embedding event"; return false; }
+    const auto t1 = std::chrono::steady_clock::now();
     if (!embed_stage_rows(embd, &token, 1, c.n_embd, c.n_vocab, embd_stage, err)) return false;
+    const auto t2 = std::chrono::steady_clock::now();
     pos_slot_host[0] = (int32_t) pos0;
     const int64_t want = (pos0 + 1 + 255) / 256;
     const int bucket = (int) std::min<int64_t>(want, (int64_t) graph_exec.size() - 1);
@@ -2099,9 +2137,20 @@ bool DenseModel::Impl::run_graphed(const DenseConfig& c, int32_t token, int64_t 
         err.clear();
         return false;
     }
+    if (gtime) cudaEventRecord(ev_g0, stream);
     if (cudaGraphLaunch(graph_exec[(size_t) bucket], stream) != cudaSuccess) {
         err = std::string("dense model: graph launch: ") + cudaGetErrorString(cudaGetLastError());
         return false;
+    }
+    if (gtime) {
+        cudaEventRecord(ev_g1, stream);
+        const auto t3 = std::chrono::steady_clock::now();
+        const auto ms_of = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        gtime_wait += ms_of(t0, t1);
+        gtime_dequant += ms_of(t1, t2);
+        gtime_launch += ms_of(t2, t3);
+        gtime_pending = true;
+        ++gtime_steps;
     }
     cudaEventRecord(embed_done, stream);
     return true;

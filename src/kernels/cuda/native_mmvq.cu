@@ -2322,6 +2322,58 @@ void native_pq2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     launch_check();
 }
 
+// Two PQ2_0 GEMVs over the same activation: each warp computes output row `warp` of both matrices (the row counts
+// may differ) with native_pq2_0_mmvq_kernel's own chunk order and reduction, so yA and yB are bitwise the two
+// single calls.  The pair exists to halve the launch count of the dense decode pass, where a GEMV well under the
+// card's bandwidth (ssm_alpha+ssm_beta are 65 KiB) is mostly its own launch.
+__global__ void __launch_bounds__(256, 1)
+native_pq2_0_mmvq_pair_kernel(const Pq20Block* __restrict__ wa, const Pq20Block* __restrict__ wb,
+                              const Q81Block* __restrict__ x, float* __restrict__ ya, float* __restrict__ yb,
+                              int n_in, int na, int nb) {
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (warp >= na && warp >= nb) return;
+    const bool doa = warp < na, dob = warp < nb;
+    const int blocks_per_row = n_in / 128;
+    float acca = 0.0f, accb = 0.0f;
+    for (int b = lane; b < blocks_per_row * 4; b += 32) {
+        const Q81Block* xb = x + (std::size_t) (b >> 2) * 4 + (b & 3);
+        const std::size_t off = (std::size_t) warp * blocks_per_row + (b >> 2);
+        if (doa) acca += pq2_q8_chunk(wa + off, xb, b & 3);
+        if (dob) accb += pq2_q8_chunk(wb + off, xb, b & 3);
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+        acca += __shfl_xor_sync(0xffffffffu, acca, o);
+        accb += __shfl_xor_sync(0xffffffffu, accb, o);
+    }
+    if (lane == 0) {
+        if (doa) ya[warp] = acca;
+        if (dob) yb[warp] = accb;
+    }
+}
+
+void native_pq2_0_mmvq_pair(const void* wA, const void* wB, const void* x_q8_1, float* yA, float* yB,
+                            int n_in, int n_outA, int n_outB, void* stream) {
+    if (n_in <= 0 || n_in % 128 != 0)
+        throw std::invalid_argument("native MMVQ pair requires n_in a positive multiple of 128");
+    if (n_outA <= 0 || n_outB <= 0) throw std::invalid_argument("native MMVQ pair requires n_out > 0");
+    validate_pointer(wA);
+    validate_pointer(wB);
+    validate_pointer(x_q8_1);
+    validate_pointer(yA);
+    validate_pointer(yB);
+    validate_stream(stream);
+    const auto* a = static_cast<const Pq20Block*>(wA);
+    const auto* b = static_cast<const Pq20Block*>(wB);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int n = n_outA > n_outB ? n_outA : n_outB;
+    const unsigned blocks = unsigned((std::size_t(n) + 7) / 8);
+    native_pq2_0_mmvq_pair_kernel<<<blocks, 256, 0, s>>>(a, b, x, yA, yB, n_in, n_outA, n_outB);
+    launch_check();
+}
+
 void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 64);
