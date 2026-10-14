@@ -215,26 +215,43 @@ __device__ __forceinline__ void fwht256_shared(float* buf) {
     __syncthreads();
 }
 
+// The same 1024-wide butterfly on the 1024 threads of a block, one element per thread, with the five strides below
+// 32 paired inside one warp: those stages run on the register through __shfl_xor_sync and cost no barrier at all.
+// The five strides 32..512 exchange through two ping-ponged shared buffers with ONE __syncthreads per stage (a
+// stage's read can never race the next stage's write, they are different buffers).  The pairings, the expressions
+// and their order are fwht1024_kernel's stage for stage, so the transform is bit-identical.  `wr` is the buffer the
+// first cross-warp stage writes: callers that invoke this again straight away (rms_fwht_quant's block loop) must
+// alternate it, because the last stage's reads are not followed by a barrier.
+__device__ __forceinline__ float fwht1024_shuffled(float* bufA, float* bufB, float* wr, float v, int t) {
+#pragma unroll
+    for (int len = 1; len < 32; len <<= 1) {
+        const float o = __shfl_xor_sync(0xffffffffu, v, len);
+        v = (t & len) ? (o - v) : (v + o);
+    }
+#pragma unroll
+    for (int len = 32; len < 1024; len <<= 1) {
+        wr[t] = v;
+        __syncthreads();
+        const float o = wr[t ^ len];
+        v = (t & len) ? (o - v) : (v + o);
+        wr = (wr == bufA) ? bufB : bufA;
+    }
+    return v;
+}
+
 // The folded-basis transform: one 1024-element block per (row, block) with 1024 threads.  The normalization
 // 1/sqrt(1024) is applied at the load; forward applies the signs before the transform (R x), inverse after
 // (R^T x).  Same butterfly as fwht256_shared, one size up.
 __global__ void fwht1024_kernel(const float* __restrict__ x, float* __restrict__ y, const float* __restrict__ signs,
                                 int width, int inverse) {
-    __shared__ float buf[1024];
+    __shared__ float bufA[1024], bufB[1024];
     const int t = threadIdx.x;                                  // 1024 threads per block
     const int blk = blockIdx.x, row = blockIdx.y;
     const float* xr = x + (size_t) row * width + (size_t) blk * 1024;
     const float* sg = signs + (size_t) blk * 1024;
     float v = xr[t] * (1.0f / 32.0f);
     if (!inverse) v *= sg[t];
-    buf[t] = v;
-    for (int len = 1; len < 1024; len <<= 1) {
-        __syncthreads();
-        const float a = buf[t], b = buf[t ^ len];
-        __syncthreads();
-        buf[t] = (t & len) ? (b - a) : (a + b);
-    }
-    float o = buf[t];
+    float o = fwht1024_shuffled(bufA, bufB, bufB, v, t);
     if (inverse) o *= sg[t];
     y[(size_t) row * width + (size_t) blk * 1024 + t] = o;
 }
@@ -255,7 +272,7 @@ static_assert(sizeof(Q81Twin) == 36 && alignof(Q81Twin) == 4, "q8_1 block layout
 __global__ void fwht_quant_kernel(const float* __restrict__ x, Q81Twin* __restrict__ y,
                                   const float* __restrict__ signs, int width, int hd, int nk, int rep,
                                   float* __restrict__ rot_out) {
-    __shared__ float buf[1024];
+    __shared__ float bufA[1024], bufB[1024];
     const int t = threadIdx.x;
     const int blk = blockIdx.x, row = blockIdx.y;
     const size_t j = (size_t) blk * 1024 + t;
@@ -267,14 +284,7 @@ __global__ void fwht_quant_kernel(const float* __restrict__ x, Q81Twin* __restri
     }
     float v = x[(size_t) row * width + src] * (1.0f / 32.0f);
     v *= signs[j];
-    buf[t] = v;
-    for (int len = 1; len < 1024; len <<= 1) {
-        __syncthreads();
-        const float a = buf[t], b = buf[t ^ len];
-        __syncthreads();
-        buf[t] = (t & len) ? (b - a) : (a + b);
-    }
-    const float xi = buf[t];
+    const float xi = fwht1024_shuffled(bufA, bufB, bufB, v, t);
     if (rot_out) rot_out[(size_t) row * width + j] = xi;
     // native_quantize_q8_1_kernel, warp for warp: the block's 32 warps own the 32 q8_1 blocks of this 1024-block.
     const int warp = t >> 5, lane = t & 31;
@@ -297,7 +307,7 @@ __global__ void fwht_quant_kernel(const float* __restrict__ x, Q81Twin* __restri
 __global__ void swiglu_quant_kernel(const float* __restrict__ g, const float* __restrict__ u,
                                     Q81Twin* __restrict__ y, const float* __restrict__ signs, int width,
                                     float* __restrict__ h_out, float* __restrict__ rot_out) {
-    __shared__ float buf[1024];
+    __shared__ float bufA[1024], bufB[1024];
     const int t = threadIdx.x;
     const int blk = blockIdx.x, row = blockIdx.y;
     const size_t j = (size_t) blk * 1024 + t;
@@ -309,14 +319,7 @@ __global__ void swiglu_quant_kernel(const float* __restrict__ g, const float* __
     if (signs) {
         v *= (1.0f / 32.0f);
         v *= signs[j];
-        buf[t] = v;
-        for (int len = 1; len < 1024; len <<= 1) {
-            __syncthreads();
-            const float s = buf[t], b = buf[t ^ len];
-            __syncthreads();
-            buf[t] = (t & len) ? (b - s) : (s + b);
-        }
-        xi = buf[t];
+        xi = fwht1024_shuffled(bufA, bufB, bufB, v, t);
         if (rot_out) rot_out[i] = xi;
     }
     const int warp = t >> 5, lane = t & 31;
@@ -340,7 +343,7 @@ __global__ void rms_fwht_quant_kernel(float* __restrict__ x, const float* __rest
                                       const float* __restrict__ w, float* __restrict__ xn,
                                       const float* __restrict__ signs, Q81Twin* __restrict__ y, int width, float eps,
                                       int nblk) {
-    __shared__ float buf[1024];
+    __shared__ float bufA[1024], bufB[1024];
     __shared__ float part[8];
     __shared__ float scale;
     const int row = blockIdx.x;
@@ -375,14 +378,9 @@ __global__ void rms_fwht_quant_kernel(float* __restrict__ x, const float* __rest
         const size_t j = (size_t) blk * 1024 + threadIdx.x;
         float v = orow[j] * (1.0f / 32.0f);
         v *= signs[j];
-        buf[threadIdx.x] = v;
-        for (int len = 1; len < 1024; len <<= 1) {
-            __syncthreads();
-            const float a = buf[threadIdx.x], b = buf[threadIdx.x ^ len];
-            __syncthreads();
-            buf[threadIdx.x] = (threadIdx.x & len) ? (b - a) : (a + b);
-        }
-        const float xi = buf[threadIdx.x];
+        // Alternate the first write buffer: the previous block's last stage ended on a read, and no barrier
+        // follows it (see fwht1024_shuffled).
+        const float xi = fwht1024_shuffled(bufA, bufB, (blk & 1) ? bufA : bufB, v, threadIdx.x);
         const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
         float amax = fabsf(xi);
 #pragma unroll

@@ -65,6 +65,8 @@ int main() {
         strata::kernels::dense_rms_norm(x, w, xn, 1, E, 1e-6f, st, u); }));
     std::printf("rms_fwht_quant   E (rows=1):   %7.2f us\n", us_per(2000, [&] {
         strata::kernels::dense_rms_fwht_quant_rows(x, nullptr, w, xn, q8, sg, E, 1, 1e-6f, st); }));
+    std::printf("fwht_rows        E (5120x1):   %7.2f us\n", us_per(2000, [&] {
+        strata::kernels::dense_fwht_rows(x, xn, sg, E, 1, false, st); }));
     std::printf("split_q_rms     (24x256):      %7.2f us\n", us_per(2000, [&] {
         strata::kernels::dense_split_q_rms(x, w, xn, H, D, 1e-6f, st); }));
     std::printf("quantize         E (5120x1):   %7.2f us\n", us_per(2000, [&] {
