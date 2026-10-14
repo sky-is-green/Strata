@@ -1163,6 +1163,14 @@ int main(int argc, char ** argv) {
                     if (max_new > 0) k = std::min(k, max_new - gen);
                     k = std::min(k, ctxv - (P + 3));   // the pass writes P+1 .. P+1+k
                     if (k < 0) break;
+                    // STRATA_DSPARK_CONF=<tau>, as the one-shot loop: verify only the leading drafts whose confidence-head
+                    // probability is >= tau (the emitted tokens are still the trunk's - only the verify width changes)
+                    static const float conf_tau_s = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
+                    if (conf_tau_s >= 0) {
+                        int kk = 0;
+                        while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
+                        k = kk;
+                    }
                     const bool refeed = dirty && ((P + 1) & 1);
                     vt.clear();
                     if (refeed) vt.push_back(prev);
@@ -1368,8 +1376,20 @@ int main(int argc, char ** argv) {
             ++gen;
             return !(std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos || gen >= a.n_predict);
         };
+        // STRATA_DSPARK_CONF=<tau>: verify only the leading drafts whose confidence-head probability (sigmoid of
+        // conf) is >= tau - a draft that will be rejected still costs its experts' PCIe / NVMe bytes in the verify
+        // pass, while every emitted token is still the trunk's own (lossless: only the verify width changes).
+        // STRATA_DSPARK_CONFLOG=<file>: per pass "k acc verify_ms p0 p1 p2 p3 p4" (the offline threshold screen).
+        static const float conf_tau = std::getenv("STRATA_DSPARK_CONF") ? (float) std::atof(std::getenv("STRATA_DSPARK_CONF")) : -1.0f;
+        static FILE * conf_log = std::getenv("STRATA_DSPARK_CONFLOG") ? std::fopen(std::getenv("STRATA_DSPARK_CONFLOG"), "w") : nullptr;
+        auto sig = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
         while (emit(t)) {
-            const int k = std::min(spec_depth, a.n_predict - gen);   // drafts past the budget are never emitted
+            int k = std::min(spec_depth, a.n_predict - gen);   // drafts past the budget are never emitted
+            if (conf_tau >= 0) {
+                int kk = 0;
+                while (kk < k && sig(sp_conf[kk]) >= conf_tau) ++kk;
+                k = kk;
+            }
             const bool refeed = dirty && ((P + 1) & 1);
             vt.clear();
             if (refeed) vt.push_back(prev);
@@ -1399,6 +1419,13 @@ int main(int argc, char ** argv) {
             while (acc < k && sp_ids[acc] == g[acc]) ++acc;
             if (sp_noacc) acc = 0;   // bisect tap: every draft rejected (the stream must stay plain greedy)
             ++sp_pass; sp_acc += acc; sp_refeed += refeed; sp_full += acc == k;
+            if (conf_log) {
+                // acceptance of EVERY draft against the trunk rows this pass computed (beyond k: unknown, -1)
+                std::fprintf(conf_log, "%d %d %.2f", k, acc, now_ms() - tv);
+                for (int i = 0; i < spec_depth; ++i) std::fprintf(conf_log, " %.4f", sig(sp_conf[i]));
+                std::fprintf(conf_log, "\n");
+                std::fflush(conf_log);
+            }
             int spos[6];
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
             const int drafts[5] = { sp_ids[0], sp_ids[1], sp_ids[2], sp_ids[3], sp_ids[4] };

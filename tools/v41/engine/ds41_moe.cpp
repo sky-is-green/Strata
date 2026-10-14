@@ -157,7 +157,11 @@ struct Arena {
 /// the workers; wait() returns when every task is done.  One batch at a time: every start() is followed by a wait()
 /// before the next start().
 struct ReadPool {
-    static constexpr int kThreads = 8;
+    // STRATA_D3_READERS: worker count (default 8).  NVMe queue depth = readers x (each pread's 128 KiB commands)
+    static int n_threads() {
+        static const int n = std::getenv("STRATA_D3_READERS") ? std::max(1, std::min(64, std::atoi(std::getenv("STRATA_D3_READERS")))) : 8;
+        return n;
+    }
     std::vector<std::thread> th;
     std::mutex mu;
     std::condition_variable cv, cv_done;
@@ -168,7 +172,7 @@ struct ReadPool {
     uint64_t gen = 0;
     bool stop = false;
     ReadPool() {
-        for (int i = 0; i < kThreads; ++i)
+        for (int i = 0; i < n_threads(); ++i)
             th.emplace_back([this]() {
                 uint64_t seen = 0;
                 for (;;) {
@@ -2951,8 +2955,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                                                   (long long) layer, nt, im.nact_multi_n.size(), im.nact_multi_act.size(), (int) cpu::kNativeActBytes);
     auto BLX = [&](int32_t e) { return im.bl[(size_t) im.g.cls(layer, e)]; };   // an expert's blob (the bytes a DMA moves)
     // DS41_PROF_X=1: wall ms per phase, summed over calls, printed every 640 calls (16 passes x 40 layers)
-    static const bool xprof = std::getenv("DS41_PROF_X") != nullptr;
+    // DS41_PROF_X=2: count only verify/decode-sized calls (nt <= 8) - a prompt's wide calls swamp the averages
+    static const int xprof_mode = std::getenv("DS41_PROF_X") ? std::atoi(std::getenv("DS41_PROF_X")) : 0;
+    const bool xprof = xprof_mode == 1 || (xprof_mode >= 2 && nt <= 8);
     static double xp[8] = {};
+    static double xpool0[3] = {};
+    static int64_t xpool_b0 = 0;
     static long xp_n = 0, xp_nu = 0, xp_cpu = 0, xp_file = 0;
     double xt = xprof ? now_ms() : 0;
     auto xmark = [&](int i) { if (xprof) { const double t = now_ms(); xp[i] += t - xt; xt = t; } };
@@ -3064,7 +3072,9 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     const double tfg = nfg > 0 ? now_ms() : 0;
     if (nfr > 0) {
         if (!gp.rpool) gp.rpool = std::make_unique<ReadPool>();
-        const int parts = std::max(1, std::min(8, 8 / nfr));
+        // STRATA_D3_PARTS: a call's read budget in parts (default 8, split over its blobs)
+        static const int d3_parts = std::getenv("STRATA_D3_PARTS") ? std::max(1, std::atoi(std::getenv("STRATA_D3_PARTS"))) : 8;
+        const int parts = std::max(1, std::min(d3_parts, d3_parts / nfr));
         gp.rpool->start((size_t) nfr * (size_t) parts, [&, parts](size_t r) {
             const int b = fread_b[r / (size_t) parts];
             im.blobs->read_part(layer, ue[fg_u[b]], (int) (r % (size_t) parts), parts, (uint8_t*) fg_src[b]);
@@ -3404,11 +3414,19 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         xmark(6);
         ++xp_n; xp_nu += nu;
         for (int u = 0; u < nu; ++u) if (cls[u] == CPU) { ++xp_cpu; if (!gp.arena.ptr(layer, ue[u])) ++xp_file; }
-        if (xp_n % 640 == 0)
+        if (xp_n % 640 == 0) {
             std::fprintf(stderr, "[prof_x] %ld calls, ms/call: classify %.3f xq %.3f launch %.3f jobs+reads %.3f pool %.3f "
                          "sum+sync %.3f admit %.3f | distinct %.2f/call, cpu %.2f, file %.2f\n", xp_n, xp[0] / xp_n,
                          xp[1] / xp_n, xp[2] / xp_n, xp[3] / xp_n, xp[4] / xp_n, xp[5] / xp_n, xp[6] / xp_n,
                          (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n);
+            // the pool's own phases since the last print: gate/up, the ff quant, down, and its weight-read rate
+            const cpu::ExpertPool& pl = *im.pool;
+            const double g = pl.ms_multi_gu - xpool0[0], q = pl.ms_multi_q - xpool0[1], d = pl.ms_multi_down - xpool0[2];
+            const int64_t by = pl.multi_bytes - xpool_b0;
+            std::fprintf(stderr, "[prof_x] pool since last: gu %.1f ms, q %.1f ms, down %.1f ms, %.1f MB -> %.2f GB/s\n",
+                         g, q, d, (double) by / 1e6, (double) by / 1e6 / std::max(1e-9, g + q + d));
+            xpool0[0] = pl.ms_multi_gu; xpool0[1] = pl.ms_multi_q; xpool0[2] = pl.ms_multi_down; xpool_b0 = pl.multi_bytes;
+        }
     }
     im.st.add(st);
     im.pf_n = 0;
