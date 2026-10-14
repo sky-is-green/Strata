@@ -99,6 +99,12 @@ void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_ca
                            float* scratch, int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale,
                            void* stream);
 
+/// dense_attn_decode_fmt + dense_gate_apply in one launch, bit-identical to the pair: q_full is this column's
+/// [q | gate] rows (row h of the head), and `out` receives the gated attention directly.
+void dense_attn_decode_gate_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt,
+                                const float* q_full, float* out, float* scratch, int n_head, int n_kv, int head_dim,
+                                int n_ctx, int max_ctx, float scale, void* stream);
+
 /// Bytes of scratch dense_attn_decode needs for a cache of `max_ctx` cells.
 uint64_t dense_attn_scratch_bytes(int n_head, int head_dim, int max_ctx);
 

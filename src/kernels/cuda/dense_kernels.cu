@@ -442,6 +442,36 @@ __global__ void attn_merge_kernel(const float* __restrict__ part_acc, const floa
     out[(size_t) h * head_dim + threadIdx.x] = val;
 }
 
+// The merge with gate_apply's output stage in the same launch: `q_full` is this column's [q | gate] rows (row h
+// is head h), and the write is gate_apply_kernel's own `attn * sigmoid(gate)` expression, so the two-launch pair
+// and this one land on the same bits.
+template <int VF>
+__global__ void attn_merge_gate_kernel(const float* __restrict__ part_acc, const float* __restrict__ part_ml,
+                                       const float* __restrict__ q_full, float* __restrict__ out, int head_dim,
+                                       int n_splits) {
+    __shared__ float so[kMaxHeadDim];
+    const int h = blockIdx.x;
+    float gm = -FLT_MAX;
+    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_ml[((size_t) h * n_splits + s) * 2]);
+    float a = 0.0f, L = 0.0f;
+    for (int s = 0; s < n_splits; ++s) {
+        const float l = part_ml[((size_t) h * n_splits + s) * 2 + 1];
+        if (l == 0.0f) continue;
+        const float f = __expf(part_ml[((size_t) h * n_splits + s) * 2] - gm);
+        a += part_acc[((size_t) h * n_splits + s) * head_dim + threadIdx.x] * f;
+        L += l * f;
+    }
+    float val = L > 0.0f ? a / L : 0.0f;
+    if (VF == kQ4) {
+        so[threadIdx.x] = val;
+        __syncthreads();
+        fwht256_shared(so);
+        val = so[threadIdx.x];
+    }
+    const float g = q_full[(size_t) h * 2 * head_dim + head_dim + threadIdx.x];
+    out[(size_t) h * head_dim + threadIdx.x] = val * (1.0f / (1.0f + __expf(-g)));
+}
+
 int splits_for(int cells) { return (cells + kChunk - 1) / kChunk; }
 
 // ================================================================================== the batched prompt kernels
@@ -1163,6 +1193,44 @@ void dense_attn_decode_fmt(const float* q, const void* k_cache, const void* v_ca
 void dense_attn_decode(const float* q, const uint16_t* k_cache, const uint16_t* v_cache, float* out, float* scratch,
                        int n_head, int n_kv, int head_dim, int n_ctx, int max_ctx, float scale, void* stream) {
     dense_attn_decode_fmt(q, k_cache, v_cache, kF16, kF16, out, scratch, n_head, n_kv, head_dim, n_ctx, max_ctx, scale, stream);
+}
+
+// dense_attn_decode_fmt + dense_gate_apply as one merge launch: q_full is this column's [q | gate] rows (the gate
+// is row h's second half).  The partial launch is unchanged.
+void dense_attn_decode_gate_fmt(const float* q, const void* k_cache, const void* v_cache, int k_fmt, int v_fmt,
+                                const float* q_full, float* out, float* scratch, int n_head, int n_kv, int head_dim,
+                                int n_ctx, int max_ctx, float scale, void* stream) {
+    if (n_ctx < 1 || n_ctx > max_ctx) throw std::runtime_error("dense_attn_decode_gate: n_ctx outside the cache");
+    if (head_dim % 32 != 0 || head_dim > kMaxHeadDim || n_head % n_kv != 0)
+        throw std::runtime_error("dense_attn_decode_gate: head_dim must be a multiple of 32 up to 256 and n_head a multiple of n_kv");
+    check_kv_formats("dense_attn_decode_gate", k_fmt, v_fmt, head_dim);
+    const int n_splits = splits_for(n_ctx);
+    const int max_splits = splits_for(max_ctx);
+    float* part_acc = scratch;
+    float* part_ml = scratch + (size_t) n_head * max_splits * head_dim;
+    const cudaStream_t st = (cudaStream_t) stream;
+    const uint8_t* K = (const uint8_t*) k_cache;
+    const uint8_t* V = (const uint8_t*) v_cache;
+    const dim3 grid(n_head, n_splits);
+#define STRATA_ATTG(KF, VF)                                                                                     \
+    attn_partial_kernel<KF, VF><<<grid, kWarps * 32, 0, st>>>(q, K, V, part_acc, part_ml, n_head, n_kv,         \
+                                                              head_dim, n_ctx, max_ctx, scale, n_splits)
+    switch (k_fmt * 3 + v_fmt) {
+        case 0: STRATA_ATTG(kF16, kF16); break;
+        case 1: STRATA_ATTG(kF16, kQ8); break;
+        case 2: STRATA_ATTG(kF16, kQ4); break;
+        case 3: STRATA_ATTG(kQ8, kF16); break;
+        case 4: STRATA_ATTG(kQ8, kQ8); break;
+        case 5: STRATA_ATTG(kQ8, kQ4); break;
+        case 6: STRATA_ATTG(kQ4, kF16); break;
+        case 7: STRATA_ATTG(kQ4, kQ8); break;
+        default: STRATA_ATTG(kQ4, kQ4); break;
+    }
+#undef STRATA_ATTG
+    check("dense_attn_partial");
+    if (v_fmt == kQ4) attn_merge_gate_kernel<kQ4><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits);
+    else attn_merge_gate_kernel<kF16><<<n_head, head_dim, 0, st>>>(part_acc, part_ml, q_full, out, head_dim, n_splits);
+    check("dense_attn_merge_gate");
 }
 
 // ============================================================================ the batched prompt path

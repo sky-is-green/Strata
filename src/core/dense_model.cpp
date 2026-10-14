@@ -786,10 +786,11 @@ void DenseModel::Impl::attn_block(const DenseConfig& c, const QMat& wq, const QM
     native_rope_apply_rows(kcur, kcur, n * HK, D, c.n_rot, rope, HK, pos0, s);
     dense_kv_append_rows_fmt(kc, vc, kfmt, vfmt, kcur, vcur, n, pos0, HK, D, (int) max_context, s);
     for (int j = 0; j < n; ++j) {
-        dense_attn_decode_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, attn + (size_t) j * H * D, attn_scratch,
-                              H, HK, D, pos0 + j + 1, (int) max_context, scale, s);
+        // The merge writes the gated output straight to attn32: the gate is row h's second half in q_full.
+        dense_attn_decode_gate_fmt(qcur + (size_t) j * H * D, kc, vc, kfmt, vfmt, q_full + (size_t) j * H * 2 * D,
+                                   attn32 + (size_t) j * H * D, attn_scratch, H, HK, D, pos0 + j + 1,
+                                   (int) max_context, scale, s);
     }
-    dense_gate_apply(attn, q_full, attn32, n * H, H, D, s);
     }
     if (rot & ROT_O) {
         fwht_quantize(attn32, H * D, n, ham_signs(H * D), nullptr, 0, 0, 0, s);
