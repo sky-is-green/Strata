@@ -54,3 +54,13 @@ Rebuild: `mmq.cu.o` plus every TU that includes `mmq.cuh` — `quantize.cu.o`, `
   `src/prefill/moe_mmq.cu` builds `mmq_args` positionally, so it must compute `J_best` itself (it now does, same rule
   as ggml's host code) - without it: `GGML_ABORT` "J_best=75" in the MoE prefill.  Identity id buffers +128 ints.
 - Verified: 512-token prefill logits bit-identical before/after AND run to run; DSpark decode 256 tokens identical.
+
+## kv-fp4.patch (2026-10-15, session 11) - APPLIED in the local tree
+- The `--kv-fp4` caches: CUDA set_rows quantize-on-write for NVFP4 (`quantize_f32_nvfp4_ds41_block`) and MXFP4
+  (`quantize_f32_mxfp4_ds41_block`) in `cpy-utils.cuh` - EXACT packers for values already on the DS4.1 fake-quant
+  grids (they try the scales the grid admits and verify by multiplication; ggml's own MXFP4/NVFP4 rules differ);
+  NVFP4 get_rows (`dequantize_nvfp4`, getrows.cu); MXFP4 K in the lightning indexer on the fp32 vec kernel (never the
+  fp16 wmma kernel, so the scores equal the BF16 path's); supports_op entries.  Files: cpy-utils.cuh, set-rows.cu,
+  getrows.cu, dequantize.cuh, fattn-common.cuh, lightning-indexer.cu, ggml-cuda.cu.  Apply after the others.
+- Verified: `test_ds41_kvfp4 --cuda` (5.2M fake-quantized values through set_rows/get_rows, 0 differ) and the engine
+  gate (8000-token prompt, exact routing, `STRATA_PRESTAGE_GIB=1.5` both arms): last-row logits bitwise identical.
