@@ -44,6 +44,10 @@ void iq_corr_g128_b(const void* b, const void* t_q8_1, int rank, int n_out, floa
 void iq_corr_mixed_a(const void* a_moe, const void* xq_moe, int n_moe, int rank_moe, void* tq_moe,
                      const void* a_router, const float* h, int n_router, int rank_router, void* t16_router,
                      void* stream);
+/// The router's f32 GEMV rows and the mixed A pass in one launch (T = 1).  False where a shape does not fit.
+bool native_gemv_corr_mixed_a(const void* W, const float* h, float* y, int n_in, int n_out, const void* a_moe,
+                              const void* xq_moe, int n_moe, int rank_moe, void* tq_moe, const void* a_router,
+                              int n_router, int rank_router, void* t16_router, void* stream);
 void iq_corr_mixed_b(const void* b_moe, const void* tq_moe, int rank_moe, int n_out_moe, float* out_moe,
                      const void* b_router, const void* t16_router, int rank_router, int n_out_router, float* out_router,
                      void* stream);

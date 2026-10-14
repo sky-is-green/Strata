@@ -1682,18 +1682,26 @@ struct Engine {
             }
             tick(5, false);
         }
-        tick(6, true);   // the post-attention norm and the router logits
+        tick(6, true);   // the post-attention norm, the router logits and the mixed A pass in one launch
         k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps, (T <= kGemmT) ? (Q81Block*) xq : nullptr);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
-        if (one) {
-            if (!skip_rt) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, 1);
-        } else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        const bool mixed_ok = one && L.moe_corr_a.d && L.router_corr_a.d && L.moe_corr_a.n_in == N && L.moe_corr_b.n_out == N;
+        bool mixed_a_fused = false;
+        if (mixed_ok && !skip_rt && !skip_ma)
+            mixed_a_fused = K::native_gemv_corr_mixed_a(L.router_ext, h, logits_r, N, (int) g.n_expert + 1,
+                                                       L.moe_corr_a.d, xq, L.moe_corr_a.n_in, L.moe_corr_a.n_out, corr_tq,
+                                                       L.router_corr_a.d, (int) g.n_embd, (int) L.router_corr_a.n_out, corr_t16, st);
+        if (!mixed_a_fused) {
+            if (one) {
+                if (!skip_rt) f32mm(L.router_ext, h, logits_r, N, (int) g.n_expert + 1, 1);
+            } else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
+        }
         tick(6, false);
         tick(7, true);   // the router delta (f16) and the MoE delta (g128): one mixed pair at one row
         bool mixed = false;
-        if (one && L.moe_corr_a.d && L.router_corr_a.d && L.moe_corr_a.n_in == N && L.moe_corr_b.n_out == N) {
-            if (!skip_ma)
+        if (mixed_ok) {
+            if (!mixed_a_fused && !skip_ma)
                 K::iq_corr_mixed_a(L.moe_corr_a.d, xq, L.moe_corr_a.n_in, L.moe_corr_a.n_out, corr_tq,
                                    L.router_corr_a.d, h, (int) g.n_embd, (int) L.router_corr_a.n_out, corr_t16, st);
             if (!skip_mb)

@@ -3571,6 +3571,112 @@ bool native_mmvq_corr_aq(int t, const void* w, const void* x_q8_1, float* y, int
     return true;
 }
 
+// The router's f32 GEMV rows and the mixed corrections' A pass in one launch (T = 1): the GEMV blocks first
+// (k_gemv_f32's warp-per-row body in this kernel's 1024-thread form - the same float4 accumulation and XOR
+// tree), then corr_mixed_a_kernel's body unchanged.  Bitwise the two kernels; only the launch is shared.
+__global__ void __launch_bounds__(1024) gemv_corr_mixed_a_kernel(const float* __restrict__ W,
+                                                                const float* __restrict__ h, float* __restrict__ y,
+                                                                int n_in, int n_out, int f32_blocks,
+                                                                const uint8_t* __restrict__ a_moe,
+                                                                const block_q8_1* __restrict__ xq_moe, int n_moe,
+                                                                int rank_moe, block_q8_1* __restrict__ tq_moe,
+                                                                const uint16_t* __restrict__ a_router, int n_router,
+                                                                int rank_router, uint16_t* __restrict__ t16_router) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if ((int) blockIdx.x < f32_blocks) {
+        const int o = (int) blockIdx.x * 32 + warp;
+        if (o >= n_out) return;
+        const float4* wr = (const float4*) (W + (size_t) o * n_in);
+        const float4* xr = (const float4*) h;
+        float acc = 0.f;
+        for (int i = lane; i < n_in / 4; i += 32) {
+            const float4 a = wr[i], b = xr[i];
+            acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        if (lane == 0) y[o] = acc;
+        return;
+    }
+    const int bx = (int) blockIdx.x - f32_blocks;
+    __shared__ float ts[32];
+    __shared__ __align__(16) uint16_t xs[4096];
+    __shared__ float part[8][4];
+    const int g_blocks = rank_moe / 32;
+    if (bx < g_blocks) {
+        const int row = bx * 32 + warp;
+        float s = 0.0f;
+        if (row < rank_moe) {
+            const int nb = n_moe / 128;
+            const uint8_t* wr = a_moe + (size_t) row * ((size_t) (n_moe / 128) * sizeof(block_pq2_0));
+            for (int k = lane; k < nb; k += 32) {
+                const Split<142>::W w = Split<142>::load(wr, k, 0);
+                s += Split<142>::apply(w, xq_moe + k * 4, 0);
+            }
+            s = warp_sum(s);
+        }
+        if (lane == 0) ts[warp] = s;
+        __syncthreads();
+        if (warp == 0) {
+            const float xi = ts[lane];
+            float amax = fabsf(xi), sum = xi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            const float d = q8_1_finite(amax / 127.0f);
+            const int8_t q = q8_1_quant(xi, d, amax);
+            tq_moe[bx].qs[lane] = q;
+            if (lane == 0) tq_moe[bx].ds = q8_1_ds(d, sum);
+        }
+        return;
+    }
+    const int rg = warp >> 2;                          // the row group: 8 rows per block
+    const int rb = (bx - g_blocks) * 8 + rg;
+    const int wg = warp & 3;                           // the warp's quarter within its row
+    for (int j = threadIdx.x; j < n_router; j += 1024) xs[j] = f16_from_f32(h[j]);
+    __syncthreads();
+    const int64_t n8 = n_router / 8;
+    const uint4* rp = reinterpret_cast<const uint4*>(a_router + (size_t) rb * n_router);
+    const uint4* xp = reinterpret_cast<const uint4*>(xs);
+    const int64_t q0 = (n8 * wg) / 4, q1 = (n8 * (wg + 1)) / 4;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    int64_t k = q0 + lane;
+    for (; k + 96 < q1; k += 128) {
+        acc0 += f16_dot8(rp[k], xp[k]);
+        acc1 += f16_dot8(rp[k + 32], xp[k + 32]);
+        acc2 += f16_dot8(rp[k + 64], xp[k + 64]);
+        acc3 += f16_dot8(rp[k + 96], xp[k + 96]);
+    }
+    for (; k < q1; k += 32) acc0 += f16_dot8(rp[k], xp[k]);
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) part[rg][wg] = acc;
+    __syncthreads();
+    if (wg == 0 && lane == 0)
+        t16_router[rb] = f16_from_f32(((part[rg][0] + part[rg][1]) + part[rg][2]) + part[rg][3]);
+}
+
+// The fused pair's launcher: false where a shape does not fit (the caller runs the separate launches).
+bool native_gemv_corr_mixed_a(const void* W, const float* h, float* y, int n_in, int n_out, const void* a_moe,
+                              const void* xq_moe, int n_moe, int rank_moe, void* tq_moe, const void* a_router,
+                              int n_router, int rank_router, void* t16_router, void* stream) {
+    if (n_in <= 0 || n_in % 4 != 0 || n_out <= 0) return false;
+    if (n_moe <= 0 || n_moe % 128 != 0 || rank_moe <= 0 || rank_moe % 32 != 0) return false;
+    if (n_router <= 0 || n_router % 32 != 0 || n_router > 4096 || rank_router <= 0 || rank_router % 32 != 0) return false;
+    const int f32_blocks = (n_out + 31) / 32;
+    const unsigned blocks = (unsigned) (f32_blocks + rank_moe / 32 + rank_router / 8);
+    gemv_corr_mixed_a_kernel<<<blocks, 1024, 0, (cudaStream_t) stream>>>((const float*) W, h, y, n_in, n_out, f32_blocks,
+                                                                        (const uint8_t*) a_moe,
+                                                                        (const block_q8_1*) xq_moe, n_moe, rank_moe,
+                                                                        (block_q8_1*) tq_moe, (const uint16_t*) a_router,
+                                                                        n_router, rank_router, (uint16_t*) t16_router);
+    check("native_gemv_corr_mixed_a");
+    return true;
+}
+
 // The correction branch's A pass with the q8_1 image of its result fused in: tq [rank/32 blocks] = quantize_q8_1
 // of A xq (both bitwise the staged form: quantize_q8_1_rows of iq_mmvq(142, ncols = 1)'s output).
 void iq_corr_g128_aq(const void* a, const void* x_q8_1, int n_in, int rank, void* t_q8_1, void* stream) {
