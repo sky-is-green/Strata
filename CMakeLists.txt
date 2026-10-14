@@ -85,6 +85,9 @@ if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
 endif()
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
+# The dense runner (`strata-dense`) feeds a prompt through MMQ instead of 8-token run() groups; it needs the same
+# GGML MMQ instances strata_mmq compiles, so it is switched off with them.
+option(STRATA_DENSE_PREFILL "Batched MMQ prompt prefill for strata-dense (needs the strata_mmq MMQ kernels)" ON)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
@@ -390,6 +393,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/lora_corr.cu
+                          src/kernels/cuda/dense_kernels.cu
+                          src/kernels/cuda/qwen35_attention.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -489,7 +494,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
-    src/core/corrections.cpp)
+    src/core/corrections.cpp src/core/dense_model.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -624,6 +629,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # a DENSE qwen35 model (Qwen3.8-27B): same server protocol as `strata --serve`, no experts (src/program/dense_main.cpp)
+  add_executable(strata-dense src/program/dense_main.cpp)
+  target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-dense PRIVATE strata_engine ${_strata_gpu_runtime_target})
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet
@@ -1505,6 +1515,13 @@ if(STRATA_NATIVE_EXPERTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
     endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    # the dense runner: its prompt path multiplies the model's own weights through these same MMQ kernels
+    if(STRATA_DENSE_PREFILL AND TARGET strata_mmq)
+      target_link_libraries(strata_engine PUBLIC strata_mmq)
+      target_compile_definitions(strata_engine PUBLIC STRATA_DENSE_MMQ=1)
+    elseif(STRATA_DENSE_PREFILL)
+      message(STATUS "strata-dense: no strata_mmq target - the dense prompt path stays on run()")
+    endif()
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
     if(STRATA_BUILD_TESTS)
       # #136: the fused int8 experts against a double-precision reference and the MMQ path (exit 77 below sm_80)
@@ -1579,6 +1596,13 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    # the dense runner: its prompt path multiplies the model's own weights through these same MMQ kernels
+    if(STRATA_DENSE_PREFILL AND TARGET strata_mmq)
+      target_link_libraries(strata_engine PUBLIC strata_mmq)
+      target_compile_definitions(strata_engine PUBLIC STRATA_DENSE_MMQ=1)
+    elseif(STRATA_DENSE_PREFILL)
+      message(STATUS "strata-dense: no strata_mmq target - the dense prompt path stays on run()")
+    endif()
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
     # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)
     add_executable(hip_prefill_fused_moe tests/cuda/prefill_fused_moe_test.cpp)
