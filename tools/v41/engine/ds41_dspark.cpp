@@ -7,6 +7,7 @@
 
 #include "ggml-alloc.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -45,11 +46,25 @@ struct Ds41DSpark::Impl {
     std::vector<int> filled;           // ring slot -> position held (-1 empty)
     // graphs (one per (k, draft?) shape), one allocator
     ggml_gallocr_t ga = nullptr;
-    struct G { ggml_context * c = nullptr; ggml_cgraph * gf = nullptr; std::vector<ggml_tensor *> ids, conf; };
+    struct G { ggml_context * c = nullptr; ggml_cgraph * gf = nullptr; std::vector<ggml_tensor *> ids, conf, rids; };
+    // STRATA_DSPARK_COUNT=<file>: every block's routed-expert picks are counted (draft AND feed graphs) and written at
+    // exit as 3 lines of NE counts - the input of STRATA_DSPARK_KEEP.
+    std::vector<std::vector<int64_t>> counts;
+    // STRATA_DSPARK_KEEP=<counts file>:<K>[,<K1>,<K2>]: only each block's K most-used routed experts are loaded (gate rows, gate
+    // bias and the experts sliced on load; the router then picks among those K).  The drafter's experts are ~4.15 GiB
+    // of the card - VRAM the trunk's expert cache does not get.  Drafts are verified by the trunk, so this moves only
+    // acceptance, never the output.
+    std::vector<std::vector<int32_t>> keep;
     std::map<std::pair<int, bool>, G> graphs;
     double ms = 0;
 
     ~Impl() {
+        if (const char * cf = std::getenv("STRATA_DSPARK_COUNT"); cf && !counts.empty()) {
+            if (FILE * f = std::fopen(cf, "w")) {
+                for (auto & r : counts) { for (size_t i = 0; i < r.size(); ++i) std::fprintf(f, "%s%lld", i ? " " : "", (long long) r[i]); std::fputc('\n', f); }
+                std::fclose(f);
+            }
+        }
         for (auto & kv : graphs) ggml_free(kv.second.c);
         if (ga) ggml_gallocr_free(ga);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -100,11 +115,47 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         ggml_quantize_init(xt);
     }
     auto is_exp = [](const std::string & n) { return n.find(".ffn.experts.") != std::string::npos; };
+    // keep: per block, the K most-used experts (ascending index order)
+    auto blk_of = [](const std::string & n) { return n.rfind("mtp.", 0) == 0 ? std::atoi(n.c_str() + 4) : -1; };
+    auto sliced = [&](const std::string & n) -> int {   // 0 = no, 1 = experts (ne[2]), 2 = gate weight (ne[1]), 3 = gate bias (ne[0])
+        if (keep.empty() || blk_of(n) < 0) return 0;
+        if (is_exp(n)) return 1;
+        auto ends = [&](const char * x) { const size_t l = std::strlen(x); return n.size() > l && n.compare(n.size() - l, l, x) == 0; };
+        if (ends(".ffn.gate.weight")) return 2;
+        if (ends(".ffn.gate.bias")) return 3;
+        return 0;
+    };
+    if (const char * kp = std::getenv("STRATA_DSPARK_KEEP")) {
+        std::string a(kp);
+        const size_t c = a.rfind(':');
+        if (c == std::string::npos) { e = "STRATA_DSPARK_KEEP=<counts file>:<K>"; return false; }
+        std::vector<int> Ks;   // one K for every block, or a comma list per block (block 0's picks spread more widely)
+        for (const char * q = a.c_str() + c + 1; *q;) { Ks.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q) ++q; }
+        FILE * f = std::fopen(a.substr(0, c).c_str(), "r");
+        if (!f) { e = "STRATA_DSPARK_KEEP: cannot open " + a.substr(0, c); return false; }
+        char line[65536];
+        while (std::fgets(line, sizeof line, f)) {
+            std::vector<std::pair<long long, int32_t>> v;
+            char * q = line;
+            for (int32_t i = 0;; ++i) { char * end; const long long x = std::strtoll(q, &end, 10); if (end == q) break; v.push_back({ x, i }); q = end; }
+            if (v.empty()) continue;
+            const int K = Ks.empty() ? 0 : Ks[std::min(keep.size(), Ks.size() - 1)];
+            if (K < (int) cfg.n_used || K > (int) v.size()) { std::fclose(f); e = "STRATA_DSPARK_KEEP: K out of range"; return false; }
+            std::stable_sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.first > y.first; });
+            std::vector<int32_t> k;
+            for (int i = 0; i < K; ++i) k.push_back(v[(size_t) i].second);
+            std::sort(k.begin(), k.end());
+            keep.push_back(k);
+        }
+        std::fclose(f);
+        if (keep.size() != 3) { e = "STRATA_DSPARK_KEEP: expected 3 lines of counts"; return false; }
+    }
     ggml_init_params ip = { (src.size() + 8) * ggml_tensor_overhead(), nullptr, true };
     wctx = ggml_init(ip);
     for (auto & s : src) {
         int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < s.second->shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) s.second->shape[d];
+        if (const int sl = sliced(s.second->name)) ne[sl == 1 ? 2 : sl == 2 ? 1 : 0] = (int64_t) keep[(size_t) blk_of(s.second->name)].size();
         const ggml_type ty = (xt != GGML_TYPE_COUNT && is_exp(s.second->name)) ? xt : (ggml_type) s.second->type;
         if (ty != (ggml_type) s.second->type && ne[0] % ggml_blck_size(ty)) { e = s.second->name + ": row not a multiple of the block"; return false; }
         ggml_tensor * t = ggml_new_tensor(wctx, ty, (int) s.second->shape.size(), ne);
@@ -119,6 +170,19 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         m.find(s.second->name, &sh);
         ggml_tensor * t = w[s.second->name];
         const void * data = m.shard(sh).tensor_data(*s.second);
+        std::vector<uint8_t> kept;   // STRATA_DSPARK_KEEP: the kept experts' / gate rows' source bytes, in order
+        if (const int sl = sliced(s.second->name)) {
+            const ggml_type st = (ggml_type) s.second->type;
+            const int64_t n0 = (int64_t) s.second->shape[0];
+            const size_t unit = sl == 1 ? ggml_row_size(st, n0) * (size_t) s.second->shape[1]   // one expert
+                              : sl == 2 ? ggml_row_size(st, n0)                                   // one gate row
+                                        : ggml_type_size(st);                                     // one bias value
+            if (sl == 3 && ggml_blck_size(st) != 1) { e = s.second->name + ": quantized gate bias"; return false; }
+            const auto & k = keep[(size_t) blk_of(s.second->name)];
+            kept.resize(k.size() * unit);
+            for (size_t i = 0; i < k.size(); ++i) std::memcpy(kept.data() + i * unit, (const uint8_t *) data + (size_t) k[i] * unit, unit);
+            data = kept.data();
+        }
         if (t->type == (ggml_type) s.second->type) {
             ggml_backend_tensor_set(t, data, 0, ggml_nbytes(t));
         } else {   // dequantize + requantize in row chunks over the CPU threads
@@ -300,7 +364,8 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
         ggml_mul_mat_set_prec(rl, GGML_PREC_F32);
         ggml_tensor * sc = ggml_sqrt(c, ggml_softplus(c, rl));                                  // [NE, BS]
         ggml_tensor * ids = ggml_argsort_top_k(c, ggml_add(c, sc, BW(b, "ffn.gate.bias")), (int) NU);   // [NU, BS]
-        ggml_tensor * wts = ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_3d(c, sc, 1, NE, BS), ids), NU, BS);
+        if (std::getenv("STRATA_DSPARK_COUNT")) { ggml_set_output(ids); gr.rids.push_back(ids); ggml_build_forward_expand(gf, ids); }
+        ggml_tensor * wts = ggml_reshape_2d(c, ggml_get_rows(c, ggml_reshape_3d(c, sc, 1, sc->ne[0], BS), ids), NU, BS);
         if (Gm.norm_topk && NU > 1) wts = ggml_div(c, wts, ggml_scale_bias(c, ggml_sum_rows(c, wts), 1.0f, 1e-20f));
         wts = ggml_scale(c, wts, (float) Gm.weights_scale);
         // routed experts (Expert.forward: clamped SwiGLU, the routing weight applied before w2)
@@ -379,6 +444,14 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
     Impl::G & gr = im.graph(k, draft);
     if (!ggml_gallocr_alloc_graph(im.ga, gr.gf)) { im.err = "DSpark graph allocation failed"; return false; }
     if (ggml_backend_graph_compute(im.be, gr.gf) != GGML_STATUS_SUCCESS) { im.err = "DSpark graph compute failed"; return false; }
+    if (!gr.rids.empty()) {
+        if (im.counts.empty()) im.counts.assign(gr.rids.size(), std::vector<int64_t>((size_t) im.NE, 0));
+        for (size_t b = 0; b < gr.rids.size(); ++b) {
+            std::vector<int32_t> v((size_t) ggml_nelements(gr.rids[b]));
+            ggml_backend_tensor_get(gr.rids[b], v.data(), 0, v.size() * 4);
+            for (int32_t x : v) if (x >= 0 && x < im.NE) ++im.counts[b][(size_t) x];
+        }
+    }
     if (draft) {
         for (size_t i = 0; i < gr.ids.size(); ++i) {
             ggml_backend_tensor_get(gr.ids[i], &ids[i], 0, 4);
