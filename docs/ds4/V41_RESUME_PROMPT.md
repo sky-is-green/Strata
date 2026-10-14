@@ -3,6 +3,64 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-14 ~21:10 (end of session 10) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4 deepseek4:main
+- pushing is OK'd; GitHub = Indras-Mirror/Strata-DSV4.1).  HEAD at handoff: a5075937 (+ a docs commit).  Overnight run:
+Mal is asleep - work autonomously, measure before concluding, keep tests small, commit + push verified work.
+
+READ FIRST: docs/ds4/V41_START_HERE.md section 5c blocks "Session 10b" then "Session 10" (newest first), then
+~/AI/research/REPORT.md (FreeToken + llama.cpp PR #29887 survey, ranked ideas at the end).
+
+STATE (RTX 4090 + 90 GB RAM):
+- Quality (real tasks, 21 HumanEval + 10 tool calls, greedy): route bias x0.25 20/21, **x0.5 20/21 (Mal's pick)**,
+  x0.75 19/21, 1.0 (old default) 16/21; tool calling 10/10 everywhere.  Harness ~/AI/v41-dev/taskeval (taskeval.py,
+  arm.sh / sarm.sh, smoke.py, engine.sh + cfg.json run the build-ds4-dspark binary).
+- x0.5 lossless speed ladder (one-shot DSpark, 128 tok, docs/python tok/s): 16.7/14.6 -> arena-adapt in D3 22.3/22.9
+  -> draft pruned (STRATA_DSPARK_KEEP=tools/v41/serve/dspark_expert_counts.txt:64) ~24.6/26.2 -> --arena-gib 68
+  python 27-28.4 (72 GiB hits the 4 GiB RAM floor: unusable; serve = 64).  FreeToken's published number: 22-25 tok/s
+  DS-V4-Flash on an RTX 5090.
+- DSpark in --serve: CODED (opt-in STRATA_SERVE_DSPARK=<sidecar>), exact speculative sampling (unit test
+  ~/AI/v41-dev/taskeval/spec_accept_test.cpp), line protocol temp 0 / temp 1 ~25.5-25.9 tok/s.  A CRASH on 2nd
+  requests (CUDA invalid argument in Ds41DSpark::step) has a fix BUILT but NOT TESTED (stale gallocr addresses).
+
+DO, IN ORDER (Mal's go for all of it, 2026-10-14):
+0. Check the machine first: Mal ran a big zstd DB copy to Team CX2 (CPU ~8 cores) - wait until `uptime` load is low
+   and no zstd runs before any GPU/CPU-heavy test.  GPU-sharing: relay peer voice-duplex/mal asks before GPU use.
+1. Verify the DSpark gallocr fix: ~/AI/v41-dev/taskeval: `DRIVE_ENV="STRATA_SERVE_DSPARK=/media/mal/NVME1TB/Models/
+   V41-Sidecar/V41-MTP-Vision.Q2_K.gguf STRATA_DSPARK_DEPTH=4 STRATA_DSPARK_KEEP=/home/mal/AI/Strata-DS4/tools/v41/
+   serve/dspark_expert_counts.txt:64" python3 drive_dsp.py crash2.json crash2.log 262144 crash2_reqs.json` (arm_args
+   holds "--arena-adapt --route-bias 0.5 --route-bias-file 0.3 --arena-gib 64") - must run all 3 requests.  Then the
+   one-shot DSpark tokens/pass re-check (did stale drafts cost acceptance?), then HTTP: `bash sarm.sh` with HE=1
+   (smoke.py + HumanEval through DSpark serve; expect ~20/21) - see spipe2.sh.
+2. 512K context (Mal wants it): serve VRAM after the dense half is 10.36 GiB at 512K vs 11.83 at 32K and 14.28 one-shot,
+   and HTTP DSpark serve ran only 15.9-17.6 tok/s (77% hits).  Find what the KV / snapshot / prompt-batch buffers cost
+   and shrink them (Mal: Strata-dense uses int8 K / int4 V - see ~/AI/Strata* dense docs; check DS4's cache dtypes),
+   so 512K serve keeps expert slots.  Re-test the crash sequence at 524288.
+3. q* (FreeToken, REPORT.md #1): STRATA_TIER_BATCH_PCIE=0.85 / 0.75 at x0.5 + arena-adapt + K=64 (docs/python, 128
+   tok, compare verify ms/pass); if it helps, pick the PCIe share by recency (FreeToken offload_kernels.py:261-345).
+4. Serve defaults + Quetza: tools/v41/serve/ds41-engine.sh -> build-ds4-dspark binary (or rebuild build-ds4-gpu),
+   args --arena-adapt --route-bias 0.5 --route-bias-file 0.3 --arena-gib 64, env STRATA_SERVE_DSPARK + KEEP + DEPTH 4;
+   strata-ds41.json ctx (512K if item 2 lands, else 256K); test the strata-ds41-quetza wrapper end to end (a real
+   Quetza turn with tool calls).
+5. GitHub README + HF card: session 10 results (quality table, speed ladder, DSpark serve), push.
+6. Mal asked: how mergeable are Strata GLM / Strata Qwen (~/AI/Strata) / Strata dense / Strata-DS4 - a short
+   divergence assessment (shared files, diff size, what a common core would be).  Read-only.
+7. Relay/chronos: `relay ask --name X` re-registers the calling window as X (found tonight) - fix or document in the
+   relay CLI (~/.local/bin/relay, source ~/AI/QuetzaCodetl/wrappers/tools) and the chronos skill; hourly wake for this
+   session = crontab `17 * * * * /home/mal/.local/bin/chronos/ds4-overnight-nudge.sh` (line removed at handoff; the
+   script targets relay name strata-dspark - `relay up strata-dspark` first) + `relay wait --timeout 7200` as a
+   background task, re-armed after every wake.
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes the GPU lock; never wrap it in flock);
+--serve runs NOT through memguard (engine.sh / ds41-engine.sh: flock + systemd-run scope).  Need >= 75 GB MemAvailable.
+Kill by exact PID only; never pkill/pgrep -f a pattern in your own command line.  bench scripts: source the gen()
+helper from ~/AI/v41-dev/s10/run3.sh - gen() clobbers the globals tag/p/n (never use them as loop variables).
+Bias-on text depends on residency: compare verify ms/pass and tokens/pass, +-5% noise.  Build: nice -n19 ninja -C
+build-ds4-dspark ds41_generate.  anaconda's `patch` is corrupt: /usr/bin/patch.
+```
+
 ## RESUME PROMPT 2026-10-14 ~06:10 (end of session 9) - paste the block below into a new session
 
 ```
