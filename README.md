@@ -33,7 +33,10 @@ DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221
   an MXFP4 grid; they are now stored that way (exact packers in the ggml fork, `tools/v41/ggml/kv-fp4.patch`) instead of
   BF16 - logits bitwise identical, **+1.1 GiB of VRAM at 512K context**.
 - **Serve turns ~2x faster**: DSpark's seed rows come off the prompt batch instead of re-running the last 128 tokens.
-  512K context: +272-token turn 33.5 -> **18.8 s**, +1000-token turn 40.2 -> **19.7 s**, fresh 8000 tokens 51 -> 38 s.
+  and small turns read only the experts they route (whole-layer prefetch only from 640 rows).  512K context:
+  +272-token turn 33.5 -> **14.7 s**, +1000-token turn 40.2 -> **19.4 s**, fresh 8000 tokens 51 -> 37 s.
+- End to end through the server (the defaults): HumanEval 20/21, tool calls 10/10, agentic bug-fix loops 3/3, and real
+  QuetzaCodetl agent turns.
 - NVMe: 32 concurrent reads per call (was 8): -17% per expert read, decode +4-5%.
 
 ## Latest (2026-10-14)

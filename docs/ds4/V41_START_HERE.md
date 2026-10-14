@@ -126,6 +126,16 @@ ee2845ca (+ serve defaults / docs).
   the batch and the seed rows are read off x_state (`Ds41Dense::read_state_cols`; `STRATA_SERVE_BATCH_TAIL=0` = old).
   512K, DSpark + conf 0.6 + kv-fp4: **fresh 8000 51.2 -> 37.9 s, +272 tokens 33.5 -> 18.8 s, +1000 40.2 -> 19.7 s**
   (+61 tokens = step path 8.4 s, unchanged); seed quality the same (tokens/pass 2.2-4.9), decode 22-30 tok/s.
+  Then the **chunk-prefetch gate** (`STRATA_CHUNK_PF_MIN`, default 640 rows): the slabs stage a layer's WHOLE file tier
+  before its routing is known - a loss for small turns (+272 routes ~39% of it).  Batch s on / off: fresh 8000 33.7 /
+  38.8, +1000 19.2 / 22.0, +272 18.3 / 14.5 -> gated: **fresh 36.8 s, +272 14.7 s, +1000 19.4 s** per turn (session
+  start: 51.2 / 33.5 / 40.2).
+- **E2E on the production stack** (build-ds4-gpu + strata-ds41.json, port 8150): smoke OK, **HumanEval 20/21, tools
+  10/10, agentic 3/3**, and a headless Quetza turn (write sum100.py, run it, report 5050) worked: 15.4K-token system
+  prompt 50.5 s, tool-result turns of 17 / 27 / 89 tokens 1.9 / 2.3 / 7.2 s, decode 17-27 tok/s.
+- **Relay fix** (`~/AI/QuetzaCodetl/wrappers/tools/relay`, untracked file - live via ~/.local/bin/relay; skill text
+  regenerated): `ask/reply/broadcast --name X` from a window with another name now gets an UNBOUND daemon instead of
+  renaming the window (the session-10 gotcha).  Not committed in QuetzaCodetl (its tree has others' uncommitted work).
 - **--prompt-batch trade** (serve, 512K): 8192 / 2048 / 1024 -> free VRAM 10.46 / 12.39 / 12.71 GiB but an 8000-token
   prompt 44.6 / 83.5 / 132.7 s, decode no visible gain -> keep 8192.  The NC-sized prompt state is ~0.31 MiB/column
   (~2.6 GiB): giving it back during decode needs VMM map/unmap (stable addresses: cached graphs keep view pointers) -

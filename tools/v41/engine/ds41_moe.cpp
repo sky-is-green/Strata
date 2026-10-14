@@ -807,8 +807,14 @@ bool chunk_stage_alloc(Ds41MoeImpl& im) {
 /// Makes `layer`'s file-tier experts available in a slab (a synchronous fill when they were not prefetched), then
 /// starts the NEXT routed layer's fill into the other slab.  Returns the slab holding `layer`, or -1 (use the
 /// on-demand reader).  Called once per run_chunk(layer), before its class passes consume the slab.
-int chunk_pf_prepare(Ds41MoeImpl& im, int64_t layer) {
+int chunk_pf_prepare(Ds41MoeImpl& im, int64_t layer, int n) {
     if (!im.cfg.chunk_prefetch || !im.gpu || im.cfg.cpu_only) return -1;
+    // STRATA_CHUNK_PF_MIN (default 640 rows): the slabs stage a layer's WHOLE file tier before its routing is known -
+    // a win only when the call routes most of it.  s11 (512K serve turns, batch s, prefetch on / off): fresh 8000
+    // 33.7 / 38.8, +1000 tokens 19.2 / 22.0, +272 tokens 18.3 / 14.5 (it routes ~39% of the file tier) -> break-even
+    // ~690 rows.  Below the cut the class passes read only the routed file-tier experts (the on-demand reader).
+    static const int pf_min = std::getenv("STRATA_CHUNK_PF_MIN") ? std::atoi(std::getenv("STRATA_CHUNK_PF_MIN")) : 640;
+    if (n < pf_min) return -1;
     if (!chunk_stage_alloc(im)) return -1;
     ChunkStage& cs = *im.cstage;
     int s = -1;
@@ -4185,7 +4191,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                    void* out_dev) {
     // chunk_prefetch: make this layer's file-tier experts available in a slab (and start the next layer's read), so
     // the passes below DMA out of pinned memory instead of reading NVMe on their critical path (a no-op when off).
-    chunk_pf_prepare(im, layer);
+    chunk_pf_prepare(im, layer, n);
     if (!im.g.per_expert()) {
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev)) return false;
         chunk_pstage_next(im, layer);
