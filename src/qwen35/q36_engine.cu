@@ -1301,6 +1301,14 @@ struct Engine {
     // the full arm is that node's own cost.
     bool skip_xa = false, skip_xb = false, skip_ma = false, skip_mb = false, skip_tk = false, skip_rt = false;
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
+    // The rejection-streak backoff for the sidecar drafter: drafting is a *loss* while the text runs away from the
+    // drafter (every window rejects, and a rejected window costs ~3 ms more than a plain step - measured 89.0
+    // against 116.4 tok/s on a degenerate run).  After `backoff_streak` consecutive rejections speculation pauses
+    // for 16 steps, then 32, 64 .. up to `backoff_cap` per trigger, and any acceptance resets both.  So a stretch
+    // that cannot be drafted converges to plain decode, and one that recovers is retried within a pause.  Off at
+    // 0 (the default): --mtp-backoff <streak>[:<cap>].
+    int backoff_streak = 0, backoff_cap = 128;
+    int rej_streak = 0, pause_left = 0, backoff_pause = 0;
 
     // ---- the hybrid mode (Model::hybrid): per state index (the layers, then the MTP block) the slot tables; a
     // batch of up to hybrid_t rows runs its VRAM-resident experts on the GPU and the others on the CPU pool, side by
@@ -2380,6 +2388,17 @@ struct Engine {
     /// returns the accepted count a and writes the picks of rows 0 .. a (row a's pick is the token after them).
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
         const int N = (int) m->g.n_embd;
+        // The backoff's paused step: plain decode, no draft offered (-1 to the caller).  Only the sidecar path can
+        // pause - the in-file MTP block's rows are chained through its own calls and skipping one would break that
+        // chain.  A pause only ever starts after a rejected window (a = 0), so `fix` is empty and one row is the
+        // whole step.
+        if (pause_left > 0) {
+            --pause_left;
+            const int32_t one = x_tok;
+            process(&one, 1, [](int64_t) {});
+            picks[0] = greedy();
+            return -1;
+        }
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         if (m->sc_loaded) D = std::min(D, 1);   // the sidecar is a k=1 head: no state to chain through
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -2436,6 +2455,22 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        // The backoff's bookkeeping (see the members): a streak of rejected windows pauses speculation, and each
+        // trigger doubles the pause so a stretch the drafter cannot follow converges to plain decode.  Any
+        // acceptance ends the streak and the growth, so a text that recovers is drafted again at once.
+        if (m->sc_loaded && backoff_streak > 0) {
+            if (a > 0) {
+                rej_streak = 0;
+                backoff_pause = 0;
+            } else if (++rej_streak >= backoff_streak) {
+                pause_left = backoff_pause > 0 ? backoff_pause : 16;
+                backoff_pause = std::min((backoff_pause > 0 ? backoff_pause : 16) * 2, backoff_cap);
+                rej_streak = 0;
+                if (std::getenv("STRATA_Q36_SC_DEBUG"))
+                    std::fprintf(stderr, "sc: %d rejections in a row at pos %lld: pausing drafts for %d steps\n",
+                                 backoff_streak, (long long) pos, pause_left);
+            }
+        }
         if (std::getenv("STRATA_Q36_SC_DEBUG"))
             std::fprintf(stderr, "sc: verify draft %d vs pick %d (pos %lld, accepted %d)\n", drafts.empty() ? -1 : drafts[0],
                          hpin[2], (long long) pos, a);
@@ -2911,6 +2946,11 @@ int serve(Engine& E) {
             if (!emit(nx)) break;
             if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
                 const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+                if (a < 0) {   // the backoff's paused step: one plain token, no draft offered
+                    fix.clear();
+                    nx = picks[0];
+                    continue;
+                }
                 offered += E.mtp_d;
                 accepted += a;
                 live.push_back(nx);
@@ -2941,6 +2981,7 @@ int serve(Engine& E) {
 int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, sidecar_path;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
+    int backoff_streak = 0, backoff_cap = 128;   // --mtp-backoff: the sidecar drafter's rejection-streak pause
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0;
@@ -2978,6 +3019,12 @@ int strata::qwen35::run(int argc, char** argv) {
                                       "drafts)\n", v.c_str());
         }
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--mtp-backoff") {   // the sidecar drafter's rejection-streak pause: <streak>[:<cap>]
+            const std::string v = next();
+            backoff_streak = std::atoi(v.c_str());
+            const size_t c = v.find(':');
+            if (c != std::string::npos) backoff_cap = std::max(16, std::atoi(v.c_str() + c + 1));
+        }
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -3053,6 +3100,8 @@ int strata::qwen35::run(int argc, char** argv) {
     } report{E};
     E.reset();
     E.mtp_d = (m.has_mtp || m.sc_loaded) ? mtp_d : 0;
+    E.backoff_streak = backoff_streak;   // the sidecar drafter's rejection-streak pause (0: off)
+    E.backoff_cap = backoff_cap;
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
@@ -3100,6 +3149,11 @@ int strata::qwen35::run(int argc, char** argv) {
             gen.push_back(nx);
             if ((int) gen.size() >= n_gen) break;
             const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+            if (a < 0) {   // the backoff's paused step: one plain token, no draft offered
+                fix.clear();
+                nx = picks[0];
+                continue;
+            }
             offered += E.mtp_d;
             accepted += a;
             fix.assign(drafts.begin(), drafts.begin() + a);
