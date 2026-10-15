@@ -1309,6 +1309,28 @@ struct Engine {
     // 0 (the default): --mtp-backoff <streak>[:<cap>].
     int backoff_streak = 0, backoff_cap = 128;
     int rej_streak = 0, pause_left = 0, backoff_pause = 0;
+    // --mtp-period N: when the tail of the emitted stream is a confirmed period (p <= N), draft the period's
+    // continuation instead of calling the head.  The degenerate-loop case: the continuation is trivially
+    // predictable there while the head is confidently wrong (13% measured), and a period-p loop is
+    // self-similar, so a near-tie flip does not throw the rule off.  The head call is skipped entirely.
+    // The verify is untouched - the model's own pick still decides every emitted token.  0: off.
+    int mtp_period = 0;
+    int tok_hist[16] = {0};
+    int hist_n = 0;
+    void push_tok(int t) {
+        if (hist_n < 16) tok_hist[hist_n++] = t;
+        else { for (int i = 1; i < 16; ++i) tok_hist[i - 1] = tok_hist[i]; tok_hist[15] = t; }
+    }
+    int period_draft() const {
+        const int maxp = mtp_period < 8 ? mtp_period : 8;
+        for (int p = 1; p <= maxp; ++p) {
+            if (hist_n < 2 * p) break;
+            bool ok = true;
+            for (int k = 0; k < 2 * p && ok; ++k) ok = tok_hist[hist_n - 1 - k] == tok_hist[hist_n - 1 - k - p];
+            if (ok) return tok_hist[hist_n - p];
+        }
+        return -1;
+    }
 
     // ---- the hybrid mode (Model::hybrid): per state index (the layers, then the MTP block) the slot tables; a
     // batch of up to hybrid_t rows runs its VRAM-resident experts on the GPU and the others on the CPU pool, side by
@@ -2388,6 +2410,7 @@ struct Engine {
     /// returns the accepted count a and writes the picks of rows 0 .. a (row a's pick is the token after them).
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
         const int N = (int) m->g.n_embd;
+        push_tok(x_tok);   // the period rule's history: every emitted token passes through here (see period_draft)
         // The backoff's paused step: plain decode, no draft offered (-1 to the caller).  Only the sidecar path can
         // pause - the in-file MTP block's rows are chained through its own calls and skipping one would break that
         // chain.  A pause only ever starts after a rejected window (a = 0), so `fix` is empty and one row is the
@@ -2406,7 +2429,16 @@ struct Engine {
         drafts.assign((size_t) D, 0);
         if (m->sc_loaded) {
             // the drafter recomputes from hlast each step (no redo rows): its token, then the shared verify window
-            if (D > 0) drafts[0] = sidecar_draft(x_tok);
+            const int pd = D > 0 ? period_draft() : -1;
+            if (D > 0) {
+                if (pd >= 0) {
+                    drafts[0] = pd;   // a confirmed period: supply the draft, skip the head call entirely
+                    if (std::getenv("STRATA_Q36_SC_DEBUG"))
+                        std::fprintf(stderr, "sc: periodic draft %d at pos %lld\n", pd, (long long) pos);
+                } else {
+                    drafts[0] = sidecar_draft(x_tok);
+                }
+            }
             if (const char* fv = std::getenv("STRATA_Q36_SC_FORCE"); fv != nullptr && D > 0) drafts[0] = std::atoi(fv);
         } else {
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
@@ -2455,6 +2487,7 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        for (int i = 0; i < a; ++i) push_tok(drafts[(size_t) i]);   // accepted drafts are emitted before the next call
         // The backoff's bookkeeping (see the members): a streak of rejected windows pauses speculation, and each
         // trigger doubles the pause so a stretch the drafter cannot follow converges to plain decode.  Any
         // acceptance ends the streak and the growth, so a text that recovers is drafted again at once.
@@ -2982,6 +3015,7 @@ int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, sidecar_path;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     int backoff_streak = 0, backoff_cap = 128;   // --mtp-backoff: the sidecar drafter's rejection-streak pause
+    int mtp_period = 0;                          // --mtp-period: draft from a confirmed period instead (0: off)
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0;
@@ -3024,6 +3058,9 @@ int strata::qwen35::run(int argc, char** argv) {
             backoff_streak = std::atoi(v.c_str());
             const size_t c = v.find(':');
             if (c != std::string::npos) backoff_cap = std::max(16, std::atoi(v.c_str() + c + 1));
+        }
+        else if (a == "--mtp-period") {    // draft from a confirmed period <= N instead of the head (0: off)
+            mtp_period = std::min(8, std::max(0, std::atoi(next().c_str())));
         }
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
@@ -3102,6 +3139,7 @@ int strata::qwen35::run(int argc, char** argv) {
     E.mtp_d = (m.has_mtp || m.sc_loaded) ? mtp_d : 0;
     E.backoff_streak = backoff_streak;   // the sidecar drafter's rejection-streak pause (0: off)
     E.backoff_cap = backoff_cap;
+    E.mtp_period = mtp_period;           // the confirmed-period draft source (0: off)
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
