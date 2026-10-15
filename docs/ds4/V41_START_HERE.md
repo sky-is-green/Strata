@@ -398,12 +398,35 @@ request instead of degrading.
   left to debug it.  **Conclusion: at prompt size the read path has no knob left** - the reader does 5.08-5.16 GB/s
   against the microbench's 6.22, and the PREFILL lever is the batch WIDTH (each layer-major sweep re-reads the whole
   file tier: ~82 GB), which is the VRAM work above.  Still untested at prompt size: `STRATA_WAVE_THREADS` 48/64.
-- **`STRATA_VRAM_TRACE=1` prints the state tensors' sizes, and run17's traced legs ANSWERED the fixed ~2.19 GiB
-  question:** the state buffer is **2.57 GiB at NC=8192** and **3.86 GiB at NC=12288**, of which the engram (`i_eng`,
-  24 x 256 rows) is only **0.19 / 0.28 GiB each** - the remaining ~2.19 GiB is the per-column KV/attention state
-  (`i_emb`, `routed`, `shexp`, `o_fn`, `cand`, `sel`/`selm`, ...), which is exactly the allocation that looked
-  "fixed" (both failing runs had NC=8192).  So the batch's VRAM is dominated by NC-scaled state tensors: fitting a
-  WIDER batch means shrinking THOSE (fp16 / quantised `i_emb` / `routed`), not the engram.
+- **`STRATA_VRAM_TRACE=1` prints the state tensors' sizes** (run17, run20): the state buffer is **2.57 GiB at
+  NC=8192**, **3.86 at 12288**, **5.14 at 16384** - linear in NC at **~0.321 MiB a column**.
+- **CORRECTION (2026-10-16, run20): the fixed ~2.19 GiB residual at :383 is NOT this per-column state.**  The earlier
+  note here read 2.57 - 0.19 - 0.19 = 2.19 GiB (the non-engram part of the state at NC=8192) as the answer to the
+  fixed allocation - but that is the one thing the fixed term cannot be: the state SCALES with the batch, the fixed
+  allocation does not (they only coincide in value at NC=8192).  Measured tonight on a clean card, full width
+  reached (`first batch B=16384`): the 16384 batch OOM'd asking for exactly **1424.31 MiB** -
+  `ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1424.31 MiB ... cudaMalloc failed` with 0.36 GiB free - and
+  1424 MiB is the value the `ds41_generate.cpp` comment records for **8192**.  So the pass-graph buffer is
+  **B-independent** and the cap formula's "graph 0.17 MiB a column" term is a mis-derivation (1424 / 8192).  The same
+  four calibrated points fit just as well as `need(B) ~= 5.7 GiB + 0.78 MiB * B` - the aggregate free-VRAM fit cannot
+  tell the two decompositions apart, but the OOM's allocation size can.
+- **B=16384 fails by ~1.03 GiB** (run20/b16384): the per-column state at 16384 (5.14 GiB, +1.28 over 12288) is what
+  eats the reserve the fixed 1424 MiB graph buffer needs.  12288 still passes (line, run20/b12288).
+- **`i_emb`/`selm` are bit-exact as F16 and `i_eng` is near-loss-free - and together they are NOT enough.**  `i_emb`
+  is written from F16 rows (`ds41_dense.cpp`: `fp16_to_fp32`) and its only consumer cpy-casts back to F32, so F16
+  round-trips exactly; `selm` is 0/-inf and is already cast to F16 for the flash-attn mask (`ggml_cast(... F16)`),
+  so F16 storage is exactly what it becomes anyway; `i_eng` comes from an e4m3 engram (F16 has more mantissa).  Per
+  column: `i_emb` -10,240 B, `i_eng` -24,576, `selm` -8,192 = **0.041 MiB a column = 0.66 GiB at 16384** - under
+  the 1.03 GiB deficit, so 16384 needs a quality-gated change too; the cheapest sufficient one is `x_state` + `hap`
+  -> F16 (0.078 MiB a column = 1.28 GiB at 16384), which is also 48% of the state.
+- **Still unidentified - now the top target: a ~7.7-8.0 GiB allocation during the FIRST layer's tier run,
+  ~B-independent** (free 11.10->3.27 GiB at B=8192, 9.81->2.15 at 12288, 8.44->0.46 at 16384 = 7.83 / 7.66 / 7.98).
+  It is neither the chunk stage (2 x 1 GiB by default, `c_half` = 1024 MiB) nor the prestage region (1.5 GiB - and no
+  "chunk prestage" line is printed in these runs).  Name it with `nsys -t cuda,cudart` on one b8192 leg; if it is
+  reducible it buys 16384/20480 with no precision change at all.
+- **The state's per-column cost (0.321 MiB, 0.95 with the batch's other buffers):** `x_state` [5120,4] 24.3%,
+  `hap` 24.3%, `i_eng` x2 14.6%, `sel`/`selm` x8 idx layers 9.7%, `shexp`/`o_fn`/`routed`/`i_emb` 6.1% each,
+  `cand` [2048] 2.4%.  Shrinking the WIDER batch means shrinking those - starting with the two 24.3% residuals.
 - **A/B DONE AND ADOPTED (run17, 21:13-21:39, quiet box: load ~2, 3 runs a side, spread < 0.5%):
   `--prompt-batch 12288` beats 8192 by +21.5% on a 20,480-token prompt.**  8192: 64.39 / 63.99 / 64.28 s =
   318.0 / 320.1 / 318.6 tok/s, **157.2 GB** of file-tier reads in 3 sweeps (dense 20.5 s, file wait 26.9 s, 14917

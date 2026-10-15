@@ -1278,6 +1278,11 @@ int main(int argc, char ** argv) {
                 // residuals in V41_START_HERE).  0.95 MiB a column = columns 0.32 + graph 0.17 + part buffers 0.41,
                 // measured directly.  Per-tensor arithmetic undercounted the tier 2x and let a 2.19 GiB allocation
                 // fail while cudaMemGetInfo still said 6.83 GiB free.  A free card (>= 13 GiB) still gets its full PB.
+                // run20 (2026-10-16) fixes the GRAPH term: the pass-graph buffer is B-INDEPENDENT - the B=16384 leg
+                // OOM'd on "allocating 1424.31 MiB", the very size this comment records for 8192, so "graph 0.17 MiB
+                // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
+                // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
+                // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
                 const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
                 const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
                 pb_cap = std::min(PB, std::max(SB, fit));
