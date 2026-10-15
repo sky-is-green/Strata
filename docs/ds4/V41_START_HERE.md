@@ -337,10 +337,18 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
 - Real-harness decode 16-27 tok/s (2.1-3.3 tokens/pass on thinking text); a 66-token tool result 7.3 s; 1.2-2.2K-token
   results 17-23 s (the per-batch expert sweep floor ~12-15 s); a 10K one 46 s.
 
-### Session 13c (2026-10-15 19:40-20:25) - a SHARED card: VRAM-aware batch width, cache seed and chunk stage
+### Session 13c (2026-10-15 19:40-22:00) - a SHARED card: VRAM-aware batch width, cache seed, chunk stage, park/unpark
 **Read this block first.**  Mal's brief: keep working on prefill and make sure it works in the harness.  This closes
 the item the 13b block left on top - a desktop always has other GPU users (Whisper STT), and the engine FAILED the
 request instead of degrading.
+- **PARK/UNPARK FIXED (the other open 13b item): `STRATA_SERVE_PARK_PARTIAL` (default on).**  A continuation that
+  matches the parked conversation one token short of its end used to be REJECTED - the code demanded an exact prefix -
+  so an unrelated side call threw the whole cache away (run15 turn 2: 23,531 tokens re-read in **265.9 s**,
+  `reused=0`).  New logging says exactly why: `lp=21165` of a 21,166-token park, i.e. the chat template re-renders
+  ONE token (the 13b block's hypothesis, now measured).  A partial unpark restores the park and re-feeds from `lp`:
+  **run19 turn 2 = 24.7 s with 21,165 tokens reused (2,326 fed), 0 errors** - 10.8x faster, on the commonest agent
+  pattern there is (a tool result continuing a long conversation).  `STRATA_SERVE_PARK_PARTIAL=0` = old behaviour.
+  The reuse log now prints `park= lp=` too.  Gate: `~/AI/v41-dev/s13/run19*`.
 - **Reproduced first (run10a/run11a: the OLD binary + a foreign process holding 4 GiB of VRAM - Whisper's role):
   HTTP 400 on the FIRST turn.**  "allocating 2633.44 MiB (12.5 GiB held) / 2193.81 MiB (4 GiB held) on device 0:
   cudaMalloc failed".  Also reproduced: the seed asking **142.38 GiB** ("ExpertCache: 152881735680 slots x 1 B =

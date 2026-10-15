@@ -1117,10 +1117,34 @@ int main(int argc, char ** argv) {
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
             bool unparked = false;
+            int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
+            size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
             if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
                 size_t lp = 0;
                 while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
-                if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
+                lp_show = lp;
+                // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
+                // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
+                // or an EMPTY assistant turn, as the s13 harness produces - leaves lp just under park_hist.size(), and
+                // requiring an exact prefix threw away a 21,349-token cache over a 27-token difference: run8/run15 both
+                // logged "reuse lcp=27 hist=0 snap=-1 prompt=23531 -> reused=0" and re-read the whole prompt.
+                // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
+                // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
+                // at the longest common prefix even when it is below the snapshot").
+                static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
+                const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
+                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
+                                 park_hist.size(), lp);
+                    hist = park_hist;
+                    snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
+                    reuse_override = (int) lp;
+                    lcp = lp;
+                    unparked = true;
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;        // DSpark's window holds the side request's states
+#endif
+                } else if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
                     std::fprintf(stderr, "serve: unparked the %zu-token conversation\n", park_hist.size());
                     hist = park_hist;
                     snap_len = (int) park_hist.size();
@@ -1136,7 +1160,8 @@ int main(int argc, char ** argv) {
                 }
             }
             int reused = 0;
-            if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+            if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
+            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
@@ -1157,8 +1182,8 @@ int main(int argc, char ** argv) {
                 hist.clear();
                 snap_len = -1;
             }
-            std::fprintf(stderr, "serve: reuse lcp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp, hist.size(), snap_len,
-                         ids.size(), reused);
+            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
+                         park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
             if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
