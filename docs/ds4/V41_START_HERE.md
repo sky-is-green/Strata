@@ -384,14 +384,25 @@ request instead of degrading.
   left to debug it.  **Conclusion: at prompt size the read path has no knob left** - the reader does 5.08-5.16 GB/s
   against the microbench's 6.22, and the PREFILL lever is the batch WIDTH (each layer-major sweep re-reads the whole
   file tier: ~82 GB), which is the VRAM work above.  Still untested at prompt size: `STRATA_WAVE_THREADS` 48/64.
-- **Also new: `STRATA_VRAM_TRACE=1` now prints the state tensors' sizes** (`ds41_dense.cpp`: "state NC=N wants X
-  GiB (i_eng EC x ED = Y GiB each, ...)"), which is how the fixed ~2.19 GiB buffer's owner gets named from any
-  traced leg.  The traced legs (run17) never ran - see the pending item below.
-- **PENDING tonight (needs a CLEAN card):** the 8192-vs-12288 prompt-batch A/B (`~/AI/v41-dev/s13/run17.sh`,
-  3 runs a side, alternating).  Its gate needs >= 23 GiB free VRAM, because the ONE-SHOT path has no VRAM-aware cap
-  (that is `--serve` only): its dense half takes ~12 GiB and the un-capped 8192 batch ~12 GiB more, and at 9.5 GiB
-  free that allocation fails (measured, run13).  The desktop's resident `quetza-stt-whisper` (2.5 GB) alone leaves
-  ~21 GiB, so it is not enough - and that same 2.5 GB is the consumer that started this whole session.
+- **`STRATA_VRAM_TRACE=1` prints the state tensors' sizes, and run17's traced legs ANSWERED the fixed ~2.19 GiB
+  question:** the state buffer is **2.57 GiB at NC=8192** and **3.86 GiB at NC=12288**, of which the engram (`i_eng`,
+  24 x 256 rows) is only **0.19 / 0.28 GiB each** - the remaining ~2.19 GiB is the per-column KV/attention state
+  (`i_emb`, `routed`, `shexp`, `o_fn`, `cand`, `sel`/`selm`, ...), which is exactly the allocation that looked
+  "fixed" (both failing runs had NC=8192).  So the batch's VRAM is dominated by NC-scaled state tensors: fitting a
+  WIDER batch means shrinking THOSE (fp16 / quantised `i_emb` / `routed`), not the engram.
+- **A/B DONE AND ADOPTED (run17, 21:13-21:39, quiet box: load ~2, 3 runs a side, spread < 0.5%):
+  `--prompt-batch 12288` beats 8192 by +21.5% on a 20,480-token prompt.**  8192: 64.39 / 63.99 / 64.28 s =
+  318.0 / 320.1 / 318.6 tok/s, **157.2 GB** of file-tier reads in 3 sweeps (dense 20.5 s, file wait 26.9 s, 14917
+  file).  12288: 52.72 / 52.91 / 52.88 s = **388.5 / 387.1 / 387.3 tok/s**, **114.5 GB** in 2 sweeps (dense 15.3 s,
+  file wait 20.4 s, 10942 file).  The reader does the same 4.95-5.15 GB/s either way - the whole win is one fewer
+  whole-file-tier sweep.  **12288 is now the serve default** (`strata-ds41.json` `--prompt-batch 12288` +
+  `STRATA_PRESTAGE_GIB=1.5` in `ds41-engine.sh`) - safe to default because the runtime cap narrows the batch on a
+  busy card instead of OOMing (run15's gate).  Still to do: a serve-stack smoke on the new default (the one-shot A/B
+  is a different path).
+  The A/B itself needed >= 23 GiB free VRAM because the ONE-SHOT path has no runtime cap (that is `--serve` only):
+  its dense half takes ~12 GiB and the un-capped batch ~12 GiB more (at 9.5 GiB free that allocation fails, run13).
+  What cleared the card was xolotl-video's stray `quetza-stt-whisper` (2.5 GB) - the same consumer that tipped
+  run8 over at the start of this session.
 
 ### Session 13 (2026-10-15 15:00-17:00) - the three levers CLOSED by trace replay (no engine change pays)
 **Read this block first.**  Mal's pick (session 12): in-pass draft pruning, a smarter VRAM policy than LRU, the VMM

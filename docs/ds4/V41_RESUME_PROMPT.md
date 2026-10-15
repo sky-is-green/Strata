@@ -16,8 +16,11 @@ excluded from the .tok compare).  STRATA_READ_SORTED was tried and SEGFAULTED (e
 re-attempt blind (the whole scattered-vs-dd gap is ~9%, near the noise).  So the PREFILL lever is the batch WIDTH
 (~82 GB re-read per layer-major sweep), i.e. the VRAM work above.  (b) name the fixed ~2.19 GiB buffer that forces
 the 4.3 GiB fixed term - `STRATA_VRAM_TRACE=1` now prints the state tensors' sizes, so any traced leg names it;
-(c) PENDING: the 8192-vs-12288 prompt-batch A/B (`run17.sh`, 3 runs a side) needs >= 23 GiB FREE VRAM - the one-shot
-path has no VRAM-aware cap (serve only) and the desktop's quetza-stt-whisper (2.5 GB) alone leaves ~21 GiB.
+(c) DONE, ADOPTED: the 8192-vs-12288 prompt-batch A/B (run17, 3 runs a side, spread < 0.5%) gives **12288 = +21.5%**
+on a 20K prompt (387.6 vs 318.9 tok/s; 114.5 GB of file-tier reads in 2 sweeps vs 157.2 GB in 3) - **12288 is now the
+serve default** (strata-ds41.json + STRATA_PRESTAGE_GIB=1.5).  Next for prompt speed: the batch's VRAM is dominated by
+the NC-scaled state tensors (2.57 GiB at NC=8192, 3.86 at 12288; the engram is only 0.19/0.28 each) - shrink those to
+fit a wider batch, then 16384.  Next, also: a serve-stack smoke on the new default (the A/B was the one-shot path).
 Logs: ~/AI/v41-dev/s13/run9..run17*.  Studio/video work is xolotl-video's now.
 UPDATE ~19:40: production harness check found: Quetza's Whisper STT (2.5 GB VRAM) makes batch 12288
 OOM -> REVERTED to 8192 (12288 opt-in via STRATA_PROMPT_BATCH); even 8192 OOMs on a 2nd long prompt with Whisper

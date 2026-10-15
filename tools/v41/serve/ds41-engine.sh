@@ -36,8 +36,17 @@ export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
 # chunk stage is clamped from free VRAM, and the expert-cache seed skips/retries instead of failing the request -
 # harness-verified with a foreign 4 GiB holder: 3/3 turns complete, 0 errors (logs ~/AI/v41-dev/s13/run15*).
 # So the opt-in is now SAFE to leave on - a tight card simply gets a narrower batch (that re-reads the file tier once
-# per batch: ~82 GB a sweep, so keep the width as high as the card allows).  Still opt-in because the free-card
-# timing A/B at 12288 has not been re-run on a quiet box.
+# per batch: ~82 GB a sweep, so keep the width as high as the card allows).
+# ADOPTED as the DEFAULT 2026-10-15 21:40 (session 13c): the quiet-box A/B (run17, 3 runs a side, spread < 0.5%):
+# batch 8192 = 64.39 / 63.99 / 64.28 s (318.0 / 320.1 / 318.6 tok/s, 157.2 GB of file-tier reads in 3 sweeps);
+# batch 12288 = 52.72 / 52.91 / 52.88 s (388.5 / 387.1 / 387.3 tok/s, 114.5 GB in 2 sweeps) -> **+21.5%**, the
+# reader does the same 4.95-5.15 GB/s either way.  12288 is now in strata-ds41.json; STRATA_PRESTAGE_GIB=1.5 below.
+# 16384 still OOMs without the cap engaged (the next step is the state tensors: NC=8192 wants 2.57 GiB, NC=12288
+# 3.86 GiB, of which the engram is only 0.19/0.28 GiB each - the rest is the per-column KV/attention state).
+# the chunk prestage region: 1.5 GiB is what the adopted 12288 batch was measured with (3.0 GiB starves the batch's
+# own buffers on a 24 GB card).  0 = off.
+export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
+# an explicit STRATA_PROMPT_BATCH still wins over the json's --prompt-batch (it is appended after those args)
 [ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
 exec flock "$LOCK" systemd-run --user --scope -q --unit="ds41-serve-$$" -p MemoryMax=84G -p MemorySwapMax=0 \
