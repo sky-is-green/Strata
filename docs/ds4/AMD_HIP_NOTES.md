@@ -175,6 +175,7 @@ were measured for **the same** configuration.
 | `STRATA_PROM=1` (prompt-batch expert kernels) | neutral on decode (23.7 vs 23.8), worse on the prompt (43.1 vs 52.4 tok/s) |
 | `STRATA_DSPARK_DEPTH=5` | 4.364 tokens/pass but a 160.7 ms verify vs 3.692 / 128.8 at depth 4: net neutral (25.4 vs 25.2); depth 6 is refused by design (1..5) |
 | `--vram-margin 0.25`, `--pf-b 2.0`, `--pcie 0.50`, `--pcie 0.85` | inside the noise |
+| serve `--prompt-batch 2048 -> 12288` on a 5.8K-token prompt | 229.8 -> 232.8 tok/s: no measurable difference (the engine sizes the batch from free VRAM anyway) |
 
 Adopted: `--arena-gib 75`, `--kv-q8`, `--ctx 262144`, Engram from two drives, DSpark depth 4 with the 64-expert
 prune and no confidence trim, `--slots auto`.
@@ -238,6 +239,30 @@ alternating runs (three each): **`--chunk-mmq` 172.4 / 168.8 / 155.9 tok/s (medi
 165.1 / 164.6 / 161.0 (median 164.6)** - +2.5%, inside the spread. The PTQ1_0 -> Q2_0 transcode plus the MoE-MMQ
 kernels are a wash on RDNA3; they are left on (the engine's default) but they are not where the prompt time is.
 
+## The fork's fused dense ops: the win that matters on this box
+
+The dense half is the majority of a decode step here, and it is launch-bound: ~3300 tiny ggml ops a token. The fork
+ships two patches that collapse the worst of them into one node each - `tools/v41/ggml/dsv41-fake-quant.patch`
+(the activation quantize-dequantize) and `dsv41-fuse.patch` (the two hyper-connection mixes) - and the engine takes
+them with `-DSTRATA_DSV41_FQ_OP=ON -DSTRATA_DSV41_HC_MIX=ON` against a ggml built from the patched tree.
+`local/build-ggml-fused.sh` does both (the ggml build must be **static**: the engine calls ggml internals that a
+shared build hides).
+
+| (same prompt, same flags, 3 runs a side) | decode tok/s |
+| --- | ---: |
+| stock ops | 12.3 [12.3 13.8 12.3] |
+| fused ops | **13.9 [13.9 13.9 13.8]** (+13%) |
+| stock ops, with DSpark | 16.6 [16.2 16.6 17.0] |
+| **fused ops, with DSpark** | **20.5 [19.1 22.4 20.5]** (+23%) |
+
+The last-token logits are the same model: top-1 identical, mean |delta| 0.156 on logits in -11..31 (the fused op is
+the same arithmetic as the composite it replaces, in one node). The server runs this build
+(`local/ds41-local.json` sets `DS41_EXE` to `build-hip-fused/ds41_generate`).
+
+With it, the serve numbers on this box are: a 5.8K-token prompt at **230 tok/s** (fused engine, batch 2048 or 12288:
+229.8 vs 232.8, i.e. no measurable difference here - the author's one-sweep win at 12288 is on a 20K prompt) and
+decode **26-30 tok/s** with DSpark.
+
 ## The second GPU: implemented, measured, not adopted
 
 The project's **parent engine** (the Qwen one) does support several cards: contiguous layer ranges, one per GPU, each
@@ -264,8 +289,15 @@ For reference, the expert cache's own slope on one card: `--slots 1200` 19.30 to
 
 - **512K context**: the 8-bit cache makes the state affordable, but nothing above 256K has been run here; the second
   thing `--kv-fp4` would buy (a further ~0.4 GiB at 256K) is not available in this ggml tree, see the KV section.
-- **The second card**, as above.
+- **The attention/indexer kernels on RDNA3**: the remaining gap to the author's 4090 is here - `attn_router` 51.7
+  ms/token against 17.8, while the expert tier is close (19.4 vs 16.6). The CSA indexer's cost also grows with the
+  context (12.7 / 14.1 / 9.8 tok/s at ctx 4K / 32K / 256K, identical tokens). This is kernel work (profile, then port
+  or tune the gfx1100 paths), not a setting: it is the next real project, and `DSpark` went from 16.6 to 20.5 tok/s
+  with the cheap half of the same idea already done (the fused ops).
+- **The second card**, as above (design + measured negative in `V41_AMD_PEER_TIER.md`).
 - **`--chunk-mmq` tuning**: the Q2_0 MoE-MMQ kernels have no RDNA3-specific config here; the A/B is a wash.
+- **A last tuning batch not run**: `STRATA_D3_PF`, `--prefill-chunk`, `STRATA_TIER_GRAPH` on the fused build (the
+  earlier runs of the same knobs on the stock build were inside the noise).
 
 ## API server (256K context)
 

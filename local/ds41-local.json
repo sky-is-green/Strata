@@ -19,7 +19,7 @@
   "1",
   "--kv-q8",
   "--prompt-batch",
-  "2048",
+  "12288",
   "--arena-gib",
   "75"
  ],
@@ -28,7 +28,8 @@
   "GGML_NO_BACKTRACE": "1",
   "STRATA_SERVE_DSPARK": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/models/V41-GSQ/V41-MTP-Vision.Q2_K.gguf",
   "STRATA_DSPARK_DEPTH": "4",
-  "STRATA_DSPARK_KEEP": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/tools/v41/serve/dspark_expert_counts.txt:64"
+  "STRATA_DSPARK_KEEP": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/tools/v41/serve/dspark_expert_counts.txt:64",
+  "DS41_EXE": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/build-hip-fused/ds41_generate"
  },
  "cwd": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1",
  "tokenizer": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/models/V41-GSQ/tokenizer",
