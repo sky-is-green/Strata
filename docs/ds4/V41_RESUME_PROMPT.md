@@ -10,12 +10,15 @@ with 0 errors (correct, not fast: turn 1 105.2 s at a capped B=4281, turn 2 265.
 sizes the layer-major batch from free VRAM (calibrated need ~= 4.3 GiB + 0.95 MiB/col) and retries at half width;
 (2) the chunk stage is clamped from free VRAM (16 MiB floor) - it was a hard 2x1 GiB demand, the 503's cause;
 (3) the cache seed no longer asks 142 GiB when the card is tight (free <= margin made slot_gib 0 = "no limit"): it
-skips the cache, or retries with the cache off.  NEXT, in order: (a) READ PATH - measure STRATA_READ_SORTED=1 (wave
-reads issued in file-offset order instead of routing order; built, not yet measured) and STRATA_WAVE_THREADS/PARTS at
-PROMPT size, on a QUIET box (load < 3; timings from this session are useless, load 17-38), gate = token-identical;
-(b) name the fixed ~2.19 GiB graph buffer that forces the 4.3 GiB fixed term (unconfirmed; nsys) -> wider batch on a
-contended card; (c) 16384/20480 batch - now bounded by `need()`, not by the 1.42 GiB alloc alone.  Logs:
-~/AI/v41-dev/s13/run9..run15*.  Studio/video work is xolotl-video's now (it holds the Xolotl video pass).
+skips the cache, or retries with the cache off.  NEXT, in order: (a) READ PATH - MEASURED and exhausted at prompt size
+(run16, quiet box: WAVE_PARTS 4/16 = 0%; 5.16 GB/s of reader time; tokens identical once memguard's PID banner is
+excluded from the .tok compare).  STRATA_READ_SORTED was tried and SEGFAULTED (exit 139) -> REVERTED, do not
+re-attempt blind (the whole scattered-vs-dd gap is ~9%, near the noise).  So the PREFILL lever is the batch WIDTH
+(~82 GB re-read per layer-major sweep), i.e. the VRAM work above.  (b) name the fixed ~2.19 GiB buffer that forces
+the 4.3 GiB fixed term - `STRATA_VRAM_TRACE=1` now prints the state tensors' sizes, so any traced leg names it;
+(c) PENDING: the 8192-vs-12288 prompt-batch A/B (`run17.sh`, 3 runs a side) needs >= 23 GiB FREE VRAM - the one-shot
+path has no VRAM-aware cap (serve only) and the desktop's quetza-stt-whisper (2.5 GB) alone leaves ~21 GiB.
+Logs: ~/AI/v41-dev/s13/run9..run17*.  Studio/video work is xolotl-video's now.
 UPDATE ~19:40: production harness check found: Quetza's Whisper STT (2.5 GB VRAM) makes batch 12288
 OOM -> REVERTED to 8192 (12288 opt-in via STRATA_PROMPT_BATCH); even 8192 OOMs on a 2nd long prompt with Whisper
 up -> free-VRAM-aware batch sizing + OOM recovery: DONE in 13c (see the ~20:25 entry).  Park did not unpark in the

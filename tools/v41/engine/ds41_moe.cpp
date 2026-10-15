@@ -4132,7 +4132,6 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     std::atomic<size_t> rnext{0}, rdone{0};
     std::atomic<double> t_rd_last{0};
     size_t wave_end = 0;   // reads issued for file blobs [0, wave_end)
-    std::vector<size_t> perm;   // STRATA_READ_SORTED: this wave's read order (offset-sorted); lives until the next wave
     std::vector<std::thread> readers;
     double t_file = 0, t_rd0 = 0;
     auto start_wave = [&]() {   // the next `cap` file blobs (their slots must be free: the caller made sure)
@@ -4149,26 +4148,17 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         // s11, +272-token turn (32 threads): parts 1 / 4 / 8 -> 3.60 / 5.02 / 5.29 GB/s, batch 14.25 / 11.17 / 10.68 s,
         // tokens identical (exact routing)
         static const size_t P = (size_t) (std::getenv("STRATA_WAVE_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_WAVE_PARTS")))) : 8);
-        // STRATA_READ_SORTED=1: issue this wave's parts in FILE-OFFSET order instead of routing order.  A layer's routed
-        // experts are laid down in the order the tokens touched them, i.e. scattered over the 152 GB GGUF - the source's
-        // own measurement is 4.65 GB/s scattered vs 5.1 GB/s for plain dd streams on the same file.  ONLY the order of
-        // the preads changes: every blob still lands in its own slot, and the launch pairs and the k-ordered sums are
-        // untouched, so a sorted run must be token-identical to an unsorted one (that is the gate).
-        static const bool read_sorted = std::getenv("STRATA_READ_SORTED") && std::getenv("STRATA_READ_SORTED")[0] == '1';
-        perm.clear();
-        if (read_sorted && w1 > w0) {
-            std::vector<uint64_t> off(w1 - w0);
-            for (size_t k = 0; k < off.size(); ++k) off[k] = im.blobs->blob_offset(layer, order[2][w0 + k]);
-            perm.resize(w1 - w0);
-            for (size_t k = 0; k < perm.size(); ++k) perm[k] = w0 + k;
-            std::sort(perm.begin(), perm.end(), [&off, w0](size_t a, size_t b) { return off[a - w0] < off[b - w0]; });
-        }
+        // REVERTED 2026-10-15 21:10 (s13c): STRATA_READ_SORTED (issue a wave's parts in FILE-OFFSET order) was tried
+        // and SEGFAULTED in the batch (exit 139) - see V41_START_HERE's 13c block.  Not worth re-attempting blind:
+        // the source's own note puts the whole scattered-vs-dd gap at ~9% (4.65 vs 5.1 GB/s), and at PROMPT size the
+        // two orderable knobs (STRATA_WAVE_PARTS 4 / 16) measured 0% (320.9 / 316.5 / 320.9 tok/s), i.e. inside the
+        // 1.5-4.3% noise.  The prefill lever is the batch width (fewer whole-file-tier sweeps), not read order.
         rnext.store(w0 * P);
         const int nth = (int) std::min<size_t>((size_t) wave_threads, (w1 - w0) * P);
         for (int k = 0; k < nth; ++k)
             readers.emplace_back([&, w1]() {
                 for (size_t x; (x = rnext.fetch_add(1)) < w1 * P;) {
-                    const size_t q = read_sorted ? perm[x / P - w0] : (x / P);
+                    const size_t q = x / P;
                     if (P == 1) im.blobs->read(layer, order[2][q], slot_ptr(q));
                     else im.blobs->read_part(layer, order[2][q], (int) (x % P), (int) P, slot_ptr(q));
                     if (P == 1 || pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
@@ -5111,12 +5101,6 @@ void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
         pread_all(fd_, dst + at, x.off, x.bytes);
         at += x.bytes;
     }
-}
-
-uint64_t Ds41FileBlobs::blob_offset(int64_t layer, int64_t expert) const {
-    Span s[3];
-    spans(layer, expert, s);
-    return s[0].off;
 }
 
 void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {

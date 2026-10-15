@@ -945,6 +945,16 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.i_sslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, 2));
     im.i_lastblk = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
     for (int e = 0; e < 2; ++e) im.i_eng[e] = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.EC * im.ED, NC);
+    // STRATA_VRAM_TRACE: WHICH state tensor owns the columns' VRAM (s13c: a batch's state alloc was 2.45-2.76 GiB and
+    // a 2193.81 MiB allocation later failed with 6.83 GiB "free" - name the owner before sizing anything).
+    if (std::getenv("STRATA_VRAM_TRACE")) {
+        double tot = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) tot += (double) ggml_nbytes(t);
+        std::fprintf(stderr, "vram trace: state NC=%d wants %.2f GiB (i_eng %lld x %d = %.2f GiB each, i_wmask %.1f MiB, "
+                             "i_widx %.1f MiB)\n", NC, tot / 1073741824.0, (long long) im.EC, (int) im.ED,
+                     (double) ggml_nbytes(im.i_eng[0]) / 1073741824.0, (double) ggml_nbytes(im.i_wmask) / 1048576.0,
+                     (double) ggml_nbytes(im.i_widx) / 1048576.0);
+    }
     im.nbuf = ggml_backend_alloc_ctx_tensors(c, im.backend);
     if (!im.nbuf) { err = "cannot allocate " + std::to_string(NC) + " state columns"; return false; }
     ggml_backend_buffer_clear(im.nbuf, 0);

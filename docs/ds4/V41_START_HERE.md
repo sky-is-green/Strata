@@ -372,15 +372,26 @@ request instead of degrading.
 - **Below ~5 GiB free a layer-major batch cannot run at all** (4.3 GiB fixed + the columns): that request fails fast
   at c_stage.  The card's own dense half + KV is ~10.8 GiB, so a 12.5 GiB foreign holder leaves nothing - a sizing
   limit, not a bug to fix.
-- **Read path, NEXT (Mal's ask: NVMe reads for decode AND prefill).**  The wave reader (`STRATA_WAVE_THREADS` 32 x
-  `STRATA_WAVE_PARTS` 8) does 5.15-5.3 GB/s on the routed experts, vs the O_DIRECT microbench's **6.22 GB/s**
-  (6.75 MiB blobs, 8 parts, 32 threads) and dd's 5.1 GB/s at 16 streams - ~15-20% on the table in the read pattern.
-  The source's own note: the scattered 3 MiB pattern does 4.65 GB/s vs 5.1 for dd streams.  **NEW, built, NOT YET
-  MEASURED: `STRATA_READ_SORTED=1`** issues each wave's parts in FILE-OFFSET order instead of routing order (order
-  only: every blob still lands in its own slot, the launch pairs and the k-ordered sums are untouched, so the gate is
-  token-identical output; `blob_offset()` was added to the blob source).  Also untried at PROMPT size:
-  `STRATA_WAVE_THREADS` 48/64 and `STRATA_WAVE_PARTS` 12/16 (s11 tuned those for small turns only).  Measure on a
-  quiet box (load < 3); build-ds4-dspark already carries the code.
+- **Read path: MEASURED at prompt size, and it is exhausted (Mal's ask: NVMe reads for decode AND prefill).**
+  run16 (20:52-21:08, one-shot 20,480-token prompt, build-ds4-dspark, load ~2, sides alternating):
+  base 320.9 tok/s / **5.16 GB/s** of reader time; `STRATA_WAVE_PARTS=4` 316.5 / 4.96; `=16` 320.9 / 5.15.
+  So parts 4/16 = **0%** - inside the 1.5-4.3% run-to-run noise - and s11's 32-thread x 8-part tuning stands.
+  The parts runs ARE token-identical (`10699 2105 6321 11`) once the memguard banner (it embeds a PID) is excluded:
+  my first identity gate compared banners, which is why it printed DIFFERS - fix in `~/AI/v41-dev/s13/run16.sh`.
+  **`STRATA_READ_SORTED` (issue a wave's parts in FILE-OFFSET order) was TRIED and SEGFAULTED** (exit 139, inside
+  the batch, 21:00) - the code is REVERTED, `blob_offset()` with it.  Not re-attempted blind: the source's own note
+  puts the whole scattered-vs-dd gap at ~9% (4.65 vs 5.1 GB/s), i.e. near that noise floor, and no GPU window was
+  left to debug it.  **Conclusion: at prompt size the read path has no knob left** - the reader does 5.08-5.16 GB/s
+  against the microbench's 6.22, and the PREFILL lever is the batch WIDTH (each layer-major sweep re-reads the whole
+  file tier: ~82 GB), which is the VRAM work above.  Still untested at prompt size: `STRATA_WAVE_THREADS` 48/64.
+- **Also new: `STRATA_VRAM_TRACE=1` now prints the state tensors' sizes** (`ds41_dense.cpp`: "state NC=N wants X
+  GiB (i_eng EC x ED = Y GiB each, ...)"), which is how the fixed ~2.19 GiB buffer's owner gets named from any
+  traced leg.  The traced legs (run17) never ran - see the pending item below.
+- **PENDING tonight (needs a CLEAN card):** the 8192-vs-12288 prompt-batch A/B (`~/AI/v41-dev/s13/run17.sh`,
+  3 runs a side, alternating).  Its gate needs >= 23 GiB free VRAM, because the ONE-SHOT path has no VRAM-aware cap
+  (that is `--serve` only): its dense half takes ~12 GiB and the un-capped 8192 batch ~12 GiB more, and at 9.5 GiB
+  free that allocation fails (measured, run13).  The desktop's resident `quetza-stt-whisper` (2.5 GB) alone leaves
+  ~21 GiB, so it is not enough - and that same 2.5 GB is the consumer that started this whole session.
 
 ### Session 13 (2026-10-15 15:00-17:00) - the three levers CLOSED by trace replay (no engine change pays)
 **Read this block first.**  Mal's pick (session 12): in-pass draft pruning, a smarter VRAM policy than LRU, the VMM
