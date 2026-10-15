@@ -82,6 +82,19 @@ if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
 endif()
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
+# ggml's MMQ host API moved after the pinned commit: ggml_cuda_mmq_get_config takes an explicit
+# `const ggml_prec prec_src1` and mul_mat_q_case is templated on it.  src/prefill/moe_mmq.cu carries both spellings
+# behind STRATA_MMQ_PREC_SRC1, set here from the ggml tree the build actually uses (so a checkout of the pinned
+# commit and a newer one both build).
+function(strata_mmq_api_version target mmq_dir)
+  if(EXISTS "${mmq_dir}/mmq.cuh")
+    file(READ "${mmq_dir}/mmq.cuh" _strata_mmq_h)
+    if(_strata_mmq_h MATCHES "const ggml_prec prec_src1")
+      target_compile_definitions(${target} PRIVATE STRATA_MMQ_PREC_SRC1=1)
+      message(STATUS "Strata: MMQ host API takes prec_src1 (${mmq_dir})")
+    endif()
+  endif()
+endfunction()
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
@@ -1274,6 +1287,7 @@ if(STRATA_NATIVE_EXPERTS)
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    strata_mmq_api_version(strata_mmq "${_strata_mmq}")
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1, the experts of Unsloth's UD-Q4_K_XL (docs/UNSLOTH_Q4.md; the dispatch
     # follows eddoursul/Strata 7706c1b); q6_k is HIP only
@@ -1357,6 +1371,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    strata_mmq_api_version(strata_mmq "${_strata_mmq}")
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)

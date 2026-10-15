@@ -166,7 +166,13 @@ bool fits(int t, int64_t w_rows) {
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
         for (int J = 8; J <= 128 && !any; J += 8) {
+#if defined(STRATA_MMQ_PREC_SRC1)
+            // ggml's newer host API takes the src1 precision explicitly (the tree this was written against defaulted
+            // it to Q8_1); Q8 is what the fork's MMQ always used
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc, GGML_PREC_Q8);
+#else
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
+#endif
             any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
         }
         if (!any) {
@@ -221,7 +227,11 @@ void Context::run(const Product& p, void* stream) {
         const bool fallback = ggml_cuda_mmq_needs_fallback(p.w_rows);
         int64_t ntiles_best = INT64_MAX;
         for (int J = 8; J <= 128 && ntiles_best > 1; J += 8) {
+#if defined(STRATA_MMQ_PREC_SRC1)
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(t, J, fallback, cc, GGML_PREC_Q8);
+#else
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(t, J, fallback, cc);
+#endif
             if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) continue;
             const int64_t nt = (p.max_rows + config.J - 1) / config.J;
             if (nt < ntiles_best) { J_best = J; ntiles_best = nt; }
@@ -232,37 +242,43 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, J_best};
+                        p.max_rows, (int) J_best};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+#if defined(STRATA_MMQ_PREC_SRC1)
+#define STRATA_MMQ_CASE(T) mul_mat_q_case<T, GGML_PREC_Q8>(ctx, a, s)   // newer ggml: prec_src1 is a template argument
+#else
+#define STRATA_MMQ_CASE(T) mul_mat_q_case<T>(ctx, a, s)
+#endif
     switch (t) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
-        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
+        case GGML_TYPE_Q5_0: STRATA_MMQ_CASE(GGML_TYPE_Q5_0); break;
 #endif
-        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
-        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_Q2_0: STRATA_MMQ_CASE(GGML_TYPE_Q2_0); break;
+        case GGML_TYPE_IQ2_XXS: STRATA_MMQ_CASE(GGML_TYPE_IQ2_XXS); break;
+        case GGML_TYPE_IQ2_XS: STRATA_MMQ_CASE(GGML_TYPE_IQ2_XS); break;
+        case GGML_TYPE_IQ2_S: STRATA_MMQ_CASE(GGML_TYPE_IQ2_S); break;
+        case GGML_TYPE_IQ3_XXS: STRATA_MMQ_CASE(GGML_TYPE_IQ3_XXS); break;
+        case GGML_TYPE_IQ3_S: STRATA_MMQ_CASE(GGML_TYPE_IQ3_S); break;
+        case GGML_TYPE_IQ4_NL: STRATA_MMQ_CASE(GGML_TYPE_IQ4_NL); break;
+        case GGML_TYPE_IQ4_XS: STRATA_MMQ_CASE(GGML_TYPE_IQ4_XS); break;
+        case GGML_TYPE_Q8_0: STRATA_MMQ_CASE(GGML_TYPE_Q8_0); break;
 #ifdef STRATA_MMQ_KQUANTS
-        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
-        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: STRATA_MMQ_CASE(GGML_TYPE_Q4_K); break;
+        case GGML_TYPE_Q5_K: STRATA_MMQ_CASE(GGML_TYPE_Q5_K); break;
 #if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
-        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: STRATA_MMQ_CASE(GGML_TYPE_Q6_K); break;
 #endif
-        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
-        case GGML_TYPE_Q2_K: mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, a, s); break;   // MiMo GSQ-RCO experts
-        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;   // MiMo GSQ-RCO experts
-        case GGML_TYPE_MXFP4: mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s); break; // MiMo GSQ-RCO experts
+        case GGML_TYPE_Q5_1: STRATA_MMQ_CASE(GGML_TYPE_Q5_1); break;
+        case GGML_TYPE_Q2_K: STRATA_MMQ_CASE(GGML_TYPE_Q2_K); break;   // MiMo GSQ-RCO experts
+        case GGML_TYPE_Q3_K: STRATA_MMQ_CASE(GGML_TYPE_Q3_K); break;   // MiMo GSQ-RCO experts
+        case GGML_TYPE_MXFP4: STRATA_MMQ_CASE(GGML_TYPE_MXFP4); break; // MiMo GSQ-RCO experts
 #endif
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
     }
+#undef STRATA_MMQ_CASE
     ck(cudaGetLastError(), "mul_mat_q");
 }
 

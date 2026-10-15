@@ -99,14 +99,23 @@ if(TARGET strata_kernels_cpu AND TARGET ggml-cpu)
     # AMD (HIP, STRATA_ENABLE_HIP): the SAME DS4_MOE_CUDA tier source, compiled for the wave32 backend.  The tier
     # carries no device code of its own (all of it lives in strata_kernels, compiled as HIP here); what it uses is
     # the CUDA runtime API, and include/strata/hip_compat/cuda_runtime.h renames that to HIP (strata_hip_runtime,
-    # which force-includes it), so one source serves both builds.  The MMQ prompt path (strata_mmq, ds41_transcode)
-    # stays CUDA-only: without DS4_MOE_MMQ the tier's grouped kernels run the prompt as they do on CUDA without it.
+    # which force-includes it), so one source serves both builds.  With STRATA_PREFILL_MMQ the prompt path's MMQ
+    # (strata_mmq, built for HIP by the root CMakeLists) joins it: the PTQ1_0 -> Q2_0 device transcode is the same
+    # .cu compiled as HIP, so DS4_MOE_MMQ turns on exactly as it does on CUDA.
     if(TARGET ggml-hip AND TARGET strata_kernels)
         add_library(ds41_moe_hip STATIC ${_v41_dir}/ds41_moe.cpp)
         target_include_directories(ds41_moe_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_v41_dir})
         target_compile_definitions(ds41_moe_hip PRIVATE DS4_MOE_CUDA=1)
         target_link_libraries(ds41_moe_hip PUBLIC strata_engine strata_kernels strata_kernels_cpu strata_artifact ggml
                                                  ggml-base ggml-hip strata_hip_runtime)
+        if(TARGET strata_mmq)
+            set_source_files_properties(${_v41_dir}/ds41_transcode.cu PROPERTIES LANGUAGE HIP)
+            add_library(ds41_transcode_hip STATIC ${_v41_dir}/ds41_transcode.cu)
+            target_include_directories(ds41_transcode_hip PUBLIC ${_v41_dir})
+            target_link_libraries(ds41_transcode_hip PUBLIC strata_hip_runtime)
+            target_compile_definitions(ds41_moe_hip PRIVATE DS4_MOE_MMQ=1)
+            target_link_libraries(ds41_moe_hip PUBLIC ds41_transcode_hip strata_mmq)
+        endif()
     endif()
 endif()
 # the end-to-end engine: the HIP tier, else the CUDA tier, else the CPU-only tier
