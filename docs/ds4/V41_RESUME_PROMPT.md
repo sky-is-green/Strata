@@ -122,7 +122,10 @@ up -> free-VRAM-aware batch sizing + OOM recovery: DONE in 13c (see the ~20:25 e
 harness (template re-render, see START_HERE) -> resume at the longest common prefix below the snapshot.
 DONE from 13b: the park/unpark continuation fix (commit ad1b0f4c).  The continuation matched 21,165 of 21,166 parked
 tokens and the old code demanded an EXACT prefix, so it missed by one token and re-read everything: turn 2 went
-265.9 s -> 24.7 s (cached_tokens 21,165).  STRATA_SERVE_PARK_PARTIAL=0 restores the old behaviour.
+reused=21,165 tokens (cached_tokens 21,165 in the harness's own usage) where the old code reused 0.  Do NOT quote the
+265.9 -> 24.7 s delta as the fix's measure - those two arms ran at different batch widths on differently loaded boxes
+(the mechanism, reused=0 -> 21,165, is the evidence; a like-for-like timing pair is still owed).
+STRATA_SERVE_PARK_PARTIAL=0 restores the old behaviour.
 UPDATE ~18:55: production config (DSpark on) confirmed: 20K prompt 66.85 -> 58.44 s (306 -> 350 tok/s).  Next:
 park DSpark weights in host RAM during batch prompts (~5 s of 58), then the 16384 OOM (1.42 GiB alloc), then the read
 pipeline.  Video: ~/AI/xolotl-video (Remotion, 3:20 visual cut, out/xolotl-v1.mp4; `npm run studio` to edit; text
