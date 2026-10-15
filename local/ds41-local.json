@@ -17,6 +17,7 @@
   "262144",
   "--stop",
   "1",
+  "--kv-q8",
   "--prompt-batch",
   "2048",
   "--arena-gib",

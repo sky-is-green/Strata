@@ -134,6 +134,30 @@ Quality: greedy, thinking off, the code-review prompt gets the missing error han
 separators / the unbounded `s +=` growth) in order, with the Engram tables enabled the answer points at the
 `std::ifstream` open check first. The CPU tier and the HIP tier produce **identical tokens** on the same prompt.
 
+## The KV cache here: 8-bit, not 4-bit
+
+The compressed KV and the indexer keys are the context-sized state (`L.comp` = `{d_head 512, ctx/ratio}` per
+KV-source layer, `L.idxk` = `{idx_dim, ctx/ratio}`). The engine's choices:
+
+| Setting | Type | Notes |
+| --- | --- | --- |
+| default | BF16 (or F32 with `--no-actquant`) | what the server ran before this |
+| `--kv-q8` (added here; `--kv-type N` for any ggml type) | Q8_0 | 8 bits; `ggml_set_rows` quantizes on write, `ggml_flash_attn_ext` takes Q8_0 K/V (it is in ggml's supported KV list), the window ring's `ggml_cast` dequantizes on read |
+| `--kv-fp4` | NVFP4 compressed / MXFP4 indexer | the 4-bit grids the author's 4090 used for 512K. **Not usable on this tree**: NVFP4/MXFP4 are not in `ggml_cuda_fattn_kv_type_supported()` (`fattn.cu`), so the attention would have no kernel for them - `tools/v41/ggml/kv-fp4.patch` adds the set_rows packers, not attention kernels |
+
+Measured at 256K with everything else equal (one-shot, Engram, DSpark off for the logits):
+
+| | expert slots after the dense half | logits vs BF16 | prompt 1536 tok | decode 48 tok |
+| --- | --- | --- | --- | --- |
+| BF16 (default) | 13.71 GiB | - | 115.8 / 119.3 tok/s | 15.86 tok/s |
+| `--kv-q8` | **14.08 GiB** | top-1 identical, cosine **0.998987**, mean abs diff 0.152 (logits -11.2..31.0), top-5 overlap 5/5 | 100.5 / 107.1 tok/s | 16.53 tok/s |
+
+So the 8-bit cache is effectively lossless here and buys 0.37 GiB of expert slots, but the quantized-KV attention
+kernel costs ~10% on the prompt path (the vector kernel instead of the f16 MMA one). This checkout's server runs
+`--kv-q8` (the choice for 256K and the setting that scales to 512K); BF16 is one flag away if prompt speed matters
+more than the 0.37 GiB. 4-bit is out of the question both for quality and because the attention kernels for it are not
+in this ggml tree.
+
 ## DSpark on this box (the draft stack runs on HIP)
 
 The Q2_K sidecar loads as a HIP graph (`2.91 GB of weights on the card` with the 64-experts-per-layer prune, 5.14 GB
@@ -178,10 +202,8 @@ as is); a realistic estimate is days of work with real correctness risk, and the
 
 ## Not done yet
 
-- **`--kv-fp4`** (the bit-exact 4-bit KV cache that makes the 4090's 512K context cheap) needs the
-  `tools/v41/ggml/kv-fp4.patch` packers in the ggml tree (`cpy-utils.cuh`); the tree here does not carry them, so the
-  server runs the default BF16-with-activation-quant KV. At 256K that is affordable, at 512K it is the first thing to
-  port.
+- **512K context**: the 8-bit cache makes the state affordable, but nothing above 256K has been run here; the second
+  thing `--kv-fp4` would buy (a further ~0.4 GiB at 256K) is not available in this ggml tree, see the KV section.
 - **The second card**, as above.
 - **`--chunk-mmq` tuning**: the Q2_0 MoE-MMQ kernels have no RDNA3-specific config here; the A/B is a wash.
 
