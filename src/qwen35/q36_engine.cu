@@ -1321,8 +1321,8 @@ struct Engine {
         if (hist_n < 16) tok_hist[hist_n++] = t;
         else { for (int i = 1; i < 16; ++i) tok_hist[i - 1] = tok_hist[i]; tok_hist[15] = t; }
     }
-    int period_draft() const {
-        const int maxp = mtp_period < 8 ? mtp_period : 8;
+    int period_draft(int maxp_in) const {
+        const int maxp = maxp_in < 8 ? maxp_in : 8;
         for (int p = 1; p <= maxp; ++p) {
             if (hist_n < 2 * p) break;
             bool ok = true;
@@ -1330,6 +1330,33 @@ struct Engine {
             if (ok) return tok_hist[hist_n - p];
         }
         return -1;
+    }
+    // STRATA_Q36_JEV_PROBE=<file>: one record per verify window for the control readout (the "jev-controller"):
+    // the head's input hidden state, the last 16 emitted tokens, the head's draft, the model's pick, whether the
+    // draft was accepted and whether the period rule would fire.  Debug/training only, off unless the env is set.
+    FILE* jev_fp = nullptr;
+    bool jev_tried = false;
+    std::vector<float> jev_hbuf;
+    void jev_write(int x_tok, int draft, int pick, int accepted, int rule) {
+        if (!jev_tried) {
+            jev_tried = true;
+            if (const char* p = std::getenv("STRATA_Q36_JEV_PROBE")) jev_fp = std::fopen(p, "wb");
+            if (jev_fp != nullptr) std::fprintf(stderr, "sc: jev probe writing to %s\n", std::getenv("STRATA_Q36_JEV_PROBE"));
+        }
+        if (jev_fp == nullptr) return;
+        const int N = (int) m->g.n_embd;
+        jev_hbuf.resize((size_t) N);
+        CK(cudaMemcpy(jev_hbuf.data(), hlast, (size_t) N * 4, cudaMemcpyDeviceToHost));
+        const int64_t p64 = (int64_t) pos;
+        std::fwrite(&p64, 8, 1, jev_fp);
+        std::fwrite(&x_tok, 4, 1, jev_fp);
+        std::fwrite(&draft, 4, 1, jev_fp);
+        std::fwrite(&pick, 4, 1, jev_fp);
+        std::fwrite(&accepted, 4, 1, jev_fp);
+        std::fwrite(&rule, 4, 1, jev_fp);
+        std::fwrite(tok_hist, 4, 16, jev_fp);
+        std::fwrite(jev_hbuf.data(), 4, (size_t) N, jev_fp);
+        std::fflush(jev_fp);
     }
 
     // ---- the hybrid mode (Model::hybrid): per state index (the layers, then the MTP block) the slot tables; a
@@ -2427,9 +2454,11 @@ struct Engine {
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
         drafts.assign((size_t) D, 0);
+        // the period rule's log-only probe: what the rule would fire on, regardless of --mtp-period
+        const int pd_log = (D > 0) ? period_draft(4) : -1;
         if (m->sc_loaded) {
             // the drafter recomputes from hlast each step (no redo rows): its token, then the shared verify window
-            const int pd = D > 0 ? period_draft() : -1;
+            int pd = D > 0 ? period_draft(mtp_period) : -1;
             if (D > 0) {
                 if (pd >= 0) {
                     drafts[0] = pd;   // a confirmed period: supply the draft, skip the head call entirely
@@ -2504,6 +2533,9 @@ struct Engine {
                                  backoff_streak, (long long) pos, pause_left);
             }
         }
+        // the control-readout record (STRATA_Q36_JEV_PROBE): what the head drafted, what the model picked, and
+        // the rule's opinion - the dataset for a learned version of the period rule
+        if (D > 0 && m->sc_loaded) jev_write(x_tok, drafts.empty() ? -1 : drafts[0], hpin[2], a, pd_log >= 0 ? 1 : 0);
         if (std::getenv("STRATA_Q36_SC_DEBUG"))
             std::fprintf(stderr, "sc: verify draft %d vs pick %d (pos %lld, accepted %d)\n", drafts.empty() ? -1 : drafts[0],
                          hpin[2], (long long) pos, a);
