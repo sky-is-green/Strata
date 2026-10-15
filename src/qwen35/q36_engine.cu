@@ -1289,6 +1289,7 @@ struct Engine {
     // Opt-in, measurement/training only: STRATA_Q36_MTP_PROBE=<file>.  A pos jump marks a prompt, so the
     // assembler can cut windows where a request ended.
     std::FILE* mtp_probe = nullptr;
+    std::string mtp_probe_name;
     float* probe_h = nullptr;
     float* probe_hd = nullptr;   // device: the pending pair's hidden (a window overwrites hmain before it is used)
     int32_t probe_tok = 0;
@@ -1367,6 +1368,7 @@ struct Engine {
         const size_t C = (size_t) g.ssm_conv_channels;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         if (const char* pf = std::getenv("STRATA_Q36_MTP_PROBE")) {   // before the buffer pool: probe_hd is in it
+            mtp_probe_name = pf;
             mtp_probe = std::fopen(pf, "wb");
             if (!mtp_probe) {
                 std::fprintf(stderr, "strata-q36: cannot write the MTP probe %s\n", pf);
@@ -2507,6 +2509,8 @@ struct Engine {
         std::fwrite(rec, 4, 2, mtp_probe);
         std::fwrite(&at, 8, 1, mtp_probe);
         if (++probe_n % 128 == 0) std::fflush(mtp_probe);
+        if (probe_n == 1) std::fprintf(stderr, "strata-q36: MTP probe: writing the drafter's pairs to %s\n",
+                                       mtp_probe_name.c_str());
     }
     void mtp_probe_dump(int32_t tok, const float* h) {   // the T = 1 step: the pick is already in `pick`
         mtp_probe_dump(tok, greedy(), h, pos);
