@@ -464,6 +464,12 @@ public:
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// Measurement only (session 13): open a binary routing trace.  Writes a header snapshot (per (layer, expert):
+    /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
+    /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
+    /// caller record (the pass's acceptance).  Replayed by tools/v41/sim/route_sim.py.
+    void trace_open(const std::string& path);
+    void trace_mark(const float* v, int n);
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU

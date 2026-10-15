@@ -16,6 +16,7 @@ Q3_K = 2.25 bpw; dense Q8_0) on **one RTX 4090 24 GB + Ryzen 7 5700X + 90 GB DDR
 | | |
 |---|---|
 | Prefill 8K / 16K / 20K | 244-248 / 288 / 266 tok/s, exact (MMQ default) |
+| Decode today (s13, serve flags, one-shot 256 tok) | DSpark **python 27.96 / prose 16.33 / code 26.68 tok/s**; plain decode 18.61 / 14.67 / 19.53 |
 | Decode p256 x 256, forced tokens (identical work) | **26.4-27.5 tok/s = 37.5 ms/token** (28-29.5 on luckier token paths) |
 | Quality | 4096-tok code ppl 2.3790 exact routing; decode biases (defaults) cost code 2.38 -> 2.87 |
 | Head gate vs FP8 teacher (held-out) | ppl 5.645 vs 4.915, top-1 0.674 vs 0.701 |
@@ -47,7 +48,10 @@ decode-thread issuing +1.2 ate it) · attention-level levers (KV quant, window, 
 quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft penalties only - Mal) · **striping the
 file tier over a SECOND drive** (`STRATA_BLOB_MIRROR`: an 84 GiB mirror of the coldest experts on NVME1TB, the share
 of a blob's parts read from it - the pattern does +33% in the microbench and NOTHING in the engine at arena 64 AND
-at arena 32; the file tier is not bandwidth-bound. Session 12 block, 2026-10-15).
+at arena 32; the file tier is not bandwidth-bound. Session 12 block, 2026-10-15). · **a smarter VRAM policy than LRU**
+(Belady ceiling 4-8%, every online policy within +-1% of LRU; admission window 4 is already the best) · **in-pass draft
+pruning** (oracle -4.8%, a real rule -0.7%) · VMM for the prompt state (elastic columns already did it) · inclusive
+VRAM/arena tiers (demotions cost ~0) · plain decode for low-acceptance text (DSpark wins on prose too).  Session 13 block.
 
 ## 5. State at shutdown (2026-10-13 ~06:00, session 5) - nothing is running; resume from here
 - **DSpark teacher test: DONE.**  Teacher (FP8) states 0.437 accepted/pass vs ours 0.405 (`~/AI/v41-dev/dspark/
@@ -252,36 +256,53 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   harnesses' `gpu_busy()` ("any compute app") never clears - gate on VRAM used (>= 2 GB = busy) or on
   `pgrep -x ds41_generate`.
 
-### NEXT (session 13, Mal's pick 2026-10-15) - the three levers, with how to measure each
-**Bench discipline first: the 512K turn bench's run-to-run spread with an identical config is 1.5-4.3%** (session 12:
-31.51 -> 31.98 s on the same turn, and the short decodes swing 2.76 -> 3.09 s).  Every claim below needs **>= 3 runs
-a side**, alternating A/B/A/B, and both baselines quoted.  A single pair produced session 12's 64 x 16 false positive.
-1. **In-pass draft pruning (decode, keeps the output distribution exact).**  A DSpark verify pass runs 1+depth rows
-   and its expert bytes scale with the width (s11: verify ms by width 72 / 91 / 118 / 135 for 1 / 2 / 3 / 4 tokens;
-   every verified draft row costs ~20-27 ms of expert bytes).  Drop *trailing* draft rows mid-pass, once the first
-   layers' unique-miss set is known to be expensive: the dropped rows are simply not verified this pass, they stay
-   drafts and are re-fed next pass, so nothing about acceptance or sampling changes - a narrower pass, not a
-   different rule.  Where: `gpu_run_n_ex` (the verify path, `nt = 1 + depth`) - trim the row count before the
-   launches; drafting already allows any width (`STRATA_DSPARK_DEPTH` 0..5).  Measure: **time per token** (not
-   tokens/pass - a narrower pass would "win" that for free) plus accepted drafts/pass at 3 prompts x >= 3 runs;
-   report the trimmed-pass share.  Bitwise gate: `--kv-fp4` + a pinned `STRATA_PRESTAGE_GIB` (and note that the
-   greedy stream already depends on the verify width at ties, s11).
-2. **A VRAM replacement policy smarter than LRU.**  Today: per-layer LRU with a 4-call admission window
-   (`STRATA_LRU_WIN`) and a single same-class victim (`lru_victim`); the serve decode hit rate is already ~93% (222
-   of 239 routed rows a token at 512K, 1509-1946 slots).  Untried, in order of promise: (a) score victims by
-   *predicted next use* - the engine already predicts the next layers' top-k for prefetch (`Ds41Dense::predict`,
-   `--pf-b`, `spec_read`), so the same prediction can rank victims instead of recency; (b) add a frequency term so
-   one-off misses cannot evict a hot expert; (c) a *prediction*-based warm set across a batch turn (session 12's
-   warm_reseed used the released set, which is mostly recent misses, and showed nothing).  Measure: hits /
-   (hits + pcie + file) and verify ms/pass on the 4-turn bench, >= 3 runs a side.
-3. **VMM refactor for the prompt state's ~2.6 GiB.**  The layer-major prompt holds NC-sized state columns (0.31 MiB
-   a column x 8192 ~ 2.6 GiB) that decode does not need; `set_columns()` (elastic columns) resizes and drops every
-   cached graph, which is why the VRAM is not given back.  A VMM pool (cuMemAddressReserve / cuMemMap / cuMemUnmap
-   with STABLE virtual addresses, so cached graphs and tensor views keep their pointers) would let the dense half
-   and the expert cache share that VRAM: +2.6 GiB of slots is worth ~10-20% of a verify pass (measured: 13.44 /
-   12.13 / 10.83 GiB of slots -> python verify 131 / 136 / 145 ms).  Session 11 parked it because 1227 -> 1509 slots
-   showed nothing in decode - so do it only together with a decode-side measurement, and gate on bit-exactness with
-   `STRATA_PRESTAGE_GIB` pinned.
+### Session 13 (2026-10-15 15:00-17:00) - the three levers CLOSED by trace replay (no engine change pays)
+**Read this block first.**  Mal's pick (session 12): in-pass draft pruning, a smarter VRAM policy than LRU, the VMM
+refactor.  Method: instead of building each one, record the verify passes' routing once and replay it offline -
+`STRATA_ROUTE_TRACE=<file>` (measurement only, inert when unset: `Ds41MoeTier::trace_open` / `trace_mark`) +
+`tools/v41/sim/route_sim.py` (`--policy`, `--prune`).  Logs / traces / scripts: `~/AI/v41-dev/s13/` (run1 = the 3
+traces, run2 = plain decode, sim1.txt / sim2.txt, swapreg.py).  Serve flags (x0.5 + file 0.3 + arena-adapt + arena 64
++ kv-fp4, DSpark depth 4 + KEEP 64 + conf 0.6), one-shot, 256 tokens: python 27.96 / prose 16.33 / code 26.68 tok/s.
+- **Verify-pass cost model** (345 passes, R2 0.977): **verify ms = 25.7 + 5.7 x rows + 0.49 x PCIe misses + 2.93 x file
+  misses**.  A python pass (4.5 rows, 125 PCIe, 8 file) = 26 + 26 + 61 + 23 ms: PCIe is ~45%, the file tier ~17%.
+- **The replay is calibrated**: the simulator's per-(layer, class) LRU with the 4-call admission window, arena_adapt and
+  the D3 prefetch slots (a miss the engine served from a prefetch slot counts as a hit and is LRU-admitted, as in
+  gpu_run_n_ex) reproduces the engine: python PCIe 31.89 vs 31.85 observed per token, hit 77.9 vs 78.0%; prose 49.64 /
+  49.57; code 25.96 / 26.07.
+- **(2) VRAM replacement policy: CLOSED.**  Belady's MIN with bypass (reads the trace ahead = the ceiling of ANY
+  policy) cuts PCIe misses/token 31.9 -> 26.5 (python), 49.6 -> 45.4 (prose), 26.0 -> 19.8 (code) = **-2.1 to -3.0 ms
+  of a 35-59 ms verify-ms/token, i.e. a 4-8% ceiling**.  Online policies get none of it: admission window 1 / 2 / 8 /
+  inf all worse than 4 (the current default is the best LRU); LRU-2 +0.1-0.2 ms; LFU-decay -0.4 / -0.2 / +0.1 ms (decay
+  0.9-0.995 identical); TinyLFU admission -0.2 / +0.6 / +0.5 ms (it refuses useful admissions).  DeepSeek's routing is
+  too flat for recency or frequency to predict a layer's next use, and a victim's next use is a whole pass away - the
+  prefetch predictor (same pass, next layers) cannot rank victims.  **Do not retry without a NEW signal of next-pass
+  routing.**
+- **(1) In-pass draft pruning: CLOSED.**  Dropping a pass's last draft row costs its unique misses (experts no earlier
+  row routes) + 5.7 ms/row; it loses a token only when every verified draft is accepted.  Oracle (knows each row's full
+  cost AND its acceptance): **-4.8% verify-ms/token** over all 3 prompts.  A real rule (drop at layer Lc if the row's
+  observed unique-miss cost x (40/Lc - 1) > theta x p_cum x ms/token; Lc 2/4/8/12, theta 0.5-3, best picked per prompt
+  in hindsight): best -0.7% overall (python -2.0%, prose -0.3%, code -0.4%) - inside the bench's 1.5-4.3% spread.  The
+  row's early-layer cost predicts its later cost poorly (corr 0.21 at Lc 2, 0.50 at Lc 8), and the confidence trim
+  (conf 0.6) already removed the cheap wins.
+- **(3) VMM refactor for the prompt state: ALREADY DONE (by session 11's elastic columns).**  `set_columns()` drops the
+  cached graphs and reallocates; serve decodes with S = 512 columns (~160 MiB) - the 11.59 -> 14.00 GiB / 1227 -> 1509
+  slots of session 11 IS the 2.6 GiB coming back.  The "needs VMM" note predated elastic columns.  VMM would only save
+  the graph rebuild per resize.
+- **VRAM swap demotions are free**: adding the replayed LRU swaps per pass (15 a pass) to the cost model gives -0.13
+  ms/swap (R2 0.9771 -> 0.9779) - the D2H demotions overlap fully; inclusive tiers (arena copies of VRAM experts) would
+  buy nothing.
+- **Plain decode is now SLOWER than DSpark on every prompt** (same flags, `STRATA_DEC_PROF=1`): prose 14.67 vs 16.33,
+  python 18.61 vs 27.96, code 19.53 vs 26.68 tok/s; a plain step = attn_router ~18.3 + tier 29-45 ms.  So a width-1
+  verify pass (~72 ms incl. draft-row work) is no worse than plain steps, and "k = 0 -> plain step + taps" has nothing
+  to gain.  Section 2's "37.5 ms/token" was forced tokens at an older config.
+- **DSpark's 2.91 GB on the card**: the sidecar holds **128** draft experts per MTP block (not 384): KEEP 64 = 3 x 64
+  Q2_K experts x ~11 MiB = 2.1 GiB + attention / main_proj / markov head ~0.6 GiB (the head is the trunk's,
+  shared).  Vision is not loaded.  K < 64 costs ~15% acceptance (s10), so the only VRAM left there is lower-precision
+  draft experts (untested: ~0.8 GB = ~+6% slots vs some acceptance).
+- **What is left for decode** (none measured): lower-precision DSpark draft experts (above); file-tier misses (2.9 ms
+  each, ~17% of a python pass - speculative reads were net-negative three times because of the issuing cost); the
+  dense half's fixed ~26 ms a pass (elementwise "zoo" kernels, section 3).  The expert tier is capacity-bound and
+  policy cannot fix that.
 
 ### Session 10b (2026-10-14 19:40-21:10) - DSpark IN --serve (speculative SAMPLING), crash fix UNTESTED; research
 **Read this block first.**  Mal's go 2026-10-14: (1) default x0.5 + arena-adapt + draft K=64 + arena 64 GiB, (2) DSpark

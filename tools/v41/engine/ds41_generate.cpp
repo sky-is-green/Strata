@@ -1475,6 +1475,9 @@ int main(int argc, char ** argv) {
     // for it), except the ratio-2 compressor's 2-slot state ring: a pass writes its LAST 2 tokens' states, so after a
     // rejection a pass that starts at an odd position re-feeds the last accepted token (its group's state then comes
     // from inside the pass).
+    // STRATA_ROUTE_TRACE=<file> (measurement only): the verify passes' routing + acceptance, for
+    // tools/v41/sim/route_sim.py (session 13: in-pass draft pruning and the VRAM replacement policy, replayed offline)
+    if (const char * rt = std::getenv("STRATA_ROUTE_TRACE")) tier.trace_open(rt);
     long sp_pass = 0, sp_acc = 0, sp_refeed = 0, sp_full = 0;
     const bool sp_noacc = std::getenv("STRATA_DSPARK_NOACC") != nullptr;
     double sp_vms = 0, sp_dms = 0;
@@ -1537,6 +1540,11 @@ int main(int argc, char ** argv) {
                 for (int i = 0; i < spec_depth; ++i) std::fprintf(conf_log, " %.4f", sig(sp_conf[i]));
                 std::fprintf(conf_log, "\n");
                 std::fflush(conf_log);
+            }
+            {   // STRATA_ROUTE_TRACE: 'P' {m, k, acc, refeed, verify ms, conf p0..p4}
+                float pm[10] = { (float) vt.size(), (float) k, (float) acc, (float) refeed, (float) (now_ms() - tv) };
+                for (int i = 0; i < 5; ++i) pm[5 + i] = i < spec_depth ? sig(sp_conf[i]) : 0.0f;
+                tier.trace_mark(pm, 10);
             }
             int spos[6];
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;

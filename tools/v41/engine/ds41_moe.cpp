@@ -549,6 +549,7 @@ struct Ds41MoeImpl {
     std::vector<int64_t> vlast;       ///< vram_lru: (layer, expert) -> the run() call that last used its VRAM copy
     std::vector<int64_t> vmiss;       ///< vram_lru: (layer, expert) -> the layer's call count at its last miss
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
+    FILE* trace = nullptr;            ///< trace_open: the session-13 routing trace (measurement only)
     /// warm_reseed: (layer, expert) that held a VRAM slot when the cache was last released, most recently used
     /// first.  A seed consumes it: those experts fill the first STRATA_WARM_SHARE (default 500) per mille of the
     /// slots, the global rank the rest.  Empty = off.
@@ -1733,6 +1734,30 @@ void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
         im_->blobs->advise(layer, e);
         ++im_->st.advised;
     }
+}
+
+void Ds41MoeTier::trace_open(const std::string& path) {
+    if (im_->trace) std::fclose(im_->trace);
+    im_->trace = std::fopen(path.c_str(), "wb");
+    if (!im_->trace) return;
+    const int64_t L = im_->g.n_layers, X = im_->g.n_experts;
+    const int32_t hdr[3] = { 'H', (int32_t) L, (int32_t) X };
+    std::fwrite(hdr, 4, 3, im_->trace);
+    std::vector<int32_t> v((size_t) (L * X * 3));
+    for (int64_t l = 0; l < L; ++l)
+        for (int64_t e = 0; e < X; ++e) {
+            int32_t* r = v.data() + (size_t) (l * X + e) * 3;
+            r[0] = im_->g.cls(l, e); r[1] = resident(l, e) ? 1 : 0; r[2] = in_arena(l, e) ? 1 : 0;
+        }
+    std::fwrite(v.data(), 4, v.size(), im_->trace);
+}
+
+void Ds41MoeTier::trace_mark(const float* v, int n) {
+    if (!im_->trace) return;
+    const int32_t hdr[2] = { 'P', n };
+    std::fwrite(hdr, 4, 2, im_->trace);
+    std::fwrite(v, 4, (size_t) n, im_->trace);
+    std::fflush(im_->trace);
 }
 
 void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
@@ -3134,6 +3159,17 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             fread_b[nfr++] = b;
         }
         any_vic = any_vic || fg_vic[b] >= 0;
+    }
+    if (im.trace) {   // trace_open: 'C' layer nt nu, then per distinct expert {expert, first row, class, from_pf}
+        int32_t rec[4 + 4 * kMaxEnt];
+        int n = 0;
+        rec[n++] = 'C'; rec[n++] = (int32_t) layer; rec[n++] = nt; rec[n++] = nu;
+        for (int u = 0; u < nu; ++u) {
+            int first = 0;
+            while (first < NE && ent_u[first] != u) ++first;
+            rec[n++] = ue[u]; rec[n++] = first / (int) K; rec[n++] = cls[u]; rec[n++] = from_pf[u] ? 1 : 0;
+        }
+        std::fwrite(rec, 4, (size_t) n, im.trace);
     }
     if (any_vic) {   // nothing still in flight from an EARLIER call (a gpu_run decode skips its layer sync) reads or
                      // writes a victim slot while the reader threads below fill it from the CPU
@@ -4559,6 +4595,7 @@ bool ds41_moe_cpu_expert(const cpu::NativeFmt& f, int64_t n_embd, int64_t n_ff, 
 }
 
 void Ds41MoeTier::close() {
+    if (im_ && im_->trace) { std::fclose(im_->trace); im_->trace = nullptr; }
 #if defined(DS4_MOE_CUDA)
     if (g_prof_n > 0) {
         double tot = 0;

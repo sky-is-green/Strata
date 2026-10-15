@@ -3,6 +3,38 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-15 ~17:00 (end of session 13) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
+deepseek4:main - pushing is OK'd; GitHub = Indras-Mirror/Strata-DSV4.1).  READ FIRST: docs/ds4/V41_START_HERE.md
+section 5c block "Session 13" (newest), then only what a question needs.  Traces / logs: ~/AI/v41-dev/s13/.
+
+STATE (RTX 4090 + 90 GB RAM), all committed + pushed, production build-ds4-gpu rebuilt.  Serve defaults UNCHANGED
+since session 11.  Decode today (serve flags, one-shot 256): DSpark python 27.96 / prose 16.33 / code 26.68 tok/s.
+
+SESSION 13 CLOSED ALL THREE PLANNED LEVERS by recording the verify passes' routing (STRATA_ROUTE_TRACE) and replaying
+it offline (tools/v41/sim/route_sim.py, calibrated to the engine's own counts within 0.2%):
+- smarter VRAM policy than LRU: Belady ceiling only 4-8%; LRU windows / LRU-2 / LFU-decay / TinyLFU all within +-1%
+  of today's LRU (window 4 is already best).  Do not retry without a new signal of NEXT-PASS routing.
+- in-pass draft pruning: oracle -4.8%, a real rule -0.7% (inside the noise).
+- VMM refactor: already done by session 11's elastic columns.
+- also measured: VRAM swap demotions cost ~0; plain decode is slower than DSpark on every prompt (prose too).
+Verify-pass cost model: ms = 25.7 + 5.7 x rows + 0.49 x PCIe misses + 2.93 x file misses (R2 0.977).
+
+NEXT candidates (unmeasured, Mal to pick): lower-precision DSpark draft experts (2.1 GiB of Q2_K on the card; K < 64
+costs acceptance, lower bits might not) -> more trunk slots; file-tier misses (2.9 ms each, ~17% of a pass); the
+dense half's fixed ~26 ms a pass.  The expert tier is capacity-bound.
+
+GOTCHA: after a reboot "SSD NVME" (/dev/nvme0n1p3, the GGUF) may not be mounted:
+udisksctl mount -b /dev/nvme0n1p3 -t ntfs3.
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes the GPU lock; never wrap it in
+flock); --serve runs NOT through memguard.  Need >= 75 GB MemAvailable.  Kill by exact PID only.  Never rebuild a
+build dir while a run launches from it.  A foreign headless Chrome holds a 51 MiB CUDA context: gate on VRAM used
+(>= 2 GB) or pgrep -x ds41_generate, not "any compute app".  Any A/B needs >= 3 runs a side (spread 1.5-4.3%).
+```
+
 ## RESUME PROMPT 2026-10-15 ~06:00 (end of session 12) - paste the block below into a new session
 
 ```
