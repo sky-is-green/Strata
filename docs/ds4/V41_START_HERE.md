@@ -417,13 +417,24 @@ request instead of degrading.
   round-trips exactly; `selm` is 0/-inf and is already cast to F16 for the flash-attn mask (`ggml_cast(... F16)`),
   so F16 storage is exactly what it becomes anyway; `i_eng` comes from an e4m3 engram (F16 has more mantissa).  Per
   column: `i_emb` -10,240 B, `i_eng` -24,576, `selm` -8,192 = **0.041 MiB a column = 0.66 GiB at 16384** - under
-  the 1.03 GiB deficit, so 16384 needs a quality-gated change too; the cheapest sufficient one is `x_state` + `hap`
-  -> F16 (0.078 MiB a column = 1.28 GiB at 16384), which is also 48% of the state.
-- **Still unidentified - now the top target: a ~7.7-8.0 GiB allocation during the FIRST layer's tier run,
-  ~B-independent** (free 11.10->3.27 GiB at B=8192, 9.81->2.15 at 12288, 8.44->0.46 at 16384 = 7.83 / 7.66 / 7.98).
-  It is neither the chunk stage (2 x 1 GiB by default, `c_half` = 1024 MiB) nor the prestage region (1.5 GiB - and no
-  "chunk prestage" line is printed in these runs).  Name it with `nsys -t cuda,cudart` on one b8192 leg; if it is
-  reducible it buys 16384/20480 with no precision change at all.
+  the 1.03 GiB deficit, so these alone do not get 16384.  This is the FALLBACK if the 1 GiB speed knob above costs too
+  much reader throughput; the cheapest sufficient F16 change is `x_state` + `hap` (0.078 MiB a column = 1.28 GiB at
+  16384), which is also 48% of the state.
+- **NAMED (run21, `nsys --trace=cuda --cuda-memory-usage=true`, one b8192 leg): the batch's VRAM is plain
+  `cudaMalloc`, and the 1424 MiB buffer that OOM'd at 16384 is a GRAPH buffer - transient, allocated at t=61.91 s and
+  freed 40 ms later, B-independent because the graph is built per 512-column sub-batch.**  The full >1 GiB picture:
+  8332 MiB dense weights + **2633 MiB state at NC=8192, allocated at INIT and held** (so the one-shot path reserves
+  the state at NC=NCmax=B before the batch - it is NOT elastic like `--serve`), 65532 MiB = **`cudaHostRegister` of
+  the 64 GiB HOST arena, not VRAM**, 1536 MiB prestage, and graph buffers of 1424.3 / 2193.8 / 2194.8 / 2196.8 /
+  2276.3 MiB (the 1424.3 and the first two ~2.19 are freed within 20-60 ms; the 2196.8 and 2276.3 are held).  Held
+  through the batch: 1417.5 + 1025 + 1025 + 1015.7 + 960.0 + 1536 (prestage) + ~2196 = **~8.0 GiB**, which is the
+  drop the VRAM trace shows, and none of it is the engram or the per-column state.
+- **So 16384's ~1.05 GiB deficit is a SPEED-knob problem, not a precision problem.**  `STRATA_PRESTAGE_GIB` (1.5,
+  allocated at t=59.4, hundreds of ms before the graph at t=61.9) and `MIMO_CHUNK_STAGE_MIB` (1024, the 2 x 1 GiB
+  halves at t=57-59) are both pure throughput knobs sized from free VRAM.  Dropping either by ~1 GiB frees it before
+  the graph alloc needs it.  The cost is reader speed (prestage 1.5 is what made 12288 a 2-sweep batch), so this is a
+  real trade - but it needs NO KL/ppl gate, unlike the F16 state change below, which is the fallback if the speed
+  knob costs too much.
 - **The state's per-column cost (0.321 MiB, 0.95 with the batch's other buffers):** `x_state` [5120,4] 24.3%,
   `hap` 24.3%, `i_eng` x2 14.6%, `sel`/`selm` x8 idx layers 9.7%, `shexp`/`o_fn`/`routed`/`i_emb` 6.1% each,
   `cand` [2048] 2.4%.  Shrinking the WIDER batch means shrinking those - starting with the two 24.3% residuals.
