@@ -397,8 +397,11 @@ request instead of degrading.
   file wait 20.4 s, 10942 file).  The reader does the same 4.95-5.15 GB/s either way - the whole win is one fewer
   whole-file-tier sweep.  **12288 is now the serve default** (`strata-ds41.json` `--prompt-batch 12288` +
   `STRATA_PRESTAGE_GIB=1.5` in `ds41-engine.sh`) - safe to default because the runtime cap narrows the batch on a
-  busy card instead of OOMing (run15's gate).  Still to do: a serve-stack smoke on the new default (the one-shot A/B
-  is a different path).
+  busy card instead of OOMing (run15's gate).  **SERVE-STACK SMOKE (run18, 21:41-21:43, the adopted default through
+  serve_ds41.py): PASSED** - with another process holding 2.5 GB the engine logged
+  `serve: VRAM 11.26 GiB free -> prompt batch 6428 (of 12288)` (the cap working live), ran 21,138 tokens in 90.35 s
+  = 233.9 tok/s, the side call in 8.4 s, and reported **0 engine errors, 0 server errors, 0 HTTP 400s**.  That is the
+  quantified cost of a 2.5 GB neighbour: 233.9 vs 387 tok/s at full width.
   The A/B itself needed >= 23 GiB free VRAM because the ONE-SHOT path has no runtime cap (that is `--serve` only):
   its dense half takes ~12 GiB and the un-capped batch ~12 GiB more (at 9.5 GiB free that allocation fails, run13).
   What cleared the card was xolotl-video's stray `quetza-stt-whisper` (2.5 GB) - the same consumer that tipped
