@@ -1290,6 +1290,10 @@ struct Engine {
     // assembler can cut windows where a request ended.
     std::FILE* mtp_probe = nullptr;
     float* probe_h = nullptr;
+    float* probe_hd = nullptr;   // device: the pending pair's hidden (a window overwrites hmain before it is used)
+    int32_t probe_tok = 0;
+    int64_t probe_pos = 0;
+    bool probe_have = false;
     long long probe_n = 0;
     // The ablation arm (measurement only: the outputs change, the node costs are read off the step).  Each flag
     // drops one correction / router node (or swaps top-k for a trivial fill) so the graph replay's difference to
@@ -1362,7 +1366,15 @@ struct Engine {
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+        if (const char* pf = std::getenv("STRATA_Q36_MTP_PROBE")) {   // before the buffer pool: probe_hd is in it
+            mtp_probe = std::fopen(pf, "wb");
+            if (!mtp_probe) {
+                std::fprintf(stderr, "strata-q36: cannot write the MTP probe %s\n", pf);
+                std::exit(1);
+            }
+        }
         x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); hmain = dalloc(T * N); hlast = dalloc(N);
+        if (mtp_probe) probe_hd = dalloc(N);
         if (m->sc_loaded) {
             sc_x = dalloc(2 * N); sc_z = dalloc((size_t) m->sc_width); sc_out = dalloc(N); sc_hn = dalloc(N);
             sc_e = dalloc(N); sc_tok = dalloc_t<int32_t>(1);
@@ -1386,13 +1398,6 @@ struct Engine {
         corr_x16 = dalloc_t<uint16_t>(std::min<size_t>(T, (size_t) strata::kernels::kLoraCorrRoundRows) * N);
         corr_t16 = dalloc_t<uint16_t>(T * (size_t) strata::kernels::kLoraCorrMaxRank);
         time_decode = std::getenv("STRATA_Q36_DECODE_TIME") != nullptr;
-        if (const char* pf = std::getenv("STRATA_Q36_MTP_PROBE")) {
-            mtp_probe = std::fopen(pf, "wb");
-            if (!mtp_probe) {
-                std::fprintf(stderr, "strata-q36: cannot write the MTP probe %s\n", pf);
-                std::exit(1);
-            }
-        }
         skip_xa = std::getenv("STRATA_Q36_SKIP_XA") != nullptr;   // the out correction's A pass
         skip_xb = std::getenv("STRATA_Q36_SKIP_XB") != nullptr;   // ... its B pass
         skip_ma = std::getenv("STRATA_Q36_SKIP_MA") != nullptr;   // the mixed pair's A (the MoE and router deltas)
@@ -2433,6 +2438,18 @@ struct Engine {
             std::fprintf(stderr, "sc: verify draft %d vs pick %d (pos %lld, accepted %d)\n", drafts.empty() ? -1 : drafts[0],
                          hpin[2], (long long) pos, a);
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        // The drafter's pairs, from the path it actually reads.  A window advances a + 1 positions, so the *next*
+        // draft call is seeded from row a's hidden and the token picks[a] - and its target is that next window's
+        // own picks[0], one window later.  So the pair is held here and written when the next window reports its
+        // picks; a rejected row's hidden belongs to a token the stream did not take, so row a is the only one
+        // that forms a pair.  (The T = 1 arm below has its target in the same step, hence no holding.)
+        if (mtp_probe && !warming) {
+            if (probe_have) mtp_probe_dump(probe_tok, picks[0], probe_hd, probe_pos);
+            CK(cudaMemcpyAsync(probe_hd, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
+            probe_tok = picks[a];
+            probe_pos = pos + a + 1;
+            probe_have = true;
+        }
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
@@ -2478,20 +2495,21 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         return hpin[2];
     }
-    /// One drafter training record (see mtp_probe): the hidden this step was seeded from, the token it processed and
-    /// the token the engine's own head chose from that row.
-    void mtp_probe_dump(int32_t tok, const float* h) {
+    /// One drafter training record (see mtp_probe): the hidden the step was seeded from (at pos - 1), the token it
+    /// processed, the token the engine's own head then chose, and pos.
+    void mtp_probe_dump(int32_t tok, int32_t newtok, const float* h, int64_t at) {
         const int N = (int) m->g.n_embd;
         if (!probe_h) probe_h = (float*) std::malloc((size_t) N * 4);
-        int32_t rec[2] = {tok, 0};
-        const int64_t at = pos;
+        int32_t rec[2] = {tok, newtok};
         CK(cudaMemcpyAsync(probe_h, h, (size_t) N * 4, cudaMemcpyDeviceToHost, st));
-        CK(cudaMemcpyAsync(rec + 1, pick, 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         std::fwrite(probe_h, 4, (size_t) N, mtp_probe);
         std::fwrite(rec, 4, 2, mtp_probe);
         std::fwrite(&at, 8, 1, mtp_probe);
         if (++probe_n % 128 == 0) std::fflush(mtp_probe);
+    }
+    void mtp_probe_dump(int32_t tok, const float* h) {   // the T = 1 step: the pick is already in `pick`
+        mtp_probe_dump(tok, greedy(), h, pos);
     }
     void host_logits(std::vector<float>& out) {
         out.resize((size_t) m->g.n_vocab);
