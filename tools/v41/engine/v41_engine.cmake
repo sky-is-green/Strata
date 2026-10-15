@@ -15,6 +15,15 @@ if(TARGET ggml-cpu)
         target_link_libraries(ds41_dense PUBLIC ggml-cuda)
         target_compile_definitions(ds41_dense PRIVATE DS41_HAVE_CUDA)
     endif()
+    # AMD (HIP, STRATA_ENABLE_HIP): ggml's HIP backend is the CUDA backend's own sources compiled as HIP, so its API
+    # keeps the cuda names (ggml_backend_cuda_init, ggml_backend_cuda_register_host_buffer).  Linking ggml-hip makes
+    # `--backend cuda` pick the ROCm device and keeps the dense half on the DS41_HAVE_CUDA path.  Without this link
+    # ggml_backend_init_by_type(GPU) returns NULL and ds41_generate reports "no cuda backend in this build".  The
+    # routed-expert CUDA tier (ds41_moe_cuda) is CUDA-only and stays out; the HIP build runs the CPU expert tier.
+    if(TARGET ggml-hip)
+        target_link_libraries(ds41_dense PUBLIC ggml-hip)
+        target_compile_definitions(ds41_dense PRIVATE DS41_HAVE_CUDA)
+    endif()
     # opt-in: the activation rounding as ONE ggml op (GGML_OP_DSV41_FAKE_QUANT) instead of ds41_ops.hpp's stock-op
     # composite.  Needs the llama.cpp tree patched with tools/v41/ggml/dsv41-fake-quant.patch (the tree is not tracked
     # here, so the stock build never depends on it).  Bit-identical (test_ds41_fq); decode 26.3 -> 27.7 tok/s.
@@ -87,9 +96,24 @@ if(TARGET strata_kernels_cpu AND TARGET ggml-cpu)
             target_link_libraries(ds41_moe_cuda PUBLIC strata_mmq)
         endif()
     endif()
+    # AMD (HIP, STRATA_ENABLE_HIP): the SAME DS4_MOE_CUDA tier source, compiled for the wave32 backend.  The tier
+    # carries no device code of its own (all of it lives in strata_kernels, compiled as HIP here); what it uses is
+    # the CUDA runtime API, and include/strata/hip_compat/cuda_runtime.h renames that to HIP (strata_hip_runtime,
+    # which force-includes it), so one source serves both builds.  The MMQ prompt path (strata_mmq, ds41_transcode)
+    # stays CUDA-only: without DS4_MOE_MMQ the tier's grouped kernels run the prompt as they do on CUDA without it.
+    if(TARGET ggml-hip AND TARGET strata_kernels)
+        add_library(ds41_moe_hip STATIC ${_v41_dir}/ds41_moe.cpp)
+        target_include_directories(ds41_moe_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_v41_dir})
+        target_compile_definitions(ds41_moe_hip PRIVATE DS4_MOE_CUDA=1)
+        target_link_libraries(ds41_moe_hip PUBLIC strata_engine strata_kernels strata_kernels_cpu strata_artifact ggml
+                                                 ggml-base ggml-hip strata_hip_runtime)
+    endif()
 endif()
-# the end-to-end engine: CUDA tier when built, else the CPU-only tier
-if(TARGET ds41_dense AND TARGET ds41_moe_cuda)
+# the end-to-end engine: the HIP tier, else the CUDA tier, else the CPU-only tier
+if(TARGET ds41_dense AND TARGET ds41_moe_hip)
+    add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp)
+    target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_hip)
+elseif(TARGET ds41_dense AND TARGET ds41_moe_cuda)
     add_executable(ds41_generate ${_v41_dir}/ds41_generate.cpp)
     target_link_libraries(ds41_generate PRIVATE ds41_dense ds41_moe_cuda)
 elseif(TARGET ds41_dense AND TARGET ds41_moe_cpu)
@@ -120,6 +144,11 @@ if(TARGET ds41_dense)
     add_executable(test_ds41_dspark ${_v41_dir}/test_ds41_dspark.cpp)
     target_link_libraries(test_ds41_dspark PRIVATE ds41_dspark)
     if(TARGET ggml-cuda)
+        target_compile_definitions(test_ds41_dspark PRIVATE DS41_HAVE_CUDA)
+    endif()
+    # AMD (HIP): the gate asks the backend by type and refuses without one; ggml-hip exports the same
+    # ggml_backend_cuda_init, so the same define lets the gate run the draft stack on the ROCm card.
+    if(TARGET ggml-hip)
         target_compile_definitions(test_ds41_dspark PRIVATE DS41_HAVE_CUDA)
     endif()
 endif()

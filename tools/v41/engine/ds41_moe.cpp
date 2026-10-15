@@ -1587,7 +1587,10 @@ void Ds41MoeTier::set_slot_gib(double gib) { im_->cfg.slot_gib = gib; }
 
 void Ds41MoeTier::set_cache_enabled(bool on) {
     if (!im_) return;
-    if (!on && im_->gpu && im_->gpu->cache) return;   // an open cache is release_cache()'s to drop, not a config flip's
+#if defined(DS4_MOE_CUDA)
+    // an open cache is release_cache()'s to drop, not a config flip's (the CPU-only Gpu stub has no cache at all)
+    if (!on && im_->gpu && im_->gpu->cache) return;
+#endif
     im_->cfg.no_cache = !on;
 }
 

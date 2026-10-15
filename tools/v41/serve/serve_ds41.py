@@ -24,7 +24,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 V41 = HERE.parent
-STRATA = Path.home() / "AI" / "Strata"
+# Strata's server this shim sits in front of.  Default: the installed layout (~/AI/Strata).  STRATA_HOME points it at
+# another tree, and this checkout is one (a Strata fork ships its own serve/), so a self-contained install needs no
+# ~/AI/Strata at all.
+STRATA = Path(os.environ.get("STRATA_HOME") or (Path.home() / "AI" / "Strata"))
 sys.path.insert(0, str(STRATA))
 sys.path.insert(0, str(STRATA / "tools"))
 sys.path.insert(0, str(V41.parent))          # Strata-DS4/tools: strata_tokenizer.py with the joyai-llm pre-split
@@ -238,9 +241,10 @@ def _op_feed_ds41(self, delta: str):
     return _op_feed(self, _strip_wrappers(self, delta, False))
 
 
-def _op_finish_ds41(self):
+def _op_finish_ds41(self, reason=None):
+    # reason (how the turn ended) is Strata's newer signature: passed through unchanged
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
-    return out + _op_finish(self)
+    return out + _op_finish(self, reason)
 
 
 F.OutputParser.__init__ = _op_init_ds41
@@ -288,14 +292,16 @@ def _note_ds41(self, n, evs, st=None, rate=None):
     return _svc_note(self, n, evs, st, rate)
 
 
-def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel):
+def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, force=None):
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
                 f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
     end = "(stream closed)"
     try:
-        for item in _svc_run(self, ids, thinking, tools, max_new, sampling, cancel):
+        # force is the request's "ignore the cached prompt state" flag: Strata's own server has it, the engine wrapper
+        # only forwards it (a V4.1 prompt that cannot be extended is re-prefilled by the engine either way)
+        for item in _svc_run(self, ids, thinking, tools, max_new, sampling, cancel, force=force):
             if item[0] == "done" and isinstance(item[1], dict):
                 d = item[1]
                 end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"

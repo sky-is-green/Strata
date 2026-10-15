@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -1130,6 +1130,10 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
+# Dev shortcut for the AMD/HIP port: link the ggml that STRATA_GGML_DIR has ALREADY built (its build directory)
+# instead of compiling that tree again - on gfx1100 the ggml-hip flash-attention template instances take hours.
+# Same source tree, so headers and archives match; the normal CUDA/CPU paths are untouched (empty by default).
+set(STRATA_GGML_PREBUILT "" CACHE PATH "an existing build dir of STRATA_GGML_DIR: link its ggml, do not compile it")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
@@ -1138,9 +1142,15 @@ if(STRATA_ORCA_Q4KS_MMQ AND NOT STRATA_NATIVE_EXPERTS)
 endif()
 if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-  set(GGML_STATIC ON CACHE BOOL "" FORCE)
-  set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  # With STRATA_ENABLE_HIP these FORCEs are incompatible with ggml's GPU backend: ggml-hip refuses the static link
+  # ("Static linking not supported for HIP/ROCm", ggml-hip/CMakeLists.txt) and GGML_CUDA must stay off, so the
+  # wave32 build leaves the two knobs alone (shared ggml, as ggml's own HIP build wants) and ggml-hip is selected
+  # with -DGGML_HIP=ON.  The CUDA and CPU builds are byte-identical to before.
+  if(NOT STRATA_ENABLE_HIP)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(GGML_STATIC ON CACHE BOOL "" FORCE)
+    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  endif()
   include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ggml_cuda.cmake OPTIONAL)   # fork: STRATA_GGML_CUDA
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
@@ -1170,7 +1180,9 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
-  if(STRATA_GGML_DIR)
+  if(STRATA_GGML_PREBUILT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/cmake/ggml_prebuilt.cmake)
+  elseif(STRATA_GGML_DIR)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)

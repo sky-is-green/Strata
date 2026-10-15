@@ -69,3 +69,13 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# The AMD/HIP port's local run artifacts (docs/ds4/AMD_HIP_NOTES.md): the Engram sources and tables, the prompt
+# dumps and the HF cache are data (hundreds of GB), not source.  local/*.py and local/*.json are kept.
+/local/engram-src/
+/local/engram/
+/local/prompts/
+/local/*.bin
+/local/*.ids
+/.hf-cache/
+/.run/
