@@ -4,6 +4,9 @@
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
 ## RESUME PROMPT 2026-10-15 ~17:30 (session 13b) - paste the block below into a new session
+UPDATE ~17:50: park gate PASSED (IDENTICAL; 8.15 s vs 28.99 s) and production build-ds4-gpu is rebuilt with it;
+meshapplied ternary CLOSED (ours better at equal bits).  Next = prompt speed: size the chunk/c_stage buffers so
+--prompt-batch 16384-32768 fits VRAM (one sweep per prompt), then the dense half.
 
 ```
 Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4

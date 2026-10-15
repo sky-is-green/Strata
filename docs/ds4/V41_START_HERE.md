@@ -288,6 +288,15 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   PASSES on layer 5 (381 of 384 experts ternary; rotation verified; PTQ1_0 repack lossless); layer 0 has a manifest
   but no layer file (FP4 upstream); the screen is re-queued as `~/AI/v41-dev/s13/run3c.sh` -> run3c.out (layer 5).
   Park gate rerun: run3b.out.
+- **PARK GATE PASSED (run3b, exact routing): continuation tokens IDENTICAL**; the continuation after an unrelated
+  side request reused 8,000 tokens in 8.15 s vs 28.99 s with STRATA_SERVE_PARK=0.  **Production build-ds4-gpu rebuilt
+  with park (2026-10-15 ~17:50)** - restart strata-ds41-quetza to use it.
+- **meshapplied ternary: CLOSED, ours is better.**  Layer 5 screen (teacher inputs, 268 experts): where ours is PTQ1_0
+  (same 1.75 bpw) mesh's gate+up error is 1.36x ours (mesh wins 19% of experts), down 0.985x (a tie); vs our Q2_0 /
+  Q3_K 1.8x / 11-16x worse.  Our GPTQ ternary already beats their Hadamard GPTQ ternary at equal bits - no swap.
+- **Prompt speed outlook:** NVMe-bound (file wait 27 of 40 s experts, 20K prompt, 328 tok/s).  One sweep per prompt
+  (batch = prompt, needs the chunk / c_stage buffers sized down so 16K-32K fit VRAM) ~ 500-550 tok/s; ~800 also needs
+  the dense half faster (21.9 s of a 20K prompt).
 - **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
   rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
   for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
