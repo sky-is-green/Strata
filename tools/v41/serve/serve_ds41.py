@@ -214,11 +214,49 @@ def ds41_parse_tool_call(body: str, schema=None):
     return F.ToolCall(name=m.group(1), arguments=args)
 
 
-F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
-F.call_end = ds41_call_end
-F.parse_tool_call = ds41_parse_tool_call
+# The served path TRANSLATES the DSML stream into the XML form the server's parser reads.
+#
+# `serve/frontend.py` detects a call with `_follower` / `_bare_opener` / `call_end` around Qwen's
+# `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`, and a DSML `invoke` is not in that
+# vocabulary.  Measured 2026-10-16 with the three hooks below merely overridden (CALL_START/CALL_END, call_end,
+# parse_tool_call): the DSML call came out as plain content - `tool_calls: null`, the markup in `content`, the tool
+# never ran - because `_follower` looks for `<function=`, `<parameter=` or `{` right after the opener.  Translating
+# keeps every one of that parser's heuristics (code fences, a quoted call, the streamed body) working on the model's
+# own syntax instead of teaching it a second one.
+_DSML = f"<{E.dsml_token}"
+_INVOKE_RE = re.compile(re.escape(INVOKE_OPEN) + r'\s*name="([^"]+)"\s*>')
+_PARAM_RE = re.compile(re.escape(P_OPEN) + r'\s*name="([^"]+)"\s+string="(true|false)"\s*>(.*?)' + re.escape(P_CLOSE),
+                       re.DOTALL)
+_WRAP_RE = re.compile(re.escape(CALLS_OPEN) + r"|" + re.escape(CALLS_CLOSE))
+
+
+def ds41_translate(buf: str) -> str:
+    """DSML -> the XML call form: `<｜DSML｜ invoke name="X">` -> `<tool_call><function=X>`,
+    `<｜DSML｜ parameter name="K" string="b">V</｜DSML｜ parameter>` -> `<parameter=K>V</parameter>`,
+    `</｜DSML｜ invoke>` -> `</function></tool_call>`; the optional `<｜DSML｜ calls>` wrapper is dropped."""
+    buf = _WRAP_RE.sub("", buf)
+    buf = _PARAM_RE.sub(lambda m: "<parameter=" + m.group(1) + ">" + m.group(3) + "</parameter>", buf)
+    buf = _INVOKE_RE.sub(lambda m: "<tool_call>\n<function=" + m.group(1) + ">\n", buf)
+    return buf.replace(INVOKE_CLOSE, "</function>\n</tool_call>")
+
+
+def ds41_hold(buf: str) -> int:
+    """Bytes at the END of `buf` that must not be emitted yet: a `<｜DSML｜` that is still being written (the
+    tokenizer splits it across deltas), or an element whose closing tag has not arrived."""
+    p = buf.rfind(_DSML)
+    if p < 0:
+        return 0
+    tail = buf[p:]
+    if ">" not in tail:
+        return len(buf) - p
+    m = re.match(re.escape(_DSML) + r"\s*(\w+)", tail)
+    # the tag names carry the DSML leading space (E.tool_parameter_tag_name == " parameter"), the regex has eaten it
+    if m and m.group(1) == E.tool_parameter_tag_name.strip() and P_CLOSE not in tail:
+        return len(buf) - p                     # a parameter element whose own close has not arrived
+    return 0
+
+
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
-WRAPPERS = (CALLS_OPEN, CALLS_CLOSE)
 
 
 def _op_init_ds41(self, *a, **k):
@@ -228,13 +266,15 @@ def _op_init_ds41(self, *a, **k):
 
 
 def _strip_wrappers(self, delta: str, final: bool) -> str:
-    """Drop <｜DSML｜ calls> / </｜DSML｜ calls> from the stream, holding a partial one until it is decided."""
+    """Translate the DSML stream for the server's parser, holding back a partial tag or element."""
     buf = self.dsml_hold + delta
-    for w in WRAPPERS:
-        buf = buf.replace(w, "")
-    keep = 0 if final else self._hold(buf, WRAPPERS)
+    # `_hold` covers a suffix that is a PREFIX of one of these tags - an opener split across deltas ("<｜DSML", "｜ in")
+    # and, just as important, a closing tag split the same way (`</｜DSML` + `｜ invok` + `e>`): ds41_hold only sees a
+    # complete `<｜DSML｜` token, so the closers have to be held here (measured: without them the close leaked out raw)
+    tags = (_DSML, INVOKE_CLOSE, P_CLOSE, CALLS_OPEN, CALLS_CLOSE)
+    keep = 0 if final else max(self._hold(buf, tags), ds41_hold(buf))
     self.dsml_hold = buf[len(buf) - keep:] if keep else ""
-    return buf[:len(buf) - keep] if keep else buf
+    return ds41_translate(buf[:len(buf) - keep] if keep else buf)
 
 
 def _op_feed_ds41(self, delta: str):

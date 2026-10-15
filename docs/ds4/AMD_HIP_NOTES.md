@@ -299,6 +299,23 @@ For reference, the expert cache's own slope on one card: `--slots 1200` 19.30 to
 - **A last tuning batch not run**: `STRATA_D3_PF`, `--prefill-chunk`, `STRATA_TIER_GRAPH` on the fused build (the
   earlier runs of the same knobs on the stock build were inside the noise).
 
+### Tool calls over the local server (fixed 2026-10-16)
+
+The model speaks DeepSeek's own DSML (`<｜DSML｜ invoke name="X">` + `<｜DSML｜ parameter name="K" string="true|false">V<...>`);
+Strata's `serve/frontend.py` only knows Qwen's XML call form. Overriding `CALL_START`/`CALL_END`, `call_end` and
+`parse_tool_call` (what the shim did) is not enough: `frontend.py`'s `_follower` gate looks for `<function=`,
+`<parameter=` or `{` right after the opener, so a DSML call was rejected as prose and left in `content` -
+`tool_calls: null`, the client ran nothing. Seen on a real harness session: 488 tool calls through
+`llama-cpp/Qwen3.8-Flash-Next` had worked, the one turn on this model produced a raw DSML block instead.
+
+`serve_ds41.py` now **translates the stream** (`ds41_translate`: DSML -> `<tool_call><function=NAME><parameter=K>V`),
+holding back a partial tag or element (including a closing tag split across deltas - that one leaked raw until the
+hold covered `</｜DSML｜ invoke`), which keeps every heuristic of that parser (code fences, a quoted call, the streamed
+body) working on the model's own syntax. Verified against the running server with an OpenAI client: non-streaming
+`finish_reason: tool_calls` with the parsed arguments, streaming a `tool_calls` delta in the SSE chunks, whole and
+byte-split streams, `string="false"` values typed (`30`, not `"30"`), two calls in one reply, and a quoted call
+inside a code fence stays text.
+
 ## API server (256K context)
 
 ```sh
