@@ -3,6 +3,32 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-15 ~17:30 (session 13b) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
+deepseek4:main - pushing is OK'd).  READ FIRST: docs/ds4/V41_START_HERE.md block "Session 13b", then
+docs/ds4/V41_NEXT_PREFILL_TERNARY.md.
+
+1. Check the unattended batch: cat ~/AI/v41-dev/s13/run3.out (logs in ~/AI/v41-dev/s13/run3/).  It built park/unpark
+   into build-ds4-dspark, ran the PARK GATE (must print "continuation tokens IDENTICAL"; the B:1 log must show
+   "unparked"), the --prompt-batch 8192/16384/32768 sweep on a 20K prompt, and the meshapplied ternary screen
+   (layers 0, 5).
+2. If the park gate is IDENTICAL: rebuild production (ninja -C build-ds4-gpu ds41_generate, no engine running), commit,
+   tell Mal to restart strata-ds41-quetza.  It removes the 70 s re-read after every Quetza side call.
+3. Prompt speed (Mal's goal: ~800 tok/s like sybil-solutions/dsv41-flash-offload): adopt the best --prompt-batch in
+   tools/v41/serve/strata-ds41.json if it fits VRAM and wins; then A2 (keep the VRAM expert cache through small batch
+   turns: "experts 0 hit" + "cache open" in every batch turn) and A0's chunk-prof reading (NVMe vs PCIe bound).
+4. Ternary: read mesh_screen summary - mesh better than ours where ours is PTQ1_0 -> plan B2 (engine class with
+   rotated activations); otherwise park it.
+5. Brand: Mal reviews docs/brand/out/ (Xolotl) - do not rename / push brand files without his go.
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ...; --serve through ds41-engine.sh /
+taskeval/engine.sh (flock + scope).  >= 75 GB MemAvailable.  Kill by exact PID.  Never rebuild a build dir a run
+launches from.  Gate on VRAM used (>= 2 GB) not "any compute app" (a foreign Chrome holds a CUDA context).  A/Bs
+need >= 3 runs a side (spread 1.5-4.3%).  After a reboot: udisksctl mount -b /dev/nvme0n1p3 -t ntfs3.
+```
+
 ## RESUME PROMPT 2026-10-15 ~17:00 (end of session 13) - paste the block below into a new session
 
 ```

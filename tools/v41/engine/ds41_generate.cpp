@@ -999,6 +999,19 @@ int main(int argc, char ** argv) {
         int snap_len = -1;
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         int n_req = 0;
+        // STRATA_SERVE_PARK (default on): an agent harness sends short UNRELATED requests between the turns of its main
+        // conversation (titles, summaries).  Each wrote its own positions from 0 over the main conversation's caches, so
+        // the next main turn re-read the whole prompt (2026-10-15 harness: a 454-token side call -> the 20,736-token
+        // system prompt again, 69.5 s).  Now the main conversation is parked (Ds41Dense::park: the snapshot rings + the
+        // rows the side request can write, to host memory) and unparked when a request continues it.
+        // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
+        // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
+        const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
+        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
+        const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
+        std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
+        std::vector<float> park_logits;
+        int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
@@ -1050,8 +1063,27 @@ int main(int argc, char ** argv) {
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            bool unparked = false;
+            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
+                size_t lp = 0;
+                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
+                if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation\n", park_hist.size());
+                    hist = park_hist;
+                    snap_len = (int) park_hist.size();
+                    snap_logits = park_logits;
+                    lcp = lp;
+                    unparked = true;   // the live rings are the side request's: resume through restore()
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;     // DSpark's window holds the side request's states
+#endif
+                } else if ((int64_t) ids.size() + std::max(0, max_new) > park_rows) {
+                    dense.drop_park();   // this request writes past the saved rows
+                    std::fprintf(stderr, "serve: park dropped (request reaches past %lld positions)\n", (long long) park_rows);
+                }
+            }
             int reused = 0;
-            if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+            if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
@@ -1060,6 +1092,15 @@ int main(int argc, char ** argv) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
             } else {
+                // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
+                const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
+                if (park_on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
+                    && dense.park(rows)) {
+                    park_hist.assign(hist.begin(), hist.begin() + snap_len);
+                    park_logits = snap_logits;
+                    park_rows = rows;
+                    std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
+                }
                 hist.clear();
                 snap_len = -1;
             }

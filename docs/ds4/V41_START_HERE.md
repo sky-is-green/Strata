@@ -256,6 +256,38 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   harnesses' `gpu_busy()` ("any compute app") never clears - gate on VRAM used (>= 2 GB = busy) or on
   `pgrep -x ds41_generate`.
 
+### Session 13b (2026-10-15 17:00-) - real-harness findings, PARK/UNPARK, prompt + ternary + brand prep
+**Read this block first.**  Mal ran a real Quetza session on the production wrapper; full numbers + the plan in
+[V41_NEXT_PREFILL_TERNARY.md](V41_NEXT_PREFILL_TERNARY.md).  Then:
+- **Side requests destroyed the conversation cache (FIXED in code, gate pending).**  A 454-token Quetza side call
+  between main turns wrote positions 0..453 over the main conversation's position-indexed caches (`comp` compressed KV,
+  `idxk` indexer keys) and its snapshot rings, so the next main turn re-read the whole 20,736-token system prompt:
+  **69.5 s** each time.  `Ds41Dense::park(n) / unpark() / drop_park()` (host copies of the snapshot rings + rows
+  [0, n] and the spare row of every `comp` / `idxk`) + the serve loop: an unrelated request parks a conversation of >=
+  `STRATA_SERVE_PARK_MIN` (2048) tokens if prompt + max tokens <= `STRATA_SERVE_PARK_MAX` (65536 positions, ~1 GB
+  host); a later request that continues the parked tokens unparks it (resumes through restore(), DSpark window reset);
+  a request writing past the saved rows drops the park.  `STRATA_SERVE_PARK=0` = old behaviour.  Logs: `serve: parked
+  the N-token conversation`, `serve: unparked ...`.  **Gate + timing in `~/AI/v41-dev/s13/run3.sh`** (exact routing:
+  main 8K -> continuation, vs main 8K -> unrelated side request -> the same continuation: tokens must be IDENTICAL;
+  and the continuation's prompt time with park on / off).  Production build-ds4-gpu is NOT rebuilt with it yet - do
+  that (and restart the wrapper) only after the gate says IDENTICAL.
+- **Prompt path:** run3 also sweeps `--prompt-batch 8192 / 16384 / 32768` on a 20,480-token one-shot prompt with
+  `MIMO_CHUNK_PROF=1` (2 runs each): 1 sweep instead of 3 is the cheapest step toward sybil's 800 tok/s.  If 16384 /
+  32768 fit and win, set it in `tools/v41/serve/strata-ds41.json` (`--prompt-batch`) - note the serve default batch is
+  the engine's 8192 today.  Next code step after that: keep the VRAM expert cache through small batch turns (A2 in the
+  plan doc - the log says `experts 0 hit` and `cache open` up to 4.3 s on every batch turn).
+- **meshapplied ternary:** run3 downloads layers 0 + 5 (7 GB, /media/mal/NVME1TB/mesh-ternary), runs `mesh_pack.py
+  check` (lossless PTQ1_0 repack + rotation algebra) and `mesh_screen.py layer 5 / 0` + `summary` (ours vs mesh per
+  type).  mesh_screen has never run: if it fails, the likely spots are the hook's use of model.py's Expert (`w1/w3/w2`)
+  and C.K.dequant_fp4_weight - same calls as v41_calib.screen_expert.
+- **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
+  rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
+  for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
+  `docs/brand/out/` (picks: logo.2, wordmark-banner.2, hero.2, tiers.2, axolotl.2, twins.1).  Mal reviews before any
+  rename; the brand files are deliberately NOT pushed yet.
+- Real-harness decode 16-27 tok/s (2.1-3.3 tokens/pass on thinking text); a 66-token tool result 7.3 s; 1.2-2.2K-token
+  results 17-23 s (the per-batch expert sweep floor ~12-15 s); a 10K one 46 s.
+
 ### Session 13 (2026-10-15 15:00-17:00) - the three levers CLOSED by trace replay (no engine change pays)
 **Read this block first.**  Mal's pick (session 12): in-pass draft pruning, a smarter VRAM policy than LRU, the VMM
 refactor.  Method: instead of building each one, record the verify passes' routing once and replay it offline -

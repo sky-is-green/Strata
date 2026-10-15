@@ -157,6 +157,9 @@ struct Ds41Dense::Impl {
         ggml_tensor * rbias = nullptr;    // F32 [NE]        selection-only routing bias (set_route_bias), 0 = model routing
     };
     int snap_pos = -1;
+    struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; };
+    std::vector<ParkedRows> parked;     // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites
+    int parked_pos = -1;
     std::vector<Layer> ly;
 
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
@@ -1623,6 +1626,50 @@ bool Ds41Dense::restore() {
 }
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
+
+bool Ds41Dense::park(int64_t positions) {
+    Impl & im = *p_;
+    if (im.snap_pos < 0 || positions < 1) return false;
+    ggml_backend_synchronize(im.backend);
+    im.parked.clear();
+    auto put = [&](ggml_tensor * t, size_t off, size_t n) {
+        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
+        ggml_backend_tensor_get(t, r.b.data(), off, n);
+        im.parked.push_back(std::move(r));
+    };
+    for (auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) put(t, 0, ggml_nbytes(t));
+        for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
+            if (!t) continue;
+            const int64_t rows = t->ne[1];
+            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
+            put(t, 0, (size_t) n * t->nb[1]);
+            put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
+        }
+    }
+    im.parked_pos = im.snap_pos;
+    return true;
+}
+
+bool Ds41Dense::unpark() {
+    Impl & im = *p_;
+    if (im.parked_pos < 0) return false;
+    ggml_backend_synchronize(im.backend);
+    for (auto & r : im.parked) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = im.parked_pos;
+    drop_park();
+    return true;
+}
+
+void Ds41Dense::drop_park() {
+    p_->parked.clear();
+    p_->parked.shrink_to_fit();
+    p_->parked_pos = -1;
+}
+
+bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
 
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;
