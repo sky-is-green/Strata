@@ -102,7 +102,7 @@ class MeshLayer:
         for K, s in self.signs.items():
             if len(s) != block_of(K) or not np.all(np.abs(s) == 1):
                 raise ValueError(f"signs.{K}: {len(s)} values, expected +-1 x {block_of(K)}")
-        self.ternary = sorted({int(k.split(".")[3]) for k in keys if k.startswith(f"layers.{layer}.ffn.experts.")})
+        self.ternary = sorted({int(k.split(".")[4]) for k in keys if k.startswith(f"layers.{layer}.ffn.experts.")})
 
     def has(self, e: int) -> bool:
         return e in self.ternary

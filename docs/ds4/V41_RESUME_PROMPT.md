@@ -11,7 +11,8 @@ deepseek4:main - pushing is OK'd).  READ FIRST: docs/ds4/V41_START_HERE.md block
 docs/ds4/V41_NEXT_PREFILL_TERNARY.md.
 
 1. Check the unattended batches: cat ~/AI/v41-dev/s13/run3.out (prompt-batch sweep + ternary screen) and
-   ~/AI/v41-dev/s13/run3b.out (the PARK GATE - run3's own gate failed on a wrong driver path; logs in ~/AI/v41-dev/s13/run3/).  It built park/unpark
+   ~/AI/v41-dev/s13/run3b.out (the PARK GATE) and run3c.out (mesh screen L5).  KNOWN: prompt path NVMe-bound (file wait
+   27 of 40 s experts on a 20K prompt, 328 tok/s); --prompt-batch 16384/32768 OOM (needs buffer sizing).  (park gate: - run3's own gate failed on a wrong driver path; logs in ~/AI/v41-dev/s13/run3/).  It built park/unpark
    into build-ds4-dspark, ran the PARK GATE (must print "continuation tokens IDENTICAL"; the B:1 log must show
    "unparked"), the --prompt-batch 8192/16384/32768 sweep on a 20K prompt, and the meshapplied ternary screen
    (layers 0, 5).

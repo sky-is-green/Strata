@@ -280,6 +280,14 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   check` (lossless PTQ1_0 repack + rotation algebra) and `mesh_screen.py layer 5 / 0` + `summary` (ours vs mesh per
   type).  mesh_screen has never run: if it fails, the likely spots are the hook's use of model.py's Expert (`w1/w3/w2`)
   and C.K.dequant_fp4_weight - same calls as v41_calib.screen_expert.
+- **RESULTS (run3, 17:09-17:22):** (a) **the prompt path is NVMe-bound** - 20,480-token one-shot at batch 8192: 62.35 s
+  = 328.5 tok/s, experts 40.4 s of which **file wait 27.0 s** (chunk prof: reader wall 35.8 s, GPU grouped kernels
+  0.4 s).  So the road to ~800 tok/s is the file tier (bytes per sweep, read pattern, overlap), not PCIe or kernels.
+  (b) `--prompt-batch 16384` OOMs (a 1.42 GiB alloc) and 32768 OOMs in `c_stage`: bigger batches need the chunk /
+  stage buffers sized down (or the VRAM expert cache kept out), not just the flag.  (c) mesh: `mesh_pack.py check`
+  PASSES on layer 5 (381 of 384 experts ternary; rotation verified; PTQ1_0 repack lossless); layer 0 has a manifest
+  but no layer file (FP4 upstream); the screen is re-queued as `~/AI/v41-dev/s13/run3c.sh` -> run3c.out (layer 5).
+  Park gate rerun: run3b.out.
 - **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
   rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
   for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
