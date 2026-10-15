@@ -158,6 +158,27 @@ kernel costs ~10% on the prompt path (the vector kernel instead of the f16 MMA o
 more than the 0.37 GiB. 4-bit is out of the question both for quality and because the attention kernels for it are not
 in this ggml tree.
 
+## Tuning on one card (measured with `local/bench_ds41.py`, medians of 3-4 runs)
+
+The bench runs configurations round robin and reports medians, because a single run on this box is worth nothing:
+decode varies with the *content* DSpark drafts (accepted drafts per pass change how many tokens one verify buys, and
+the same prompt can land on a different stream at a tie). Spreads of 25.2 / 27.2 / 24.9 and 26.3 / 23.8 / 16.0 tok/s
+were measured for **the same** configuration.
+
+| Knob | Result |
+| --- | --- |
+| `--arena-gib 60 -> 75` | **+40% decode** (16.4-17.4 -> 23.8-25.2 tok/s), file wait on the prompt 16.6 -> 11.0 s. Consistently reproduced in four batches. 80 GiB was worse (20.9-21.8) and unstable, 85 bimodal (22.4/14.3/14.3), 95-100 left the box at 5 GiB of RAM available; 75 is the adopted value |
+| `--arena-gib` sweep 60/65/70/75 | 16.4 / 21.7 / 18.6 / 24.7 - not monotonic (the arena holds a different ranked head at each size, and the page cache left for the Engram tables changes with it) |
+| `STRATA_ENGRAM_CACHE_ROWS=20000000` (in-process row cache, default 2M) | neutral: 16.7 / 23.8 vs 17.4 / 24.1 without |
+| `--pcie 1.0` (every miss to the CPU pool) | neutral (24.7 vs 25.2) |
+| `--route-bias-file 1.5` (routing avoids the file tier: the miss-free ceiling) | tier per pass 634.6 -> 604.3 ms only, decode 23.0 vs 25.2 - **the tier is not dominated by the misses** but by the resident-expert kernels; it also changes the answer |
+| `STRATA_PROM=1` (prompt-batch expert kernels) | neutral on decode (23.7 vs 23.8), worse on the prompt (43.1 vs 52.4 tok/s) |
+| `STRATA_DSPARK_DEPTH=5` | 4.364 tokens/pass but a 160.7 ms verify vs 3.692 / 128.8 at depth 4: net neutral (25.4 vs 25.2); depth 6 is refused by design (1..5) |
+| `--vram-margin 0.25`, `--pf-b 2.0`, `--pcie 0.50`, `--pcie 0.85` | inside the noise |
+
+Adopted: `--arena-gib 75`, `--kv-q8`, `--ctx 262144`, Engram from two drives, DSpark depth 4 with the 64-expert
+prune and no confidence trim, `--slots auto`.
+
 ## DSpark on this box (the draft stack runs on HIP)
 
 The Q2_K sidecar loads as a HIP graph (`2.91 GB of weights on the card` with the 64-experts-per-layer prune, 5.14 GB

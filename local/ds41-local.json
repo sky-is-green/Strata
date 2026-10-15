@@ -21,7 +21,7 @@
   "--prompt-batch",
   "2048",
   "--arena-gib",
-  "60"
+  "75"
  ],
  "env": {
   "STRATA_NO_LARGEPAGES": "1",
