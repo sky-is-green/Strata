@@ -23,7 +23,8 @@ Q3_K = 2.25 bpw; dense Q8_0) on **one RTX 4090 24 GB + Ryzen 7 5700X + 90 GB DDR
 | Head gate vs FP8 teacher (held-out) | ppl 5.645 vs 4.915, top-1 0.674 vs 0.701 |
 | DSpark (offline harness, fixed) | **OUR engine states: 3.27 accepted drafts/pass = 4.27 tokens/pass** (378 steps; 43% full 5-blocks; first draft 88.6%; confidence calibrated 23/61/91/99%); teacher states 3.24 / 4.24 - our 2-bit drift costs nothing. By verify depth 1..5: 1.89 / 2.65 / 3.29 / 3.83 / 4.27 tokens/pass |
 | Our hidden states vs teacher at layers 37-39 (exact routing, 639 tokens) | cosine **0.876-0.879** (large drift) |
-| Vision / DSpark in the engine | **NOT implemented** (weights exported in the sidecar only) |
+| DSpark in the engine | **IMPLEMENTED and the `--serve` default** (`STRATA_SERVE_DSPARK`, sidecar Q2_K, depth 4, KEEP 64, conf 0.6): draft+verify passes with exact speculative sampling.  In live traffic 2.1-3.3 tokens/pass (e.g. "DSpark 88 passes, 2.90 tokens/pass"); the 4.27/pass figure above is the offline harness at depth 4 |
+| Vision in the engine | **NOT implemented** (weights exported in the sidecar only) |
 
 ## 3. Per-token decode budget (37.5 ms; `STRATA_DEC_PROF=1` phase timer + nsys node trace)
 - `attn_router` **17.8 ms** = the dense CUDA graph per layer (15.2) + router graph (1.1) + readback.  Inside: dense
