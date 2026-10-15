@@ -779,9 +779,28 @@ int main(int argc, char ** argv) {
         ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
         seed_free = fr / 1073741824.0;
         seed_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
-        tier.set_slot_gib(a.slots > 0 ? 0.0 : seed_gib);
+        // A slot budget of 0 is the tier's "NO LIMIT" (--slots given: the ranked head, up to `slots` experts).  The
+        // AUTO path passed it too whenever the card had no room (`free <= margin` clamps seed_gib to 0) - and "no
+        // limit" there asked for the WHOLE model's experts: s13 run8 hit exactly that (142.38 GiB requested, 0.53
+        // GiB free -> "VRAM seed failed" -> HTTP 400).  With no usable room the cache stays SHUT for this seed and
+        // the arena + file tier serve every miss: a slower decode, never a failed request.
+        const double min_gib = 1.0;   // below this the admission traffic is not worth the slots
+        const bool explicit_slots = a.slots > 0;
+        const bool cache_room = explicit_slots || seed_gib >= min_gib;
+        tier.set_cache_enabled(cache_room);
+        tier.set_slot_gib(explicit_slots ? 0.0 : seed_gib);
+        if (!cache_room) std::fprintf(stderr, "serve: VRAM %.2f GiB free (margin %.2f) - no room for the expert cache, "
+                                             "the arena + file tier serve the decode\n", seed_free, a.vram_margin_gib);
         const double ts = now_ms();
-        if (!tier.seed_from_ranked(ranked, err)) return false;
+        if (!tier.seed_from_ranked(ranked, err)) {
+            // the cache's own allocation is what fails on a busy card (the arena is host RAM and is built first):
+            // one more try with the cache off, so the request still runs
+            if (cache_room) {
+                std::fprintf(stderr, "serve: cache seed failed (%s) - seeding again with the VRAM cache off\n", err.c_str());
+                tier.set_cache_enabled(false);
+                if (!tier.seed_from_ranked(ranked, err)) return false;
+            } else return false;
+        }
         seed_s = (now_ms() - ts) / 1000.0;
         proxy_res.clear();   // the real VRAM set from here on
         bias_now = true;     // decode: route bias + file penalty on
@@ -814,12 +833,49 @@ int main(int argc, char ** argv) {
     };
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
     std::vector<float> bcap_vh;    // [bcap_n][3 * n_embd], as pass_v's vh
+    // the layer-major batch width for THIS turn: PB, clamped per request by the VRAM actually free (the --serve loop
+    // sets it; a one-shot run keeps PB)
+    int pb_cap = PB;
+    // STRATA_VRAM_TRACE=1: every allocation-relevant step prints the free VRAM (debugging a shared card)
+    const bool vram_trace = std::getenv("STRATA_VRAM_TRACE") != nullptr;
+    auto vram_log = [&](const char * where, int a) {
+        if (!vram_trace) return;
+        size_t tf = 0, tt = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+        std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
+    };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
-                const int B = std::min(PB, n - c0);
+                int B = std::min(pb_cap, n - c0);
+                // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
+                // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
+                // desktop's STT server, DSpark's 2.9 GB, the dense half).  A batch that does not fit is retried at
+                // HALF the width (twice the sweeps over the file tier, the same answer) down to SB, so a tight card
+                // makes a prompt slower instead of failing the request (s13 run8: "prefill failed: graph allocation
+                // failed" on a 21K prompt with Whisper's 2.5 GB resident).
+                for (;;) {
+                    if (B > dense.columns()) {
+                        if (dense.set_columns(B)) { if (rdev1) rdev1 = dense.routed_dev(); }
+                        else if (B > SB) {
+                            std::fprintf(stderr, "ds41_generate: %d state columns did not fit (%s) - retrying at %d\n",
+                                         B, dense.last_error().c_str(), std::max(SB, B / 2));
+                            B = std::max(SB, B / 2);
+                            continue;
+                        } else { ferr = dense.last_error(); return false; }
+                    }
+                    if (dense.begin_batch(ids + c0, B, pos0 + c0)) break;
+                    if (B > SB) {
+                        std::fprintf(stderr, "ds41_generate: batch of %d did not fit (%s) - retrying at %d\n",
+                                     B, dense.last_error().c_str(), std::max(SB, B / 2));
+                        B = std::max(SB, B / 2);
+                        continue;
+                    }
+                    ferr = dense.last_error();
+                    return false;
+                }
                 // enc-skip: columns whose global position is before `pos0 + n - ER` are phase A (layers past layer 20
                 // are never read for them), rounded DOWN to a sub-batch boundary so a straddling sub-batch still runs
                 // the full path (more work, never wrong); the last sub-batches holding the final token are always full.
@@ -832,12 +888,8 @@ int main(int argc, char ** argv) {
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
                 }
                 double t0 = now_ms();
-                if (B > dense.columns()) {
-                    if (!dense.set_columns(B)) { ferr = dense.last_error(); return false; }
-                    if (rdev1) rdev1 = dense.routed_dev();
-                }
-                if (!dense.begin_batch(ids + c0, B, pos0 + c0)) { ferr = dense.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
+                    if (l < 4) vram_log("batch layer", l);
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state
                     // a phase-A position would leave past layer 20)
@@ -857,6 +909,7 @@ int main(int argc, char ** argv) {
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
                     // host round trip per layer); CPU / STRATA_ROUTED_HOST=1: through the host as before
                     float * rdev = routed_host ? nullptr : dense.routed_dev();
+                    if (l < 2) vram_log("pre-tier", l);
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
                         const bool ok = rdev ? tier.run_chunk_dev(l, pn, dense.batch_ids() + (size_t) s * top_k,
@@ -1184,6 +1237,30 @@ int main(int argc, char ** argv) {
             static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
             tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
             tail_logits.clear();
+            // VRAM-aware batch width for this turn (feed() halves it again if even this does not fit): the batch's
+            // state columns + graph are ~0.48 MiB a column, and the card is shared with whatever else the desktop
+            // runs.  This is what lets a big --prompt-batch stay OPT-IN: the engine takes what is actually free.
+            pb_cap = PB;
+            if (!by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
+                size_t frb = 0, totb = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &frb, &totb);
+                // The layer-major batch's own VRAM, CALIBRATED on four traced points (STRATA_VRAM_TRACE=1, s13
+                // run9/run13/run14, a 4 GiB foreign process): free 9.28 GiB with B=8192 failed, free 9.26 with
+                // B=5210 passed, free 5.92 with B=2411 failed, a free card with B=8192 passed - all four fit
+                //     need(B) ~= 4.3 GiB + 0.95 MiB * B
+                // 4.3 GiB fixed = the tier's two 1 GiB stage halves + a ~2.19 GiB graph buffer that is the SAME
+                // SIZE at B=2411 and B=8192 (so it is not the piece buffers; identity unconfirmed - see the
+                // residuals in V41_START_HERE).  0.95 MiB a column = columns 0.32 + graph 0.17 + part buffers 0.41,
+                // measured directly.  Per-tensor arithmetic undercounted the tier 2x and let a 2.19 GiB allocation
+                // fail while cudaMemGetInfo still said 6.83 GiB free.  A free card (>= 13 GiB) still gets its full PB.
+                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
+                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                pb_cap = std::min(PB, std::max(SB, fit));
+                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
+                                             frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
+                if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
+                                              frb / 1073741824.0, pb_cap, PB);
+            }
             const double tph0 = now_ms();
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;

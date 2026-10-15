@@ -337,6 +337,51 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
 - Real-harness decode 16-27 tok/s (2.1-3.3 tokens/pass on thinking text); a 66-token tool result 7.3 s; 1.2-2.2K-token
   results 17-23 s (the per-batch expert sweep floor ~12-15 s); a 10K one 46 s.
 
+### Session 13c (2026-10-15 19:40-20:25) - a SHARED card: VRAM-aware batch width, cache seed and chunk stage
+**Read this block first.**  Mal's brief: keep working on prefill and make sure it works in the harness.  This closes
+the item the 13b block left on top - a desktop always has other GPU users (Whisper STT), and the engine FAILED the
+request instead of degrading.
+- **Reproduced first (run10a/run11a: the OLD binary + a foreign process holding 4 GiB of VRAM - Whisper's role):
+  HTTP 400 on the FIRST turn.**  "allocating 2633.44 MiB (12.5 GiB held) / 2193.81 MiB (4 GiB held) on device 0:
+  cudaMalloc failed".  Also reproduced: the seed asking **142.38 GiB** ("ExpertCache: 152881735680 slots x 1 B =
+  142.38 GiB, but only 0.53 GiB of VRAM is free") and "ds4_moe: c_stage: out of memory" (-> HTTP 503).
+- **Three fixes** (tools/v41/engine/ds41_{generate,moe}.{cpp,hpp}, +99/-8; STRATA_VRAM_TRACE=1 is the trace):
+  1. `--serve`: the layer-major batch width is sized from the VRAM actually free (`pb_cap`), and `feed()` retries at
+     HALF the width if a column/graph allocation still does not fit.  The cost model is CALIBRATED on four traced
+     points: `need(B) ~= 4.3 GiB + 0.95 MiB * B` - a free card (>= 13 GiB free) keeps the full `--prompt-batch`, a
+     tight one degrades instead of failing.
+  2. The chunk stage (two `MIMO_CHUNK_STAGE_MIB` halves, 1 GiB each: a hard 2 GiB demand before) is clamped from free
+     VRAM with a 16 MiB floor; `per_half` then gives more, smaller waves.  c_stage can no longer OOM.
+  3. The VRAM cache seed: a slot budget of 0 is the tier's "NO LIMIT", and the AUTO path passed it whenever free <=
+     `--vram-margin` (i.e. on any busy card) - so the seed asked for the whole model's experts.  It now floors/skips
+     the cache (arena + file tier serve the decode) and retries ONCE with the cache off if the seed still fails:
+     never a failed request.  New `Ds41MoeTier::set_cache_enabled()` (`no_cache` had no writer before).
+- **GATE (the real HTTP stack: 3 Quetza-like turns + the s11 smoke, a foreign 4 GiB holder resident throughout):
+  3/3 turns complete, 0 engine errors** (run15, logs ~/AI/v41-dev/s13/run15*) - against HTTP 400 on turn 1 for the
+  same traffic on the old binary.  Turn 1 21,204 tok at the capped B=4281: 105.2 s (201.6 tok/s); turn 2 23,531 tok
+  at B=1114: 265.9 s (88.5 tok/s).  Free card (run9, same binary): 3/3 turns, 0 errors, turn 1 86.8 s at the full
+  B=8192.  The timings are inflated by a load-17..38 box (foreign nvcc + odin + a render): the run establishes
+  correctness, not speed.
+- **Why a narrow batch is expensive (the read-path link):** one layer-major sweep streams the WHOLE file tier of every
+  layer the batch routes through - ~82 GB per 40-layer sweep - so a 20K prompt at 8192 = **157.3 GB in 2 sweeps**
+  (measured, run4's profiler).  A narrower batch = MORE sweeps = more bytes (B=1114 -> 22 sweeps, hence 88 tok/s).
+  The lever is therefore VRAM (batch width), not the SSD.
+- **Residual (UNCONFIRMED identity):** a FIXED **~2.19 GiB** graph allocation appears at batch layer ~2, byte-identical
+  at B=2411 and B=8192 (so it is NOT the piece buffers, which scale with B).  It is why `need()` carries a 4.3 GiB
+  fixed term.  Name it (nsys / a gallocr log) and clamp it -> a wider batch on a busy card.
+- **Below ~5 GiB free a layer-major batch cannot run at all** (4.3 GiB fixed + the columns): that request fails fast
+  at c_stage.  The card's own dense half + KV is ~10.8 GiB, so a 12.5 GiB foreign holder leaves nothing - a sizing
+  limit, not a bug to fix.
+- **Read path, NEXT (Mal's ask: NVMe reads for decode AND prefill).**  The wave reader (`STRATA_WAVE_THREADS` 32 x
+  `STRATA_WAVE_PARTS` 8) does 5.15-5.3 GB/s on the routed experts, vs the O_DIRECT microbench's **6.22 GB/s**
+  (6.75 MiB blobs, 8 parts, 32 threads) and dd's 5.1 GB/s at 16 streams - ~15-20% on the table in the read pattern.
+  The source's own note: the scattered 3 MiB pattern does 4.65 GB/s vs 5.1 for dd streams.  **NEW, built, NOT YET
+  MEASURED: `STRATA_READ_SORTED=1`** issues each wave's parts in FILE-OFFSET order instead of routing order (order
+  only: every blob still lands in its own slot, the launch pairs and the k-ordered sums are untouched, so the gate is
+  token-identical output; `blob_offset()` was added to the blob source).  Also untried at PROMPT size:
+  `STRATA_WAVE_THREADS` 48/64 and `STRATA_WAVE_PARTS` 12/16 (s11 tuned those for small turns only).  Measure on a
+  quiet box (load < 3); build-ds4-dspark already carries the code.
+
 ### Session 13 (2026-10-15 15:00-17:00) - the three levers CLOSED by trace replay (no engine change pays)
 **Read this block first.**  Mal's pick (session 12): in-pass draft pruning, a smarter VRAM policy than LRU, the VMM
 refactor.  Method: instead of building each one, record the verify passes' routing once and replay it offline -

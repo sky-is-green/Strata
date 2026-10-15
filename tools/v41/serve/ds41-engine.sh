@@ -30,8 +30,14 @@ export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
 # region at 1.5 GiB (was 3.0): a 20K prompt 2 sweeps instead of 3, 60.4 -> 53.4 s in serve at 512K (+13%; one-shot
 # 328 -> 382 tok/s).  16384 OOMs (a 1.42 GiB alloc) even at prestage 0.75 - the next step.
 # REVERTED 2026-10-15 19:35: the production harness check OOMed at batch 12288 (the same 1.42 GiB graph buffer) with
-# another process holding 2.5 GB of VRAM - too fragile as a default on a desktop.  Opt in when the GPU is otherwise
-# free: STRATA_PROMPT_BATCH=12288 (adds --prompt-batch) + STRATA_PRESTAGE_GIB=1.5.  Next: pick the batch from free VRAM.
+# another process holding 2.5 GB of VRAM - too fragile as a default on a desktop.
+# FIXED 2026-10-15 20:25 (session 13c): the engine now sizes the layer-major batch from the VRAM ACTUALLY free
+# (ds41_generate.cpp's pb_cap; calibrated need ~= 4.3 GiB + 0.95 MiB a column) and retries at half the width, the
+# chunk stage is clamped from free VRAM, and the expert-cache seed skips/retries instead of failing the request -
+# harness-verified with a foreign 4 GiB holder: 3/3 turns complete, 0 errors (logs ~/AI/v41-dev/s13/run15*).
+# So the opt-in is now SAFE to leave on - a tight card simply gets a narrower batch (that re-reads the file tier once
+# per batch: ~82 GB a sweep, so keep the width as high as the card allows).  Still opt-in because the free-card
+# timing A/B at 12288 has not been re-run on a quiet box.
 [ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
 exec flock "$LOCK" systemd-run --user --scope -q --unit="ds41-serve-$$" -p MemoryMax=84G -p MemorySwapMax=0 \

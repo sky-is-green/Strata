@@ -3,15 +3,24 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
-## RESUME PROMPT 2026-10-15 ~17:30 (session 13b) - paste the block below into a new session
-UPDATE ~17:50: park gate PASSED (IDENTICAL; 8.15 s vs 28.99 s) and production build-ds4-gpu is rebuilt with it;
-meshapplied ternary CLOSED (ours better at equal bits).  Next = prompt speed: size the chunk/c_stage buffers so
---prompt-batch 16384-32768 fits VRAM (one sweep per prompt), then the dense half.
-UPDATE ~19:40 (READ FIRST): production harness check found: Quetza's Whisper STT (2.5 GB VRAM) makes batch 12288
+## RESUME PROMPT 2026-10-15 ~20:25 (session 13c) - paste the block below into a new session
+UPDATE ~20:25 (READ FIRST): the shared-card item is CLOSED and verified in the harness.  A foreign 4 GiB VRAM holder
+(Whisper's role) made the OLD binary answer HTTP 400 on turn 1; the patched engine completes 3/3 turns + the s11 smoke
+with 0 errors (correct, not fast: turn 1 105.2 s at a capped B=4281, turn 2 265.9 s at B=1114).  In: (1) `--serve`
+sizes the layer-major batch from free VRAM (calibrated need ~= 4.3 GiB + 0.95 MiB/col) and retries at half width;
+(2) the chunk stage is clamped from free VRAM (16 MiB floor) - it was a hard 2x1 GiB demand, the 503's cause;
+(3) the cache seed no longer asks 142 GiB when the card is tight (free <= margin made slot_gib 0 = "no limit"): it
+skips the cache, or retries with the cache off.  NEXT, in order: (a) READ PATH - measure STRATA_READ_SORTED=1 (wave
+reads issued in file-offset order instead of routing order; built, not yet measured) and STRATA_WAVE_THREADS/PARTS at
+PROMPT size, on a QUIET box (load < 3; timings from this session are useless, load 17-38), gate = token-identical;
+(b) name the fixed ~2.19 GiB graph buffer that forces the 4.3 GiB fixed term (unconfirmed; nsys) -> wider batch on a
+contended card; (c) 16384/20480 batch - now bounded by `need()`, not by the 1.42 GiB alloc alone.  Logs:
+~/AI/v41-dev/s13/run9..run15*.  Studio/video work is xolotl-video's now (it holds the Xolotl video pass).
+UPDATE ~19:40: production harness check found: Quetza's Whisper STT (2.5 GB VRAM) makes batch 12288
 OOM -> REVERTED to 8192 (12288 opt-in via STRATA_PROMPT_BATCH); even 8192 OOMs on a 2nd long prompt with Whisper
-up -> TOP ITEM: free-VRAM-aware batch sizing + OOM recovery (release cache / shrink / retry) in the serve prompt
-path.  Park did not unpark in the harness (template re-render, see START_HERE) -> resume at the longest common
-prefix below the snapshot.  Do timing A/Bs only on a quiet box (load < 3).
+up -> free-VRAM-aware batch sizing + OOM recovery: DONE in 13c (see the ~20:25 entry).  Park did not unpark in the
+harness (template re-render, see START_HERE) -> resume at the longest common prefix below the snapshot.
+STILL OPEN from 13b: the park/unpark continuation fix (longest common prefix below the snapshot).
 UPDATE ~18:55: production config (DSpark on) confirmed: 20K prompt 66.85 -> 58.44 s (306 -> 350 tok/s).  Next:
 park DSpark weights in host RAM during batch prompts (~5 s of 58), then the 16384 OOM (1.42 GiB alloc), then the read
 pipeline.  Video: ~/AI/xolotl-video (Remotion, 3:20 visual cut, out/xolotl-v1.mp4; `npm run studio` to edit; text

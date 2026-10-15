@@ -1585,6 +1585,12 @@ bool Ds41MoeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_
 
 void Ds41MoeTier::set_slot_gib(double gib) { im_->cfg.slot_gib = gib; }
 
+void Ds41MoeTier::set_cache_enabled(bool on) {
+    if (!im_) return;
+    if (!on && im_->gpu && im_->gpu->cache) return;   // an open cache is release_cache()'s to drop, not a config flip's
+    im_->cfg.no_cache = !on;
+}
+
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
@@ -3741,7 +3747,28 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         const char* mib = std::getenv("MIMO_CHUNK_STAGE_MIB");
         gp.c_half = (int64_t) (mib ? std::atoll(mib) : 1024) * 1048576;
         gp.c_half = std::max<int64_t>(gp.c_half, im.blob);
+        // The stage is a SPEED knob (how many file-tier blobs a chunk streams per wave), not a requirement: size it
+        // from the VRAM that is actually free, so a card shared with other GPU users runs smaller waves instead of
+        // failing the prompt ("ds4_moe: c_stage: out of memory" - s13 run10, 12.5 GiB held by another process, the
+        // prompt answered HTTP 503).  768 MiB stays free for the batch's own columns / graph / part buffers (the
+        // caller caps the batch width from what is left: ds41_generate.cpp's pb_cap).
+        {
+            size_t cfr = 0, ctot = 0;
+            if (cudaMemGetInfo(&cfr, &ctot) == cudaSuccess) {
+                const int64_t room = ((int64_t) cfr - (int64_t) (768LL << 20)) / 2 - (int64_t) (1 << 20);
+                // a hard floor too: a card with less than the reserve left still gets 16 MiB a half (one blob a wave),
+                // never a failed allocation
+                const int64_t floor_b = std::max<int64_t>(im.blob, (int64_t) (16LL << 20));
+                const int64_t half = std::min<int64_t>(gp.c_half, std::max<int64_t>(room, floor_b));
+                if (half < gp.c_half) {
+                    std::fprintf(stderr, "ds4_moe: chunk stage %.0f -> %.0f MiB (%.2f GiB of VRAM free)\n",
+                                 (double) gp.c_half / 1048576.0, (double) half / 1048576.0, (double) cfr / 1073741824.0);
+                    gp.c_half = half;
+                }
+            }
+        }
         if (gp.c_bhalf <= 0) gp.c_bhalf = gp.c_half;   // the pinned bounce halves persist; keep their size
+        else gp.c_bhalf = std::min<int64_t>(gp.c_bhalf, gp.c_half);   // a stage smaller than the bounce would overflow it
         // prestage: one device half holds a whole layer (every expert at the MMQ stride, <= blob + 1 MiB each)
         if (im.cfg.chunk_prestage)
             gp.c_half = std::max<int64_t>(gp.c_half, im.g.n_experts * (im.blob + 1048576));
@@ -4105,6 +4132,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     std::atomic<size_t> rnext{0}, rdone{0};
     std::atomic<double> t_rd_last{0};
     size_t wave_end = 0;   // reads issued for file blobs [0, wave_end)
+    std::vector<size_t> perm;   // STRATA_READ_SORTED: this wave's read order (offset-sorted); lives until the next wave
     std::vector<std::thread> readers;
     double t_file = 0, t_rd0 = 0;
     auto start_wave = [&]() {   // the next `cap` file blobs (their slots must be free: the caller made sure)
@@ -4121,12 +4149,26 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         // s11, +272-token turn (32 threads): parts 1 / 4 / 8 -> 3.60 / 5.02 / 5.29 GB/s, batch 14.25 / 11.17 / 10.68 s,
         // tokens identical (exact routing)
         static const size_t P = (size_t) (std::getenv("STRATA_WAVE_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_WAVE_PARTS")))) : 8);
+        // STRATA_READ_SORTED=1: issue this wave's parts in FILE-OFFSET order instead of routing order.  A layer's routed
+        // experts are laid down in the order the tokens touched them, i.e. scattered over the 152 GB GGUF - the source's
+        // own measurement is 4.65 GB/s scattered vs 5.1 GB/s for plain dd streams on the same file.  ONLY the order of
+        // the preads changes: every blob still lands in its own slot, and the launch pairs and the k-ordered sums are
+        // untouched, so a sorted run must be token-identical to an unsorted one (that is the gate).
+        static const bool read_sorted = std::getenv("STRATA_READ_SORTED") && std::getenv("STRATA_READ_SORTED")[0] == '1';
+        perm.clear();
+        if (read_sorted && w1 > w0) {
+            std::vector<uint64_t> off(w1 - w0);
+            for (size_t k = 0; k < off.size(); ++k) off[k] = im.blobs->blob_offset(layer, order[2][w0 + k]);
+            perm.resize(w1 - w0);
+            for (size_t k = 0; k < perm.size(); ++k) perm[k] = w0 + k;
+            std::sort(perm.begin(), perm.end(), [&off, w0](size_t a, size_t b) { return off[a - w0] < off[b - w0]; });
+        }
         rnext.store(w0 * P);
         const int nth = (int) std::min<size_t>((size_t) wave_threads, (w1 - w0) * P);
         for (int k = 0; k < nth; ++k)
             readers.emplace_back([&, w1]() {
                 for (size_t x; (x = rnext.fetch_add(1)) < w1 * P;) {
-                    const size_t q = x / P;
+                    const size_t q = read_sorted ? perm[x / P - w0] : (x / P);
                     if (P == 1) im.blobs->read(layer, order[2][q], slot_ptr(q));
                     else im.blobs->read_part(layer, order[2][q], (int) (x % P), (int) P, slot_ptr(q));
                     if (P == 1 || pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
@@ -5069,6 +5111,12 @@ void Ds41FileBlobs::read(int64_t layer, int64_t expert, uint8_t* dst) const {
         pread_all(fd_, dst + at, x.off, x.bytes);
         at += x.bytes;
     }
+}
+
+uint64_t Ds41FileBlobs::blob_offset(int64_t layer, int64_t expert) const {
+    Span s[3];
+    spans(layer, expert, s);
+    return s[0].off;
 }
 
 void Ds41FileBlobs::read_part(int64_t layer, int64_t expert, int part, int nparts, uint8_t* dst) const {

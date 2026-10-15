@@ -135,6 +135,9 @@ public:
     virtual size_t blob_bytes() const = 0;
     /// Bytes of one expert blob of layer `l` (`blob_bytes()` unless the formats differ per layer).
     virtual size_t blob_bytes(int64_t l) const { (void) l; return blob_bytes(); }
+    /// The blob's first byte in its file, 0 when the source does not know.  A raw-layout source uses it to issue a
+    /// wave's reads in file-offset order (STRATA_READ_SORTED) instead of routing order.
+    virtual uint64_t blob_offset(int64_t l, int64_t e) const { (void) l; (void) e; return 0; }
     /// Writes one expert's blob into `dst` (blob_bytes() large).
     virtual void read(int64_t layer, int64_t expert, uint8_t* dst) const = 0;
     /// Part `part` of `nparts` of the same blob: bytes [p0, p1) of it into dst + p0 (p0 = blob * part / nparts, 4 KiB
@@ -226,6 +229,8 @@ public:
     const Ds41MoeGeom& geom() const { return g_; }
     /// bytes of expert e of layer l (its class's blob)
     size_t expert_bytes(int64_t l, int64_t e) const;
+    /// the blob's first byte in the GGUF (the first of its 3 spans)
+    uint64_t blob_offset(int64_t l, int64_t e) const override;
     /// The mirror (STRATA_BLOB_MIRROR=<file>, written by `ds41_generate --build-mirror`): packed copies of the coldest
     /// experts on a SECOND drive.  read_part then reads a share of each mirrored blob's parts from it
     /// (STRATA_BLOB_MIRROR_SHARE, default 0.28), so both drives serve one blob at once.  Experts mirrored, 0 = none.
@@ -400,6 +405,9 @@ public:
     bool build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
     /// VRAM slot budget for a cache not opened yet (deferred seed: measured after the prompt freed its buffers)
     void set_slot_gib(double gib);
+    /// Turn the VRAM expert cache on/off for the NEXT seed (off: the arena + file tier serve every miss - slower
+    /// decode, no VRAM).  An ALREADY OPEN cache is not dropped by this; release_cache() does that.
+    void set_cache_enabled(bool on);
 
     /// Ranks every (layer, expert) by routing frequency over the TRAIN half of a `ds4routes.bin` file
     /// (alternating 512-token blocks - the split `tools/ds4/route_skew.py` scores with), builds the host arena
