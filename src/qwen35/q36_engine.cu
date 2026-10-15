@@ -1282,6 +1282,15 @@ struct Engine {
     double t_step_ms = 0, t_cls_ms[kTimeCls] = {};
     long long t_steps = 0;
     bool use_graph = true;
+    // The drafter's training pairs, dumped off this box's own decode path: (the hidden at pos - 1, the token this
+    // step processes, the token the engine chose from it, pos).  moe/mtp_release_train.py's convention exactly, so
+    // the head can train on the engine's hiddens and its own greedy - llama.cpp's probes are a different numerical
+    // realization of the same model and a head fitted to those loses ~20 acceptance points at runtime.
+    // Opt-in, measurement/training only: STRATA_Q36_MTP_PROBE=<file>.  A pos jump marks a prompt, so the
+    // assembler can cut windows where a request ended.
+    std::FILE* mtp_probe = nullptr;
+    float* probe_h = nullptr;
+    long long probe_n = 0;
     // The ablation arm (measurement only: the outputs change, the node costs are read off the step).  Each flag
     // drops one correction / router node (or swaps top-k for a trivial fill) so the graph replay's difference to
     // the full arm is that node's own cost.
@@ -1377,6 +1386,13 @@ struct Engine {
         corr_x16 = dalloc_t<uint16_t>(std::min<size_t>(T, (size_t) strata::kernels::kLoraCorrRoundRows) * N);
         corr_t16 = dalloc_t<uint16_t>(T * (size_t) strata::kernels::kLoraCorrMaxRank);
         time_decode = std::getenv("STRATA_Q36_DECODE_TIME") != nullptr;
+        if (const char* pf = std::getenv("STRATA_Q36_MTP_PROBE")) {
+            mtp_probe = std::fopen(pf, "wb");
+            if (!mtp_probe) {
+                std::fprintf(stderr, "strata-q36: cannot write the MTP probe %s\n", pf);
+                std::exit(1);
+            }
+        }
         skip_xa = std::getenv("STRATA_Q36_SKIP_XA") != nullptr;   // the out correction's A pass
         skip_xb = std::getenv("STRATA_Q36_SKIP_XB") != nullptr;   // ... its B pass
         skip_ma = std::getenv("STRATA_Q36_SKIP_MA") != nullptr;   // the mixed pair's A (the MoE and router deltas)
@@ -2292,6 +2308,7 @@ struct Engine {
                 }
             }
             rows_deferred = false;
+            if (mtp_probe && !warming) mtp_probe_dump(toks[0], hlast);
             CK(cudaMemcpyAsync(hlast, hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             pos += 1;
             after_rows(1);
@@ -2460,6 +2477,21 @@ struct Engine {
         CK(cudaMemcpyAsync(hpin + 2, pick, 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         return hpin[2];
+    }
+    /// One drafter training record (see mtp_probe): the hidden this step was seeded from, the token it processed and
+    /// the token the engine's own head chose from that row.
+    void mtp_probe_dump(int32_t tok, const float* h) {
+        const int N = (int) m->g.n_embd;
+        if (!probe_h) probe_h = (float*) std::malloc((size_t) N * 4);
+        int32_t rec[2] = {tok, 0};
+        const int64_t at = pos;
+        CK(cudaMemcpyAsync(probe_h, h, (size_t) N * 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(rec + 1, pick, 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        std::fwrite(probe_h, 4, (size_t) N, mtp_probe);
+        std::fwrite(rec, 4, 2, mtp_probe);
+        std::fwrite(&at, 8, 1, mtp_probe);
+        if (++probe_n % 128 == 0) std::fflush(mtp_probe);
     }
     void host_logits(std::vector<float>& out) {
         out.resize((size_t) m->g.n_vocab);
