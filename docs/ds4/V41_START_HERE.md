@@ -346,8 +346,12 @@ request instead of degrading.
   so an unrelated side call threw the whole cache away (run15 turn 2: 23,531 tokens re-read in **265.9 s**,
   `reused=0`).  New logging says exactly why: `lp=21165` of a 21,166-token park, i.e. the chat template re-renders
   ONE token (the 13b block's hypothesis, now measured).  A partial unpark restores the park and re-feeds from `lp`:
-  **run19 turn 2 = 24.7 s with 21,165 tokens reused (2,326 fed), 0 errors** - 10.8x faster, on the commonest agent
-  pattern there is (a tool result continuing a long conversation).  `STRATA_SERVE_PARK_PARTIAL=0` = old behaviour.
+  **run19 turn 2 reused 21,165 tokens (2,326 fed), 0 errors**, on the commonest agent pattern there is (a tool result
+  continuing a long conversation).  `STRATA_SERVE_PARK_PARTIAL=0` = old behaviour.
+  CAVEAT on the timing: run15's 265.9 s for that same turn was measured at a CAPPED batch 1114 on a loaded box, and
+  run19's 24.7 s at batch 5837 on a quiet one - so the wall-clock delta (10.8x) is NOT a clean measure of this fix.
+  The proof is the mechanism: `reused=0` before, `reused=21165` after, i.e. a 23,531-token prompt became 2,326 tokens
+  of prefill.  A like-for-like timing needs both arms on the same box at the same width.
   The reuse log now prints `park= lp=` too.  Gate: `~/AI/v41-dev/s13/run19*`.
 - **Reproduced first (run10a/run11a: the OLD binary + a foreign process holding 4 GiB of VRAM - Whisper's role):
   HTTP 400 on the FIRST turn.**  "allocating 2633.44 MiB (12.5 GiB held) / 2193.81 MiB (4 GiB held) on device 0:
