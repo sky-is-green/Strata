@@ -26,10 +26,13 @@ export STRATA_SERVE_DSPARK="${STRATA_SERVE_DSPARK-$DSPARK_SIDECAR}"
 export STRATA_DSPARK_KEEP="${STRATA_DSPARK_KEEP:-$PWD/tools/v41/serve/dspark_expert_counts.txt:64}"
 export STRATA_DSPARK_DEPTH="${STRATA_DSPARK_DEPTH:-4}"
 export STRATA_DSPARK_CONF="${STRATA_DSPARK_CONF:-0.6}"
-# prompt speed (s13 run4/run5, 2026-10-15): --prompt-batch 12288 (strata-ds41.json) fits only with the chunk prestage
+# prompt speed (s13 run4/run5, 2026-10-15): --prompt-batch 12288 fits only with the chunk prestage
 # region at 1.5 GiB (was 3.0): a 20K prompt 2 sweeps instead of 3, 60.4 -> 53.4 s in serve at 512K (+13%; one-shot
 # 328 -> 382 tok/s).  16384 OOMs (a 1.42 GiB alloc) even at prestage 0.75 - the next step.
-export STRATA_PRESTAGE_GIB="${STRATA_PRESTAGE_GIB:-1.5}"
+# REVERTED 2026-10-15 19:35: the production harness check OOMed at batch 12288 (the same 1.42 GiB graph buffer) with
+# another process holding 2.5 GB of VRAM - too fragile as a default on a desktop.  Opt in when the GPU is otherwise
+# free: STRATA_PROMPT_BATCH=12288 (adds --prompt-batch) + STRATA_PRESTAGE_GIB=1.5.  Next: pick the batch from free VRAM.
+[ -n "${STRATA_PROMPT_BATCH:-}" ] && set -- "$@" --prompt-batch "$STRATA_PROMPT_BATCH"
 [ -z "$STRATA_SERVE_DSPARK" ] && unset STRATA_SERVE_DSPARK
 exec flock "$LOCK" systemd-run --user --scope -q --unit="ds41-serve-$$" -p MemoryMax=84G -p MemorySwapMax=0 \
     "$PWD/build-ds4-gpu/ds41_generate" "$@"

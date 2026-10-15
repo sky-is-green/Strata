@@ -22,9 +22,7 @@
   "--route-bias-file",
   "0.3",
   "--arena-gib",
-  "64",
-  "--prompt-batch",
-  "12288"
+  "64"
  ],
  "cwd": "/home/mal/AI/Strata-DS4",
  "tokenizer": "/media/mal/SSD NVME/AI/V41-GSQ/tokenizer",

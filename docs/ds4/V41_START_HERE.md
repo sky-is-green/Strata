@@ -312,6 +312,23 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   serve at the no-DSpark speed; (2) find the 1.42 GiB cudaMalloc that OOMs batch 16384 (it OOMs WITHOUT DSpark too -
   likely the dense graph's compute buffer or chunk c_parts at width 16384; ~89 KiB a column); (3) the read pipeline
   (file wait ~20 s of the 54 s).
+- **PRODUCTION HARNESS CHECK (run8, 19:30, the real HTTP stack) - three findings, batch 12288 REVERTED:**
+  (1) **VRAM: Quetza's Whisper STT server (`quetza-stt-whisper --port 5101`, 2.5 GB VRAM) shares the card.**  With it
+  up, batch 12288 OOMs (the 1.42 GiB graph buffer) -> production is back on 8192 / prestage default; 12288 is opt-in
+  (`STRATA_PROMPT_BATCH=12288 STRATA_PRESTAGE_GIB=1.5 strata-ds41-quetza` when the GPU is otherwise free).  Worse:
+  even at 8192 a SECOND long prompt OOMed (612 MiB) after DSpark + the VRAM cache were seeded while Whisper sat on the
+  card -> the engine must size from free VRAM at prompt time and survive an OOM (release the expert cache / shrink
+  the batch and retry) instead of failing the request (the server answered HTTP 400).  This is the top robustness
+  item: a desktop always has other GPU users.
+  (2) **Park did NOT unpark in this harness:** "parked the 21349-token conversation", then the continuation (23,606
+  tokens) had no exact 21,349-token prefix match, so it re-read everything.  Likely cause: the chat template re-renders
+  the end of turn 1 differently once the assistant turn exists (generation prefix / thinking tags), so a snapshot at
+  the prompt end is not a prefix of the next prompt.  In Mal's live session normal turn-to-turn reuse DID work
+  (lcp >= snap), and run8's assistant content was empty (200 max tokens all spent thinking), so it may be the
+  harness - check a real Quetza session's log for "unparked".  Robust fix: resume at the longest common prefix even
+  when it is BELOW the snapshot (positional caches allow it; re-feed the last window's tokens to rebuild the ring).
+  (3) Timing A/Bs from 19:15 on are invalid: load average 18-23 (other jobs + video renders) - run7's prefetch test
+  is inconclusive (and its 2 x 2.71 GiB pinned slabs got the engine memguard-killed under RAM pressure).
 - **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
   rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
   for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
