@@ -1,7 +1,31 @@
-# V4.1 on two GPUs: a peer expert tier (design)
+# V4.1 on two GPUs: a peer expert tier - implemented, measured, and NOT worth it
 
-Status: **design written, not implemented.** The measurements below are what sizes it; the single-GPU numbers are in
-`AMD_HIP_NOTES.md`.
+Status: **implemented and measured, negative result.** The code is not in the tree; it is saved as
+`local/peer-tier-attempt.patch` (901 lines) if the situation ever changes. The measurements that size it, and the one
+that kills it, are below; the single-GPU numbers are in `AMD_HIP_NOTES.md`.
+
+## The result
+
+| | decode tok/s (3 reps, round robin, no DSpark) | prompt tok/s |
+| --- | --- | --- |
+| without `--peer-device` | 12.6 [12.6 7.9 13.9] | 14.2 |
+| with `--peer-device 1` | 11.8 [12.7 11.4 11.8] | 15.7 |
+
+The implementation was correct: the peer took **91.5 routed rows per token** (~35% of the 258 rows a token routes)
+off card 0 (its hits went 10959 -> 6713, every other counter identical), the tokens were **identical** with the peer
+on and off, and with `STRATA_PEER_CHECK=1` (card 0 also computes the peer's rows and compares) **4299/4299 rows were
+bit-identical** - the kernels and the q8_1 activations really are the same on both cards.
+
+It still lost ~5%, because of where the time is:
+
+```
+STRATA_DEC_PROF=1, 64 steps, no DSpark, ms/token:
+begin 5.49 · predict 0.38 · attn_router 51.70 · tier 19.44 · finish 5.77   (12.1 tok/s)
+```
+
+The expert tier is **23%** of a decode step; the dense half (`attn_router`) is **63%**. A peer that removes 35% of
+the tier removes ~3% of the step and pays a per-layer hand-off (activation upload, metadata, an event and a wait,
+per-row copies) on ~40 layers a token. No amount of store tuning changes that arithmetic.
 
 ## Why
 
@@ -87,10 +111,16 @@ objects, so this reuses code rather than inventing a protocol.
   goes through pinned host memory (one D2H 20 KB/expert, one H2D), which costs ~2x20 KB per expert at ~10 GB/s, i.e.
   microseconds, and works on any topology. `cudaMemcpyPeerAsync` can replace it later if it turns out to be a win.
 
-## Order of work
+## What was left out of the attempt
 
-1. `--peer-device N` + the `Peer` struct + activation/metadata staging, taking the `cpu_keep` rows for the **decode**
-   path only (`gpu_run`, one token); verify identical tokens; measure.
-2. The verify path (`run_multi`/`run_chunk`, i.e. DSpark's passes) - the same producer, `kMaxParts` rows per pass.
-3. The peer's own expert cache + adaptation; measure the extra hit rate.
-4. Only if it pays: the prompt path.
+The peer dispatch was wired into the decode path (`gpu_run`) only: the DSpark verify path (`gpu_run_n_ex`) and the
+prompt chunk path (`run_chunk`) never call it (so the DSpark A/B in `local/bench_peer_dspark2` is machine noise - the
+peer computes 0 rows there), and the store is not re-split after a `--serve` re-seed. None of that would change the
+verdict: the tier is not the majority of the step.
+
+## When it would be worth doing
+
+When the dense half stops being 63% of the step. Today's decode at 256K is dense-bound (see the phase profile in
+`AMD_HIP_NOTES.md`, and the context-size dependence: 12.7 / 14.1 / 9.8 tok/s at ctx 4K / 32K / 256K with identical
+tokens). Make the dense half 3x faster and the tier becomes the majority again - then this patch, which is correct
+and measured, is the next thing to pick up.

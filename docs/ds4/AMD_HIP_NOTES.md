@@ -179,6 +179,40 @@ were measured for **the same** configuration.
 Adopted: `--arena-gib 75`, `--kv-q8`, `--ctx 262144`, Engram from two drives, DSpark depth 4 with the 64-expert
 prune and no confidence trim, `--slots auto`.
 
+## Where a decode token goes (and why the second card cannot help)
+
+`STRATA_DEC_PROF=1` (prints every 64 steps), one-shot, no DSpark, 96-token reply, arena 75 GiB, ctx 256K:
+
+```
+decode step ms/token: begin 5.49  predict 0.38  attn_router 51.70  tier 19.44  finish 5.77   -> 82.8 ms = 12.1 tok/s
+```
+
+For comparison, the author's RTX 4090 breakdown for the same model (`V41_START_HERE.md`) is 37.5 ms/token:
+`attn_router 17.8 · tier 16.6 · finish 1.9 · begin 0.9`. So the tiers are close (19.4 vs 16.6 ms) while **our dense
+half is ~2.9x slower** (51.7 vs 17.8 ms) - the gap to CUDA on this box is the dense half, not the expert service.
+
+The context size is part of that, with identical tokens (same prompt, greedy; only `--ctx` changes):
+
+| `--ctx` | decode (no DSpark, 32 tok) |
+| --- | ---: |
+| 4096 | 12.70 tok/s |
+| 32768 | 14.10 tok/s |
+| 262144 | 9.80 tok/s |
+
+Since the generated tokens are the same, the difference is the attention path itself: the CSA/indexer work grows with
+the number of candidate blocks, so a 256K context costs ~30% of decode against 32K. That is the price of the context
+the user asked for, and it is the thing to attack next (the indexer/attention kernels, or the op count of the dense
+graphs - the fork's fused ops are the cheap experiment, `local/build-ggml-fused.sh`).
+
+A caution measured today: comparing a run **with and without `--engram`** is not a clean A/B. Removing the Engram
+changes what the model writes (it is part of the model), so the decode path differs and the numbers move for that
+reason (9.4-12.1 tok/s with, 10.4-14.1 without, on the same prompt) - not because the Engram add costs that much.
+Contexts (`--ctx`) are the clean comparison above: same tokens, different state size.
+
+The **peer expert tier** (the second card) was implemented, verified bit-identical and measured in this state: it
+took 35% of the routed rows off card 0 and still lost ~5%, because the tier it is helping is only 23% of the step.
+Design, measurements and the saved 901-line patch: `docs/ds4/V41_AMD_PEER_TIER.md`.
+
 ## DSpark on this box (the draft stack runs on HIP)
 
 The Q2_K sidecar loads as a HIP graph (`2.91 GB of weights on the card` with the 64-experts-per-layer prune, 5.14 GB
@@ -204,22 +238,27 @@ alternating runs (three each): **`--chunk-mmq` 172.4 / 168.8 / 155.9 tok/s (medi
 165.1 / 164.6 / 161.0 (median 164.6)** - +2.5%, inside the spread. The PTQ1_0 -> Q2_0 transcode plus the MoE-MMQ
 kernels are a wash on RDNA3; they are left on (the engine's default) but they are not where the prompt time is.
 
-## The second GPU
+## The second GPU: implemented, measured, not adopted
 
-The project's **parent engine** (the Qwen one in this same tree) does support several cards: contiguous layer ranges,
-one per GPU, each with the expert cache for its own layers (`docs/MULTI_GPU.md`, `src/core/peer_experts.hpp`,
-`--gpus` / layer split / `--peer-device` in the server). The **V4.1 engine does not**: `ds41_generate` has no device
-flag, `Ds41MoeTier`'s `Gpu` state is one device (one cache, one arena, one stream set) and `ds41_dense` builds one
-backend. On this box the second 7900 XTX is therefore idle.
+The project's **parent engine** (the Qwen one) does support several cards: contiguous layer ranges, one per GPU, each
+with the expert cache for its own layers (`docs/MULTI_GPU.md`, `src/core/peer_experts.hpp`, layer split /
+`--peer-device`). The **V4.1 engine** had none of that, so a peer expert tier was written for it: `--peer-device N`
+with a store on the second card, the pack/launch metadata lambdas factored so a launch can target either card, the
+peer's rows deposited into the primary's `d_parts` exactly like the CPU share already does (so the routed sum and the
+dense half are untouched), plus a startup seed that gives the peer the second half of card 0's ranked head.
 
-What it would buy, measured rather than guessed: the expert tier is 78% of decode, but 93-97% of its reads already hit
-VRAM. Shrinking the cache shows the slope: `--slots 1200` 19.30 tok/s (92.5% hits), `--slots 400` 14.98 tok/s (80.0%
-hits) - so a second card's extra ~14 GiB (2x the slots) is worth roughly +10-20%, not 2x. (`--slots 2100` measured
-5.34 tok/s with 7.3% hits: an explicit budget larger than the free VRAM thrashes; leave `--slots auto`.) The bigger
-win would be *splitting the work* - a peer expert tier, where the second card computes its own resident experts in
-parallel with the first card's dense half, or a layer split as the parent engine does. Both are new code in
-`ds41_moe.cpp` / `ds41_dense.cpp` (the parent's peer-expert machinery is for a different engine and cannot be reused
-as is); a realistic estimate is days of work with real correctness risk, and the ceiling is ~2x.
+It is **correct**: identical tokens with the peer on and off, and `STRATA_PEER_CHECK=1` compared 4299/4299 of the
+peer's rows bit-for-bit against card 0's own computation. It moved real work: 91.5 routed rows/token (~35% of the
+258 rows a token routes) came off card 0's hits (10959 -> 6713 rows, every other counter identical).
+
+It is also **slower**: 11.8 vs 12.6 tok/s (no DSpark, 3 reps, round robin). The phase profile above says why - the
+expert tier is 23% of the step, the dense half 63%, so taking a third of the tier off card 0 buys ~3% and the
+per-layer hand-off (activation upload, metadata, event and wait, row copies, 40 layers a token) costs more than that.
+The whole attempt is saved as `local/peer-tier-attempt.patch` (901 lines) with its design note
+(`docs/ds4/V41_AMD_PEER_TIER.md`); it is the thing to pick up again if the dense half ever stops being the majority.
+
+For reference, the expert cache's own slope on one card: `--slots 1200` 19.30 tok/s (92.5% hits), `--slots 400` 14.98
+(80.0%), `--slots 2100` 5.34 (7.3% - an explicit budget larger than the free VRAM thrashes; leave `--slots auto`).
 
 ## Not done yet
 
