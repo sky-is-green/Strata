@@ -7,6 +7,10 @@
 UPDATE ~17:50: park gate PASSED (IDENTICAL; 8.15 s vs 28.99 s) and production build-ds4-gpu is rebuilt with it;
 meshapplied ternary CLOSED (ours better at equal bits).  Next = prompt speed: size the chunk/c_stage buffers so
 --prompt-batch 16384-32768 fits VRAM (one sweep per prompt), then the dense half.
+UPDATE ~18:55: production config (DSpark on) confirmed: 20K prompt 66.85 -> 58.44 s (306 -> 350 tok/s).  Next:
+park DSpark weights in host RAM during batch prompts (~5 s of 58), then the 16384 OOM (1.42 GiB alloc), then the read
+pipeline.  Video: ~/AI/xolotl-video (Remotion, 3:20 visual cut, out/xolotl-v1.mp4; `npm run studio` to edit; text
+in src/facts.json).  Logos: docs/brand/out/logo-circle/ (Mal's favourite design made circular).
 UPDATE ~18:35: prompt batch 12288 + prestage 1.5 ADOPTED in serve (20K prompt 60.4 -> 53.4 s, 382 tok/s); mirror
 dead for good.  NEXT for 400-500: find the 1.42 GiB alloc that OOMs batch 16384 (likely the dense compute buffer at
 width 16384) and shrink it; then the read pipeline (file wait 20 s of 54).  Skill video-explainer added (Claude +

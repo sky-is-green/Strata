@@ -305,6 +305,13 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   likely one) - 16384 would make a 16K prompt one sweep and a 20K one ~420-450 tok/s.  **Second-drive mirror: dead
   for good** (A/B 2x2 at batch 8192: 62.5 / 62.7 vs 63.5 / 62.6 s; it trims file wait ~3 s but the total does not
   move) - the read pipeline, not drive bandwidth, is the limit; deleted again.
+- **Production config confirmed (run6, DSpark ON as in ds41-engine.sh, 512K, 20K prompt):** batch 8192 / prestage
+  3.0 = 66.85 s (306 tok/s); **12288 / 1.5 = 58.44 s (350 tok/s, +14%)**; 12288 / 0.75 = 59.20 s (no better).  The
+  same prompt WITHOUT DSpark = 53.4 s: the draft head's 2.91 GB on the card costs ~5 s of prompt.  NEXT levers for
+  400-500: (1) park the DSpark weights in host RAM during a layer-major batch (2.9 GB, ~0.15 s each way) -> DSpark
+  serve at the no-DSpark speed; (2) find the 1.42 GiB cudaMalloc that OOMs batch 16384 (it OOMs WITHOUT DSpark too -
+  likely the dense graph's compute buffer or chunk c_parts at width 16384; ~89 KiB a column); (3) the read pipeline
+  (file wait ~20 s of the 54 s).
 - **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
   rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
   for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
