@@ -15,7 +15,8 @@ Q3_K = 2.25 bpw; dense Q8_0) on **one RTX 4090 24 GB + Ryzen 7 5700X + 90 GB DDR
 ## 2. Numbers today
 | | |
 |---|---|
-| Prefill 8K / 16K / 20K | 244-248 / 288 / 266 tok/s, exact (MMQ default) |
+| Prefill, 20,480-token prompt (adopted default) | **387.6 tok/s one-shot / ~350 in `--serve`** at `--prompt-batch 12288` (52.8 s one-shot; 58.44 s serve at 512K with DSpark).  Was 318.9 / 306 at 8192.  The win is one fewer whole-file-tier sweep: 114.5 GB in 2 vs 157.2 GB in 3 (s13 run17, 2026-10-15, 3 runs a side).  On a shared card the runtime cap narrows the batch: 233.9 tok/s at batch 6428, 251.1 at 9026 |
+| Prefill 8K / 16K (SUPERSEDED, batch 8192 era) | 244-248 / 288 tok/s, exact (MMQ default) - re-measure at the new default before quoting |
 | Decode today (s13, serve flags, one-shot 256 tok) | DSpark **python 27.96 / prose 16.33 / code 26.68 tok/s**; plain decode 18.61 / 14.67 / 19.53 |
 | Decode p256 x 256, forced tokens (identical work) | **26.4-27.5 tok/s = 37.5 ms/token** (28-29.5 on luckier token paths) |
 | Quality | 4096-tok code ppl 2.3790 exact routing; decode biases (defaults) cost code 2.38 -> 2.87 |
