@@ -10,7 +10,8 @@ Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepse
 deepseek4:main - pushing is OK'd).  READ FIRST: docs/ds4/V41_START_HERE.md block "Session 13b", then
 docs/ds4/V41_NEXT_PREFILL_TERNARY.md.
 
-1. Check the unattended batch: cat ~/AI/v41-dev/s13/run3.out (logs in ~/AI/v41-dev/s13/run3/).  It built park/unpark
+1. Check the unattended batches: cat ~/AI/v41-dev/s13/run3.out (prompt-batch sweep + ternary screen) and
+   ~/AI/v41-dev/s13/run3b.out (the PARK GATE - run3's own gate failed on a wrong driver path; logs in ~/AI/v41-dev/s13/run3/).  It built park/unpark
    into build-ds4-dspark, ran the PARK GATE (must print "continuation tokens IDENTICAL"; the B:1 log must show
    "unparked"), the --prompt-batch 8192/16384/32768 sweep on a 20K prompt, and the meshapplied ternary screen
    (layers 0, 5).
