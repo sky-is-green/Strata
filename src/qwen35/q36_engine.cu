@@ -19,6 +19,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/lora_corr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -76,6 +77,9 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
 constexpr int kThreads = 256;
+// Debug: force the T > 1 ("v1") arms of the corrections/pairs at one row, one bit per specialization, to bisect
+// T=1 vs verify-window bitwise equivalence (STRATA_Q36_T1_V1, 0 = every T=1 fusion on).
+static const unsigned g_t1v1 = ([] { const char* v = std::getenv("STRATA_Q36_T1_V1"); return v ? (unsigned) std::strtoul(v, nullptr, 0) : 0u; })();
 constexpr int kChunkCells = 256;   // attention split-K chunk
 
 // ------------------------------------------------------------------------------------------------ small kernels
@@ -457,6 +461,24 @@ __global__ void k_attn_merge(const float* pacc, const float* pm, const float* pl
         hq[bl].qs[d % 32] = q;
         if (d % 32 == 0) hq[bl].ds = K::q8_1_ds(dd, sum);
     }
+}
+
+/// The MTP drafter's input: x = [rms(h) | rms(e)], no weight and eps 1e-6 (moe/mtp.py's MTPHead).
+__global__ void k_sidecar_prep(const float* __restrict__ h, const float* __restrict__ e, float* __restrict__ x, int n) {
+    __shared__ float shf[kThreads];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { const float a = h[i]; s += a * a; }
+    const float rh = rsqrtf(block_sum(s, shf) / (float) n + 1e-6f);
+    s = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { const float b = e[i]; s += b * b; }
+    const float re = rsqrtf(block_sum(s, shf) / (float) n + 1e-6f);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) { x[i] = h[i] * rh; x[n + i] = e[i] * re; }
+}
+
+/// Exact GELU (F.gelu's default, the erf form), in place.
+__global__ void k_gelu_exact(float* __restrict__ z, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) z[i] = 0.5f * z[i] * (1.0f + erff(z[i] * 0.70710678118654752440f));
 }
 
 /// The expert group tables and the q8_1 staging of h moved to the expert kernels next to the launches that read
@@ -889,6 +911,11 @@ struct Model {
     // the GGUF-native MTP block (blk.<n_layers>, loaded with --mtp): eh_proj over [enorm(e) | hnorm(h)], then an
     // attention + MoE layer, shared_head_norm, the main head
     bool has_mtp = false;
+    // the k=1 MTP drafter (moe/mtp_sidecar_export.py's GGUF: mtp.fc1/fc2, f16 upcast to f32 here): its output goes
+    // through the target's own output_norm/output, its inputs are hlast and the decided token's embedding
+    bool sc_loaded = false;
+    int sc_width = 0;
+    float *sc_fc1 = nullptr, *sc_fc2 = nullptr;
     Layer mtp;
     Mat eh_proj;
     const float *mtp_enorm = nullptr, *mtp_hnorm = nullptr, *mtp_shnorm = nullptr;
@@ -950,7 +977,7 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
-bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
+bool load(const std::string& path, Model& m, std::string& err, bool want_mtp, const std::string& sidecar) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
@@ -1138,6 +1165,36 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.embd = d;
         bytes += nb;
     }
+    // ---------------------------------------------------------------- the k=1 MTP drafter (optional)
+    if (!sidecar.empty()) {
+        auto sc = std::make_shared<strata::GgufModel>(strata::GgufModel::open(sidecar));
+        size_t s1 = 0, s2 = 0;
+        const strata::TensorInfo* t1 = sc->find("mtp.fc1.weight", &s1);
+        const strata::TensorInfo* t2 = sc->find("mtp.fc2.weight", &s2);
+        if (t1 == nullptr || t2 == nullptr || t1->type != 1 || t2->type != 1) {
+            err = "the MTP sidecar needs mtp.fc1.weight / mtp.fc2.weight (f16)";
+            return false;
+        }
+        const int64_t two_n = t1->shape[0], width = t1->shape[1];
+        if (two_n != 2 * g.n_embd || t2->shape[0] != width || t2->shape[1] != g.n_embd) {
+            err = "the MTP sidecar's shapes do not match the model ([2*n_embd, width] and [width, n_embd])";
+            return false;
+        }
+        std::vector<float> h1((size_t) two_n * (size_t) width), h2((size_t) width * (size_t) g.n_embd);
+        const uint16_t* p1 = (const uint16_t*) sc->shard(s1).tensor_data(*t1);
+        const uint16_t* p2 = (const uint16_t*) sc->shard(s2).tensor_data(*t2);
+        for (size_t i = 0; i < h1.size(); ++i) h1[i] = strata::kernels::f32_from_f16(p1[i]);
+        for (size_t i = 0; i < h2.size(); ++i) h2[i] = strata::kernels::f32_from_f16(p2[i]);
+        CK(cudaMalloc(&m.sc_fc1, h1.size() * 4));
+        CK(cudaMalloc(&m.sc_fc2, h2.size() * 4));
+        CK(cudaMemcpy(m.sc_fc1, h1.data(), h1.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(m.sc_fc2, h2.data(), h2.size() * 4, cudaMemcpyHostToDevice));
+        m.sc_width = (int) width;
+        m.sc_loaded = true;
+        bytes += h1.size() * 4 + h2.size() * 4;
+        std::fprintf(stderr, "strata-q36: MTP sidecar loaded (hidden %d, width %d, %.0f MiB) from %s\n",
+                     (int) g.n_embd, (int) width, (double) (h1.size() + h2.size()) * 4 / (1 << 20), sidecar.c_str());
+    }
     std::fprintf(stderr, "strata-q36: %s: %zu tensors (layout checked), %.2f GiB on the GPU in %.1f s (the routed "
                  "experts are placed after the engine's buffers)\n", path.c_str(), checked, (double) bytes / (1 << 30),
                  ms_since(t0) / 1000.0);
@@ -1175,6 +1232,8 @@ struct Engine {
         *sg, *su, *shh, *sy, *sgate, *ewts, *logits;
     float* hmain = nullptr;   // [tmax][N] the main model's final normed hidden of each row (the MTP seeds)
     float* hlast = nullptr;   // [N] that of the last processed position (zeros before the first)
+    float *sc_x = nullptr, *sc_z = nullptr, *sc_out = nullptr, *sc_hn = nullptr, *sc_e = nullptr;   // the drafter
+    int32_t* sc_tok = nullptr;
     void *q8, *xq, *escr;
     int32_t *ids, *grp_start, *n_groups, *ent_dst, *ent_tok, *tok, *pos0, *pick;
     int32_t* hpin = nullptr;   // pinned staging: [0] decode token, [1] position, [2..9] picks, [10] max rows, [16..] tokens
@@ -1295,6 +1354,10 @@ struct Engine {
         const size_t C = (size_t) g.ssm_conv_channels;
         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
         x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); hmain = dalloc(T * N); hlast = dalloc(N);
+        if (m->sc_loaded) {
+            sc_x = dalloc(2 * N); sc_z = dalloc((size_t) m->sc_width); sc_out = dalloc(N); sc_hn = dalloc(N);
+            sc_e = dalloc(N); sc_tok = dalloc_t<int32_t>(1);
+        }
         qkv = dalloc(T * C); hc = dalloc(T * C); z = dalloc(T * g.ssm_value_dim);
         alpha = dalloc(T * g.ssm_v_heads); beta = dalloc(T * g.ssm_v_heads); gdn_y = dalloc(T * g.ssm_value_dim);
         qg = dalloc(T * 2 * g.n_head * g.head_dim); kx = dalloc(T * g.n_head_kv * g.head_dim);
@@ -1416,7 +1479,8 @@ struct Engine {
                 v_beta.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
             }
         }
-        if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
+        if (m->has_mtp || m->sc_loaded) {   // the MTP block's or the drafter's logits/pick buffers (T rows of N/A)
+            if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             conv.push_back(nullptr);
             S.push_back(nullptr);
             kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
@@ -1427,6 +1491,11 @@ struct Engine {
             tok_m = dalloc_t<int32_t>(T);
             pos0_m = dalloc_t<int32_t>(1);
             pick_m = dalloc_t<int32_t>(1);
+            }
+            if (m->sc_loaded && !m->has_mtp) {   // the drafter's own: logits row and pick (the head call reads them)
+                logits_m = dalloc((size_t) g.n_vocab);
+                pick_m = dalloc_t<int32_t>(1);
+            }
         }
         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
         size_t fr = 0, tot = 0;
@@ -1463,7 +1532,7 @@ struct Engine {
     /// y1 = W1 x, y2 = W2 x in one launch at one row (the two applications' shared activation); falls back to
     /// the two calls where the pair is not available.
     void mm_pair(const Mat& w1, float* y1, const Mat& w2, float* y2, int T) {
-        if (T == 1 && w1.n_in == w2.n_in &&
+        if (T == 1 && !(g_t1v1 & 32u) && w1.n_in == w2.n_in &&
             K::native_mmvq_pair1(w1.type, w1.d, w1.n_out, w2.d, w2.n_out, xq, y1, y2, w1.n_in, st))
             return;
         apply(w1, xq, y1, T);
@@ -1536,6 +1605,12 @@ struct Engine {
         }
         K::iq_mmvq(142, a.d, corr_xq, corr_t, a.n_in, a.n_out, T, st);
         quant(corr_t, b.n_in, T, corr_tq);
+        if (accumulate) {
+            K::iq_mmvq(142, b.d, corr_tq, corr, b.n_in, b.n_out, T, st);
+            k_corr_add<<<grid1((int64_t) T * b.n_out), kThreads, 0, st>>>(dst, corr, b.n_out, b.n_out,
+                                                                          (int64_t) T * b.n_out);
+            return;
+        }
         K::iq_mmvq(142, b.d, corr_tq, dst, b.n_in, b.n_out, T, st);
     }
     /// out [T][ld_out] += B (A x): the branch through `corr`, then the f32 add (the fork's ggml_add).
@@ -1558,6 +1633,12 @@ struct Engine {
         }
         K::iq_mmvq(142, a.d, xq_staged, corr_t, a.n_in, a.n_out, T, st);
         quant(corr_t, b.n_in, T, corr_tq);
+        if (accumulate) {   // the multi-column B writes, so the add is a second pass (corr_add's own pattern)
+            K::iq_mmvq(142, b.d, corr_tq, corr, b.n_in, b.n_out, T, st);
+            k_corr_add<<<grid1((int64_t) T * b.n_out), kThreads, 0, st>>>(dst, corr, b.n_out, b.n_out,
+                                                                          (int64_t) T * b.n_out);
+            return;
+        }
         K::iq_mmvq(142, b.d, corr_tq, dst, b.n_in, b.n_out, T, st);
     }
     /// The router delta (f16 pairs): logits [T][ld_logits] += B (A x) with the repo's f16 round-trip rule
@@ -1649,8 +1730,8 @@ struct Engine {
             }
             tick(3, false);
             tick(4, true);   // the out projection, the correction's A pass folded in at one row
-            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa &&
-                                     mm_fused_corr_a(L.ssm_out, gdn_y, y, L.corr_a, gdn_y_staged);
+            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa && !(g_t1v1 & 4u) &&
+                                     mm_fused_corr_a(L.ssm_out, gdn_y, y, L.corr_a, gdn_y_staged && !(g_t1v1 & 64u));
             if (!corr_a_done) mm(L.ssm_out, gdn_y, y, T);
             tick(4, false);
             tick(5, true);   // the out-projection correction
@@ -1731,7 +1812,8 @@ struct Engine {
             tick(3, true);   // GDN-only class: nothing on an attention layer (an empty pair keeps the read valid)
             tick(3, false);
             tick(4, true);   // the out projection, the correction's A pass folded in at one row
-            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa && mm_fused_corr_a(L.wo, att, y, L.corr_a, att_staged);
+            const bool corr_a_done = T == 1 && L.corr_a.d && !skip_xa && !(g_t1v1 & 4u) &&
+                                     mm_fused_corr_a(L.wo, att, y, L.corr_a, att_staged && !(g_t1v1 & 64u));
             if (!corr_a_done) mm(L.wo, att, y, T);
             tick(4, false);
             tick(5, true);   // the out-projection correction
@@ -1747,9 +1829,10 @@ struct Engine {
         k_add_rms<<<T, kThreads, 0, st>>>(x, y, L.post_norm, h, N, m->eps, (T <= kGemmT) ? (Q81Block*) xq : nullptr);
         // routed experts (one token: the router and the shared expert's gate in one product, the gate its last row)
         const bool one = T == 1;
-        const bool mixed_ok = one && L.moe_corr_a.d && L.router_corr_a.d && L.moe_corr_a.n_in == N && L.moe_corr_b.n_out == N;
+        const bool mixed_ok = one && !(g_t1v1 & 1u) && L.moe_corr_a.d && L.router_corr_a.d && L.moe_corr_a.n_in == N &&
+                              L.moe_corr_b.n_out == N;
         bool mixed_a_fused = false;
-        if (mixed_ok && !skip_rt && !skip_ma)
+        if (mixed_ok && !(g_t1v1 & 16u) && !skip_rt && !skip_ma)
             mixed_a_fused = K::native_gemv_corr_mixed_a(L.router_ext, h, logits_r, N, (int) g.n_expert + 1,
                                                        L.moe_corr_a.d, xq, L.moe_corr_a.n_in, L.moe_corr_a.n_out, corr_tq,
                                                        L.router_corr_a.d, (int) g.n_embd, (int) L.router_corr_a.n_out, corr_t16, st);
@@ -1764,7 +1847,7 @@ struct Engine {
         // at one row the deltas' B pass, top-k and the group tables are one launch: it wants the deltas'
         // inputs (mixed A's outputs), the native expert path's tables and the 256 x 8 router
         const bool hy_here = lhy(li) && (T <= hybrid_t || !main_hybrid);
-        tail_fused = mixed_ok && one && !skip_mb && !skip_tk && !hy_here &&
+        tail_fused = mixed_ok && one && !(g_t1v1 & 2u) && !skip_mb && !skip_tk && !hy_here &&
                      K::native_router_tail_ok(L.moe_corr_b.n_in, L.moe_corr_b.n_out, L.router_corr_b.n_in,
                                               (int) g.n_expert, (int) g.n_expert, (int) Kp);
         if (mixed_ok) {
@@ -1855,7 +1938,8 @@ struct Engine {
         tick(11, false);
         tick(12, true);   // SwiGLU and the shared down in one launch at one column (the two calls otherwise)
         if (T <= kGemmT) {
-            if (!(T == 1 && K::native_mmvq_swiglu_q8_0(L.sh_down.d, sg, su, sy, (int) FS, L.sh_down.n_out, 1, st))) {
+            if (!(T == 1 && !(g_t1v1 & 8u) &&
+                  K::native_mmvq_swiglu_q8_0(L.sh_down.d, sg, su, sy, (int) FS, L.sh_down.n_out, 1, st))) {
                 K::native_swiglu_quantize_q8_1(sg, su, q8, FS, T, st);
                 mmq(L.sh_down, q8, sy, T);
             }
@@ -2241,6 +2325,31 @@ struct Engine {
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
 
+    /// The k=1 drafter's token: the sidecar head over (hlast, the decided token's embedding), through the target's
+    /// own output_norm and head (moe/mtp.py's MTPHead and mtp_logits).
+    int32_t sidecar_draft(int32_t x_tok) {
+        const int N = (int) m->g.n_embd;
+        CK(cudaMemcpyAsync(sc_tok, &x_tok, 4, cudaMemcpyHostToDevice, st));
+        K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, sc_tok, 1, N, sc_e, st);
+        k_sidecar_prep<<<1, kThreads, 0, st>>>(hlast, sc_e, sc_x, N);
+        k_gemv_f32<<<dim3(rows8(m->sc_width), 1), kThreads, 0, st>>>(m->sc_fc1, sc_x, sc_z, 2 * N, m->sc_width);
+        k_gelu_exact<<<grid1(m->sc_width), kThreads, 0, st>>>(sc_z, m->sc_width);
+        k_gemv_f32<<<dim3(rows8(N), 1), kThreads, 0, st>>>(m->sc_fc2, sc_z, sc_out, m->sc_width, N);
+        k_rms<<<1, kThreads, 0, st>>>(sc_out, m->out_norm, sc_hn, N, 1e-6f);   // the trainer's own rms eps
+        head_rows(sc_hn, 1, logits_m, pick_m);
+        CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st));
+        if (std::getenv("STRATA_Q36_SC_DEBUG")) {
+            float hh[3] = {}, ee[3] = {}, oo[3] = {};
+            CK(cudaMemcpy(hh, hlast, 12, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(ee, sc_e, 12, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(oo, sc_out, 12, cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "sc: tok %d | h %.5f %.5f %.5f | e %.5f %.5f %.5f | out %.5f %.5f %.5f | draft %d\n",
+                         x_tok, hh[0], hh[1], hh[2], ee[0], ee[1], ee[2], oo[0], oo[1], oo[2], hpin[2]);
+        }
+        return hpin[2];
+    }
+
     /// One speculative step with D MTP drafts (greedy): `x` is the next token (decided, not processed); `fix` the
     /// tokens of the rows the block must redo first (the drafts the last window accepted, seeded by hmain rows
     /// 0 .. fix.size() - 1 of that window).  Drafts d1 .. dD, then the window [x, d1 .. dD] through the main model;
@@ -2248,8 +2357,15 @@ struct Engine {
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
+        if (m->sc_loaded) D = std::min(D, 1);   // the sidecar is a k=1 head: no state to chain through
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
         CK(cudaStreamSynchronize(st));
+        drafts.assign((size_t) D, 0);
+        if (m->sc_loaded) {
+            // the drafter recomputes from hlast each step (no redo rows): its token, then the shared verify window
+            if (D > 0) drafts[0] = sidecar_draft(x_tok);
+            if (const char* fv = std::getenv("STRATA_Q36_SC_FORCE"); fv != nullptr && D > 0) drafts[0] = std::atoi(fv);
+        } else {
         // rows of the first MTP call: (hmain row i, fix[i]) at positions pos - fix.size() + i, then (hlast, x) at pos
         for (int i = 0; i < (int) fix.size(); ++i) hpin[16 + i] = fix[(size_t) i];
         hpin[16 + fix.size()] = x_tok;
@@ -2262,7 +2378,6 @@ struct Engine {
             CK(cudaMemcpyAsync(seeds, hmain, fix.size() * (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         CK(cudaMemcpyAsync(seeds + fix.size() * (size_t) N, hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
-        drafts.assign((size_t) D, 0);
         if (D > 0) {
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
@@ -2282,6 +2397,7 @@ struct Engine {
             CK(cudaStreamSynchronize(st));
             drafts[(size_t) d] = hpin[2];
         }
+        }
         // the verify window
         const int T = D + 1;
         hpin[16] = x_tok;
@@ -2296,6 +2412,9 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+        if (std::getenv("STRATA_Q36_SC_DEBUG"))
+            std::fprintf(stderr, "sc: verify draft %d vs pick %d (pos %lld, accepted %d)\n", drafts.empty() ? -1 : drafts[0],
+                         hpin[2], (long long) pos, a);
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
@@ -2322,7 +2441,7 @@ struct Engine {
         process(toks.data(), wn, [](int64_t) {});
         if (wn > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
-        if (mtp_d > 0) {
+        if (mtp_d > 0 && (m->has_mtp || m->sc_loaded)) {
             std::vector<int32_t> fix, drafts;
             int32_t picks[16];
             spec_step(filler, fix, mtp_d, drafts, picks);
@@ -2766,7 +2885,7 @@ int serve(Engine& E) {
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full;
+    std::string model, tokens, force, dump_full, sidecar_path;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
@@ -2796,6 +2915,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-graph") graph = false;
         else if (a == "--no-warmup") warm = false;
+        else if (a == "--mtp-sidecar") sidecar_path = next();   // the k=1 drafter's GGUF (moe/mtp_sidecar_export.py)
         else if (a == "--mtp") {
             // a number of drafts; Flash-Next's "--mtp <draft layer dir>" means nothing for this family
             const std::string v = next();
@@ -2836,7 +2956,7 @@ int strata::qwen35::run(int argc, char** argv) {
     Model m;
     std::string err;
     try {
-        if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+        if (!load(model, m, err, mtp_d > 0, sidecar_path)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
@@ -2878,7 +2998,7 @@ int strata::qwen35::run(int argc, char** argv) {
         }
     } report{E};
     E.reset();
-    E.mtp_d = m.has_mtp ? mtp_d : 0;
+    E.mtp_d = (m.has_mtp || m.sc_loaded) ? mtp_d : 0;
     if (warm) E.warmup();
     if (serve_mode) return serve(E);
     if (bench_pp > 0 || bench_tg > 0) {
