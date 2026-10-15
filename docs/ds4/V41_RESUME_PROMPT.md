@@ -7,6 +7,13 @@
 UPDATE ~17:50: park gate PASSED (IDENTICAL; 8.15 s vs 28.99 s) and production build-ds4-gpu is rebuilt with it;
 meshapplied ternary CLOSED (ours better at equal bits).  Next = prompt speed: size the chunk/c_stage buffers so
 --prompt-batch 16384-32768 fits VRAM (one sweep per prompt), then the dense half.
+UPDATE ~18:00: Mal's target = prompt 400-500 tok/s.  ~/AI/v41-dev/s13/run4.sh -> run4.out: 20K prompt at batch
+8192/12288/16384/20480 with STRATA_PRESTAGE_GIB 3.0/1.5/0.75 (does a bigger batch fit when prestage shrinks?), then
+the second-drive mirror rebuilt on NVME1TB and A/B'd on full sweeps (s12 found nothing on fresh 8000 - if again
+nothing, the limit is the engine's read pipeline, not the drive: chunk prof reader wall vs bytes says which).
+A Phison drive may arrive.  Brand/video (docs/brand/, uncommitted on purpose): VIDEO_SCRIPT.md (Mal reads it
+himself), VIDEO_PLAN.md (coded Remotion explainer), geometric logo takes from klein in
+/media/mal/Crucible/AI-ART/ComfyUI/output/Xolotl/geo*.png.
 
 ```
 Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
