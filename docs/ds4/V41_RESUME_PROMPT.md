@@ -4,7 +4,7 @@
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
 ## RESUME PROMPT 2026-10-16 ~00:10 (session 13d) - paste the block below into a new session
-WHERE WE GOT TO (all committed and pushed on `deepseek4`, HEAD `e83095b6`; logs `~/AI/v41-dev/s13/run9..run19*`):
+WHERE WE GOT TO (all committed and pushed on `deepseek4`, HEAD `df837c66` (doc-only commits after `ad1b0f4c`); logs `~/AI/v41-dev/s13/run9..run19*`):
 - **PREFILL, 20,480-token prompt, quiet box, one-shot, prestage 1.5, no DSpark: batch 12288 = 387.6 tok/s (52.8 s)
   vs batch 8192 = 318.9 (64.2 s) -> +21.5%, and 12288 is now the serve default** (`strata-ds41.json`).  The whole win
   is one fewer whole-file-tier sweep: 114.5 GB of reads in 2 sweeps vs 157.2 GB in 3; the reader does the same
