@@ -7,7 +7,10 @@
 UPDATE ~17:50: park gate PASSED (IDENTICAL; 8.15 s vs 28.99 s) and production build-ds4-gpu is rebuilt with it;
 meshapplied ternary CLOSED (ours better at equal bits).  Next = prompt speed: size the chunk/c_stage buffers so
 --prompt-batch 16384-32768 fits VRAM (one sweep per prompt), then the dense half.
-UPDATE ~18:00: Mal's target = prompt 400-500 tok/s.  ~/AI/v41-dev/s13/run4.sh -> run4.out: 20K prompt at batch
+UPDATE ~18:35: prompt batch 12288 + prestage 1.5 ADOPTED in serve (20K prompt 60.4 -> 53.4 s, 382 tok/s); mirror
+dead for good.  NEXT for 400-500: find the 1.42 GiB alloc that OOMs batch 16384 (likely the dense compute buffer at
+width 16384) and shrink it; then the read pipeline (file wait 20 s of 54).  Skill video-explainer added (Claude +
+Quetza).  Mal's target = prompt 400-500 tok/s.  ~/AI/v41-dev/s13/run4.sh -> run4.out: 20K prompt at batch
 8192/12288/16384/20480 with STRATA_PRESTAGE_GIB 3.0/1.5/0.75 (does a bigger batch fit when prestage shrinks?), then
 the second-drive mirror rebuilt on NVME1TB and A/B'd on full sweeps (s12 found nothing on fresh 8000 - if again
 nothing, the limit is the engine's read pipeline, not the drive: chunk prof reader wall vs bytes says which).

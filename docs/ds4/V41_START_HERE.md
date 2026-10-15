@@ -297,6 +297,14 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
 - **Prompt speed outlook:** NVMe-bound (file wait 27 of 40 s experts, 20K prompt, 328 tok/s).  One sweep per prompt
   (batch = prompt, needs the chunk / c_stage buffers sized down so 16K-32K fit VRAM) ~ 500-550 tok/s; ~800 also needs
   the dense half faster (21.9 s of a 20K prompt).
+- **PROMPT SPEED, ADOPTED (run4 + run5, 20,480-token prompt):** batch 8192 / prestage 3.0 = 328 tok/s one-shot,
+  60.4 s serve; **batch 12288 / prestage 1.5 = 382 tok/s one-shot, 53.4 s serve at 512K** (dense 21.9 -> 15.8 s,
+  file wait 26.9 -> 20.1 s: one sweep fewer, and the dense half is faster at width).  Now the serve default
+  (strata-ds41.json --prompt-batch 12288, ds41-engine.sh STRATA_PRESTAGE_GIB 1.5).  16384 / 20480 OOM (a 1.42 GiB
+  cudaMalloc, even at prestage 0.75) - find that buffer next (the dense graph's compute buffer at width 16384 is the
+  likely one) - 16384 would make a 16K prompt one sweep and a 20K one ~420-450 tok/s.  **Second-drive mirror: dead
+  for good** (A/B 2x2 at batch 8192: 62.5 / 62.7 vs 63.5 / 62.6 s; it trims file wait ~3 s but the total does not
+  move) - the read pipeline, not drive bandwidth, is the limit; deleted again.
 - **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
   rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
   for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
