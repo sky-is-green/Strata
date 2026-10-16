@@ -442,6 +442,15 @@ it copies something back to the host and blocks for it (~2.4x a layer). The `lay
 this path (`layer_synced` false, `ds41_moe.cpp:2682-2691`) is not among them. `hipGetDevice` 120 times a token is the
 cheapest of the lot and lives in the wrapper layer, not in the engine's logic.
 
+### Caching `ggml_cuda_get_device` (measured, no gain, reverted)
+
+`ggml_cuda_get_device()` (ggml-cuda.cu:135) calls `cudaGetDevice` and nearly every op calls it: 120 times per decode
+token here. It was cached per thread (invalidated in `ggml_cuda_set_device`) and measured on the same decode, 96
+tokens, two runs: `attn_router` **43.61 / 43.62 ms** against 43.35 before, decode **13.39 / 13.61 tok/s** against
+13.67. No gain: these calls cost ~0.5 us each, so 120 of them are 0.06 ms of a 75 ms token. The patch was reverted
+and ggml rebuilt. Same lesson as the error queries: on this engine the host API *call count* is not the problem, the
+*waits* are (215 stream syncs, 105 ms/token), and those wait for GPU work that the engine has serialized.
+
 ## A fresh long prompt can crash the engine (found 2026-10-16) and the context penalty is smaller than I thought
 
 **The crash.** A 63,613-token prompt, one-shot, `--prompt-batch 12288 --ctx 262144 --arena-gib 75` (the tuned config):
