@@ -30,7 +30,6 @@
   "STRATA_DSPARK_DEPTH": "4",
   "STRATA_DSPARK_KEEP": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/tools/v41/serve/dspark_expert_counts.txt:64",
   "DS41_EXE": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/build-hip-fused/ds41_generate",
-  "STRATA_HIP_WMMA": "1",
   "STRATA_PRESTAGE_GIB": "1.5"
  },
  "cwd": "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1",

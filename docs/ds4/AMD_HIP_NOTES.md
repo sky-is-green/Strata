@@ -282,6 +282,35 @@ It only moves data (no arithmetic), so the tokens are unchanged. One request a s
 direction; 1.5 (the author's value) beats 3.0 here. With `STRATA_HIP_WMMA=1` the served prompt on this box goes from
 ~220 to ~245 tok/s on a 5787-token prompt (both opt-ins are in `local/ds41-local.json`).
 
+## `STRATA_HIP_WMMA` does not apply to this engine (and a measurement that was noise)
+
+There is an int8-KV prompt-attention path on matrix cores in `src/kernels/cuda/qsa_prompt_attn.cu`
+(`STRATA_HIP_WMMA=1`, guarded for gfx11/gfx12). A one-run-a-side A/B on the 5787-token prompt first looked like
++5.4% (239.3 -> 252.1 tok/s, same 8 tokens), but that was noise: **the V4.1 engine never enters that code**. Evidence:
+0 `prompt_attn` symbols in `ds41_generate` against 752 `flash_attn*` ones (this engine's prompt attention is its own
+`native_flash_attn`/`flash_attn_tile`, not the parent engine's `qsa_prompt_attn`), no `strata: STRATA_HIP_WMMA: ...
+matrix cores` line in a whole real session's engine log, and no engine source referencing `qsa_prompt_attn`. The env
+was removed from `local/ds41-local.json`. Same shape of trap as the hipBLASLt table: an opt-in from the parent engine
+that this engine does not link. **A one-run-a-side A/B is not enough to adopt a knob - this is the concrete reason
+why.**
+
+## Prompt streaming: layer prestage (the DMA overlap)
+
+`STRATA_PRESTAGE_GIB=<GiB>` keeps a device region where the NEXT routed layer's arena experts are DMA'd on a second
+stream while the current layer's dense half runs (`chunk_pstage_issue` / `Gpu::p_buf`); `run_chunk` then launches
+from there and streams only the rest. Measured through the server (`--serve`, the path it belongs to), 5787-token
+prompt, one request a side, fresh server each time, batch 12288 + `STRATA_HIP_WMMA=1`:
+
+| `STRATA_PRESTAGE_GIB` | prompt tok/s |
+| --- | ---: |
+| unset (baseline) | 231.2 |
+| 1.5 (adopted) | **244.5** |
+| 3.0 | 236.2 |
+
+It only moves data (no arithmetic), so the tokens are unchanged. One request a side, so read the +5.8% as the
+direction; 1.5 (the author's value) beats 3.0 here. With `STRATA_HIP_WMMA=1` the served prompt on this box goes from
+~220 to ~245 tok/s on a 5787-token prompt (both opt-ins are in `local/ds41-local.json`).
+
 ## Prompt attention on the matrix cores (gfx11)
 
 `STRATA_HIP_WMMA=1` switches the int8-KV prompt attention to the WMMA path (`src/kernels/cuda/qsa_prompt_attn.cu`,
