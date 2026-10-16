@@ -316,6 +316,14 @@ body) working on the model's own syntax. Verified against the running server wit
 byte-split streams, `string="false"` values typed (`30`, not `"30"`), two calls in one reply, and a quoted call
 inside a code fence stays text.
 
+The gate for all of it is already in the tree: `tools/v41/serve/test_serve_ds41.py`
+(`t_parser` compares the served path against DeepSeek's own parser at **every split 1..39**, thinking on and
+off; `t_http` drives the mock server over HTTP for the OpenAI and Anthropic APIs). It was **red** before the
+translation - the markup came out as `content`, the same failure the harness session hit - and is green now:
+`... test_serve_ds41.py models/V41-GSQ/tokenizer` prints `all passed` (12 checks). Its server subprocess now
+runs under the interpreter running the test (`STRATA_TEST_PY` overrides) instead of the author's
+`~/AI/Strata/.venv/bin/python`, which is what kept that half unrunnable on other machines.
+
 ## API server (256K context)
 
 ```sh

@@ -153,7 +153,9 @@ def post(port, path, body):
 def t_http(tok_dir):
     port = free_port()
     script = "need the file" + E.thinking_end_token + dsml([("read_file", {"path": "a.txt", "lines": 3})])
-    py = str(Path.home() / "AI/Strata/.venv/bin/python")
+    # the server subprocess runs under the interpreter running this test (the author's ~/AI/Strata/.venv path is
+    # not where everyone's venv is); STRATA_TEST_PY overrides it
+    py = os.environ.get("STRATA_TEST_PY") or sys.executable
     proc = subprocess.Popen([py, str(HERE / "serve_ds41.py"), "--engine", "mock", "--port", str(port),
                              "--tokenizer", str(tok_dir), "--script", script, "--script", script, "--script", "done" + E.thinking_end_token + "The file says AAA."],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
