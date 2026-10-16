@@ -65,6 +65,15 @@ Documents: [docs/ds4/AMD_HIP_NOTES.md](docs/ds4/AMD_HIP_NOTES.md) (every measure
 > The earlier **DeepSeek-V4-Flash (0731)** engine is still here and documented in the second half of this README.
 > (This repo was called `Strata-DS4`; old links redirect.)
 
+## What is ours and what is inherited
+
+This branch (`amd-gfx1100`) carries the work done on **one RX 7900 XTX**: the section above is ours, with the
+numbers measured on that machine and the optimizations that were adopted.  Everything below it is inherited from
+the upstream repository this is a fork of ([Indras-Mirror/Strata-DSV4.1](https://github.com/Indras-Mirror/Strata-DSV4.1)):
+the NVIDIA (RTX 4090) measurements, the 512K-context settings and the earlier DeepSeek-V4-Flash (0731) engine.
+It is kept because the platforms are the same code - the AMD path is a port plus the tuning above, and the
+upstream notes are the reference for everything that is not AMD-specific.
+
 ## Latest (2026-10-15)
 
 - **Coding quality vs speed, measured on real tasks** (21 HumanEval + 10 tool calls, greedy; `~/AI/v41-dev/taskeval`):
