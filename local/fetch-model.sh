@@ -17,11 +17,13 @@
 #
 # Space: the GGUF arrives as 163 GB of parts and the join drops each part as it appends it (DELETE_PARTS=0 keeps
 # them and needs the space twice), the Engram is 101 GB per table plus the 101 GB shard it comes from.  On one disk
-# use ONE_AT_A_TIME=1 (fetch shard 47 -> extract layer 1 -> delete 47 -> fetch 48 -> extract layer 14 -> delete 48),
-# peak about 163 + 101 + 101 GB.  Two disks are better: pass DEST_LAYERS1 / DEST_LAYERS14.
+# that is the default, ONE_AT_A_TIME=1 (fetch shard 47 -> extract layer 1 -> delete 47 -> fetch 48 -> extract layer
+# 14 -> delete 48), peak about 163 + 101 + 101 GB.  ONE_AT_A_TIME=0 fetches both shards first (203 GB) and then
+# extracts both, so it needs 163 + 203 + 202 GB - only for a machine with room.  DEST_LAYERS1 / DEST_LAYERS14 put
+# the two tables on different disks.
 #
 # Env: GSQ_REPO, FP8_REPO, DELETE_PARTS=1 (0 keeps the parts), KEEP_FP8=0 (1 keeps the FP8 shards after the
-#      extraction, 101 GB each), ONE_AT_A_TIME=0 (1 = Engram shard by shard, for a single disk), DRY_RUN=0 (1 = print
+#      extraction, 101 GB each), ONE_AT_A_TIME=1 (0 = both shards first, needs 163 + 203 + 202 GB), DRY_RUN=0 (1 = print
 #      the plan and change nothing), FORCE_JOIN=0 (1 = remove an interrupted joined file and join again),
 #      DEST_LAYERS1, DEST_LAYERS14 (put the two Engram tables on different disks), HF_TOKEN (gated repos only),
 #      VERIFY_ROWS=200 (Engram rows checked against the source), WORK=default DEST (scratch for the FP8 shards and
@@ -34,7 +36,7 @@ GSQ_REPO=${GSQ_REPO:-IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored}
 FP8_REPO=${FP8_REPO:-dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8}
 DELETE_PARTS=${DELETE_PARTS:-1}   # 1 = drop each part right after the join, so the tree ends as models/ is now
 KEEP_FP8=${KEEP_FP8:-0}
-ONE_AT_A_TIME=${ONE_AT_A_TIME:-0}
+ONE_AT_A_TIME=${ONE_AT_A_TIME:-1}   # 1 = Engram shard by shard (one disk); 0 = both shards first (needs room)
 DRY_RUN=${DRY_RUN:-0}
 FORCE_JOIN=${FORCE_JOIN:-0}
 VERIFY_ROWS=${VERIFY_ROWS:-200}
@@ -107,9 +109,13 @@ if [ ! -f "$GSQ/V41-GSQ.gguf" ]; then
 fi
 
 say "=== 3/4 the two Engram tables (they are NOT in the GSQ repo: shards 47/48 of $FP8_REPO)"
-clean_fp8() {   # the shards go, and so do fetch_v41.sh's markers, so nothing is left behind
+drop_shard() {  # drop one shard and its marker; the index stays, the next layer still needs it
   [ "$KEEP_FP8" = 1 ] && return 0
-  rm -f "$WORK"/fp8/model-*.safetensors "$WORK"/fp8/.tree.json "$WORK"/fp8/.files.tsv "$WORK"/fp8/*.ok 2>/dev/null || true
+  rm -f "$WORK"/fp8/model-000$1-of-00048.safetensors* 2>/dev/null || true
+}
+clean_fp8() {   # at the end: the index and fetch_v41.sh's markers go too, so nothing is left behind
+  [ "$KEEP_FP8" = 1 ] && return 0
+  rm -f "$WORK"/fp8/model-*.safetensors* "$WORK"/fp8/.tree.json "$WORK"/fp8/.files.tsv "$WORK"/fp8/*.ok 2>/dev/null || true
   rmdir "$WORK/fp8" 2>/dev/null || true
 }
 extract_shard() {  # extract_shard <shard> <layer> <dest-layers>
@@ -117,19 +123,19 @@ extract_shard() {  # extract_shard <shard> <layer> <dest-layers>
   local table="$dest/engram-L$layer.safetensors"
   if [ "$(size "$table")" -gt 100000000000 ]; then say "have  engram-L$layer.safetensors"; return 0; fi
   [ "$DRY_RUN" = 1 ] && { say "would fetch shard $shard and extract layer $layer into $dest"; return 0; }
-  ONLY="model-000$shard-of-00048" bash "$HERE/tools/v41/fetch_v41.sh" "$WORK/fp8" "$FP8_REPO"
+  ONLY="model-000$shard-of-00048|model\.safetensors\.index\.json" bash "$HERE/tools/v41/fetch_v41.sh" "$WORK/fp8" "$FP8_REPO"
   python3 "$HERE/tools/v41/extract_engram.py" "$WORK/fp8" --to "layers.$layer=$dest" --verify "$VERIFY_ROWS"
-  clean_fp8
+  drop_shard "$shard"
 }
 if [ "$ONE_AT_A_TIME" = 1 ]; then
-  extract_shard 47 1 "$DEST_L1"; extract_shard 48 14 "$DEST_L14"
+  extract_shard 47 1 "$DEST_L1"; extract_shard 48 14 "$DEST_L14"; clean_fp8
 else
   if [ "$(size "$DEST_L1/engram-L1.safetensors")" -gt 100000000000 ] && [ "$(size "$DEST_L14/engram-L14.safetensors")" -gt 100000000000 ]; then
     say "have  both Engram tables"
   elif [ "$DRY_RUN" = 1 ]; then
     say "would fetch shards 47 and 48 and extract layers 1 and 14"
   else
-    ONLY='model-0004[78]-of-00048' bash "$HERE/tools/v41/fetch_v41.sh" "$WORK/fp8" "$FP8_REPO"
+    ONLY='model-0004[78]-of-00048|model\.safetensors\.index\.json' bash "$HERE/tools/v41/fetch_v41.sh" "$WORK/fp8" "$FP8_REPO"
     python3 "$HERE/tools/v41/extract_engram.py" "$WORK/fp8" --to "layers.1=$DEST_L1" --to "layers.14=$DEST_L14" --verify "$VERIFY_ROWS"
     clean_fp8
   fi

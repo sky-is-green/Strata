@@ -82,9 +82,10 @@ this branch uses:
    and `models/engram/layers14`, with the merged index from `local/engram_index.py` (the engine needs it because the
    two tables live in different directories).
 
-Space: 163 GB of parts for the GGUF (the join needs the same again only with `DELETE_PARTS=0`), and 101 GB per Engram table plus the 101 GB shard each comes from.  With two
-disks, set `DEST_LAYERS1` and `DEST_LAYERS14`; on one disk use `ONE_AT_A_TIME=1`, which extracts and deletes one
-shard at a time (peak about 163 + 101 + 101 GB).
+Space: 163 GB of parts for the GGUF (the join needs the same again only with `DELETE_PARTS=0`), and 101 GB per Engram table plus the 101 GB shard each comes from.  The default
+`ONE_AT_A_TIME=1` extracts and deletes one shard at a time (peak about 163 + 101 + 101 GB, one disk);
+`ONE_AT_A_TIME=0` fetches both shards first and then extracts both, so it needs 163 + 203 + 202 GB.  With two disks,
+`DEST_LAYERS1` and `DEST_LAYERS14` put the two tables in two places.
 
 ```sh
 local/fetch-model.sh /path/to/models     # DEST defaults to <repo>/models
@@ -101,7 +102,7 @@ is reported instead of being joined over.  Every parameter:
 | `GSQ_REPO`, `FP8_REPO` | the two repositories linked above | where to fetch from |
 | `DRY_RUN=1` | 0 | print the whole plan (what is complete, what would be fetched, the join, the Engram steps) and change nothing |
 | `DELETE_PARTS` | 1 | drop each GGUF part as it is appended; `0` keeps them and needs the space twice |
-| `ONE_AT_A_TIME` | 0 | Engram one shard at a time: fetch 47, extract layer 1, delete 47, fetch 48, extract layer 14, delete 48 (peak about 163 + 101 + 101 GB on a single disk) |
+| `ONE_AT_A_TIME` | 1 | Engram one shard at a time: fetch 47, extract layer 1, delete 47, fetch 48, extract layer 14, delete 48 (peak about 163 + 101 + 101 GB); `0` fetches both shards first and needs 163 + 203 + 202 GB |
 | `DEST_LAYERS1`, `DEST_LAYERS14` | `<models>/engram/layers1`, `layers14` | put the two Engram tables on different disks |
 | `KEEP_FP8` | 0 | keep the FP8 shards after the extraction (101 GB each) |
 | `FORCE_JOIN` | 0 | remove an interrupted `V41-GSQ.gguf` and join again (by default it stops and says so) |
