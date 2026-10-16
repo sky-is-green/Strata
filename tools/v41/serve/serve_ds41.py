@@ -81,12 +81,13 @@ def effort_kwargs(value) -> dict:
 
 
 def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget: under 2K low, under 8K medium, else high (as the server's own)."""
+    """Anthropic's thinking budget mapped onto the model's three levels (low 50, high 75, max 100): under 2K low,
+    under 8K high, else max - the encoder only defines those three (dsv41_encoding.REASONING_EFFORT_MAPPINGS)."""
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": 50 if n < 2048 else 62 if n < 8192 else 75}
+    return {"reasoning_effort": 50 if n < 2048 else 75 if n < 8192 else 100}
 
 
 for mod in (F, S):
