@@ -9,8 +9,6 @@
   "gpu",
   "--rank",
   "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/models/V41-GSQ/rank.bin",
-  "--engram",
-  "/home/vincenzo/v41-engram/layers1:/run/media/vincenzo/Dati/v41-engram/layers14",
   "--threads",
   "24",
   "--ctx",
@@ -21,7 +19,9 @@
   "--prompt-batch",
   "12288",
   "--arena-gib",
-  "75"
+  "75",
+  "--engram",
+  "/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/models/engram/layers14:/run/media/vincenzo/Dati/projects/other/Strata-DSV4.1/models/engram/layers1"
  ],
  "env": {
   "STRATA_NO_LARGEPAGES": "1",

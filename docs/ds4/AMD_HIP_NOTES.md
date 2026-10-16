@@ -179,7 +179,7 @@ were measured for **the same** configuration.
 | `--vram-margin 0.25` / `STRATA_DMA_OVERLAP=1` / `STRATA_D3_PF=2`, same 3-run A/B | 20.83 / ~20.1 / decode 18.8 with prompt 51.8 -> 57.8 tok/s: nothing outside the spread, `STRATA_D3_PF=2` only moves the prompt |
 | serve `--prompt-batch 2048 -> 12288` on a 5.8K-token prompt | 229.8 -> 232.8 tok/s: no measurable difference (the engine sizes the batch from free VRAM anyway) |
 
-Adopted: `--arena-gib 75`, `--kv-q8`, `--ctx 262144`, Engram from two drives, DSpark depth 4 with the 64-expert
+Adopted: `--arena-gib 75`, `--kv-q8`, `--ctx 262144`, Engram tables (L1 and L14, both read from the same NVMe: / is nvme0n1p1 and Dati is nvme0n1p4), DSpark depth 4 with the 64-expert
 prune and no confidence trim, `--slots auto`.
 
 ## Where a decode token goes (and why the second card cannot help)
