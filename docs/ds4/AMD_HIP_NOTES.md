@@ -265,6 +265,22 @@ With it, the serve numbers on this box are: a 5.8K-token prompt at **230 tok/s**
 229.8 vs 232.8, i.e. no measurable difference here - the author's one-sweep win at 12288 is on a 20K prompt) and
 decode **26-30 tok/s** with DSpark.
 
+## Prompt attention on the matrix cores (gfx11)
+
+`STRATA_HIP_WMMA=1` switches the int8-KV prompt attention to the WMMA path (`src/kernels/cuda/qsa_prompt_attn.cu`,
+written for gfx12 but guarded for gfx11 too, which is this card). Measured on the 5787-token prompt, one run a side,
+same flags (`--kv-q8`, arena 75, 256K, Engram):
+
+| | prompt tok/s |
+| --- | ---: |
+| off | 239.3 |
+| `STRATA_HIP_WMMA=1` | **252.1** (+5.4%) |
+
+The eight generated tokens are identical with and without it. One run a side, so treat the +5.4% as the direction,
+not a settled number; it is in `local/ds41-local.json` (the server) as an opt-in. `STRATA_PA_FAST=1` halves the matrix
+work again by dropping the FP16 hi/lo split (rounding-level accuracy, not the FP32-level path) and is **not** adopted:
+it trades the model's numerics for speed, which is out of scope here.
+
 ## hipBLASLt on the prompt: measured, and it cannot pay here
 
 `tools/hip/` ships hipBLASLt tuning tables per (architecture, library version) - for this card the pair is gfx1100 +
