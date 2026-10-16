@@ -51,6 +51,17 @@
 #include <thread>
 #include <vector>
 
+// ---- repetition penalties: the state has to be declared before the argument parsing that sets it ----------
+struct PenaltyState {
+    float repeat  = 1.0f;   // penalty_repeat: positive logits divided, negative multiplied (llama.cpp rule)
+    float freq    = 0.0f;   // penalty_freq: subtract freq * occurrences
+    float present = 0.0f;   // penalty_present: subtract once if the token is in the window
+    int   last_n  = 0;      // penalty_last_n: window over the last N emitted tokens (0 = off)
+    int   cap     = 4096;   // like the platform's kPenaltyWindowCap
+    std::vector<int> hist;  // emitted tokens, oldest first
+};
+static PenaltyState g_pen;
+
 using namespace strata;
 using namespace strata::v41;
 
@@ -133,6 +144,10 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--threads") a.threads = std::atoi(next().c_str());
         else if (k == "--ctx") a.ctx = std::atoll(next().c_str());
         else if (k == "--temp") a.temp = (float) std::atof(next().c_str());
+        else if (k == "--penalty-repeat") g_pen.repeat = (float) std::atof(next().c_str());
+        else if (k == "--penalty-freq") g_pen.freq = (float) std::atof(next().c_str());
+        else if (k == "--penalty-present") g_pen.present = (float) std::atof(next().c_str());
+        else if (k == "--penalty-last-n") g_pen.last_n = std::max(0, std::atoi(next().c_str()));
         else if (k == "--seed") a.seed = (uint64_t) std::atoll(next().c_str());
         else if (k == "--stop") a.stop = parse_csv(next());
         else if (k == "--ppl") a.ppl = true;
@@ -165,8 +180,45 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// ---- repetition penalties (design: docs/ds4/V41_SAMPLER_PENALTIES.md) -----------------------------------------
+// This engine had no penalty stage; every other stack has one (the platform this fork comes from:
+// penalty_repeat/freq/present/last_n, generate.cpp:10648; llama.cpp: --repeat-penalty/--frequency-penalty/
+// --presence-penalty).  The defaults below are the platform's and make this a no-op: the logits are then untouched
+// and the generated tokens are bit-identical to before.  Applied inside both samplers, so the speculative path's
+// draft (sample_dist) and verify (sample_p) sample the same penalised row.
+
+static void pen_record(int tok) {
+    if (g_pen.last_n <= 0) return;
+    g_pen.hist.push_back(tok);
+    if ((int) g_pen.hist.size() > g_pen.cap) g_pen.hist.erase(g_pen.hist.begin());
+}
+
+// The buffer to sample from: the input itself when there is nothing to do, else a penalised copy in scratch.
+static const float * pen_apply(const float * logits, int n_vocab, std::vector<float> & scratch) {
+    if (g_pen.last_n <= 0) return logits;
+    if (g_pen.repeat == 1.0f && g_pen.freq == 0.0f && g_pen.present == 0.0f) return logits;
+    const int n = (int) g_pen.hist.size();
+    const int from = n > g_pen.last_n ? n - g_pen.last_n : 0;
+    if (from >= n) return logits;
+    scratch.assign(logits, logits + n_vocab);
+    std::vector<int> count((size_t) n_vocab, 0);
+    for (int i = from; i < n; ++i) {
+        const int t = g_pen.hist[(size_t) i];
+        if (t >= 0 && t < n_vocab) count[(size_t) t]++;
+    }
+    for (int t = 0; t < n_vocab; ++t) {
+        const int c = count[(size_t) t];
+        if (c == 0) continue;
+        float & l = scratch[(size_t) t];
+        if (g_pen.repeat != 1.0f) l = l > 0.0f ? l / g_pen.repeat : l * g_pen.repeat;
+        if (g_pen.freq != 0.0f) l -= g_pen.freq * (float) c;
+        if (g_pen.present != 0.0f) l -= g_pen.present;
+    }
+    return scratch.data();
+}
+
 // temperature + top-k / min-p / top-p over the top candidates (top_k 0 = the 256 best); temp 0 = argmax
-int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
+static int sample_p_raw(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
     if (temp <= 0.0f) return (int) (std::max_element(logits, logits + n_vocab) - logits);
     const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
     std::vector<int> idx((size_t) n_vocab);
@@ -190,10 +242,21 @@ int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top
     return idx[(size_t) n - 1];
 }
 
+// records the emitted token, so the window is the sequence actually produced
+static int sample_p(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p, std::mt19937_64 & rng) {
+    std::vector<float> scratch;
+    // pen_record belongs where the sequence grows, not here: a draft the verify accepts never passes through
+    // sample_p, and recording here would count every other token twice.
+    return sample_p_raw(pen_apply(logits, n_vocab, scratch), n_vocab, temp, top_k, top_p, min_p, rng);
+}
+
 // the distribution sample_p draws from, as (token, probability) pairs summing to 1 (temp 0: the argmax alone) - the
-// trunk's p for --serve's speculative sampling (same candidates, same weights as sample_p)
-void sample_dist(const float * logits, int n_vocab, float temp, int top_k, float top_p, float min_p,
+// trunk's p for --serve's speculative sampling (same candidates, same weights as sample_p, and the same penalised
+// row: a draft is not an emitted token, so nothing is recorded here)
+void sample_dist(const float * logits_in, int n_vocab, float temp, int top_k, float top_p, float min_p,
                  std::vector<std::pair<int, double>> & out) {
+    std::vector<float> scratch;
+    const float * logits = pen_apply(logits_in, n_vocab, scratch);   // shadows the parameter: the body is unchanged
     out.clear();
     if (temp <= 0.0f) { out.push_back({ (int) (std::max_element(logits, logits + n_vocab) - logits), 1.0 }); return; }
     const int K = std::min(n_vocab, top_k > 0 ? top_k : 256);
@@ -1115,6 +1178,10 @@ int main(int argc, char ** argv) {
                 else if (k == "top_p") top_p = (float) std::atof(v.c_str());
                 else if (k == "top_k") tk = std::atoi(v.c_str());
                 else if (k == "min_p") min_p = (float) std::atof(v.c_str());
+                else if (k == "penalty_repeat") g_pen.repeat = (float) std::atof(v.c_str());
+                else if (k == "penalty_freq") g_pen.freq = (float) std::atof(v.c_str());
+                else if (k == "penalty_present") g_pen.present = (float) std::atof(v.c_str());
+                else if (k == "penalty_last_n") g_pen.last_n = std::max(0, std::atoi(v.c_str()));
                 else if (k == "seed") rng.seed((uint64_t) std::atoll(v.c_str()));
             }
             std::vector<int> ids = csv.empty() ? std::vector<int>() : parse_csv(csv);
@@ -1461,9 +1528,9 @@ int main(int argc, char ** argv) {
                     if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
-                    hist.push_back(t);
+                    hist.push_back(t); pen_record(t);
                     bool more = true;
-                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
+                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); pen_record(drafts[i]); more = emit(drafts[i]); }
                     prev = acc == 0 ? t : drafts[acc - 1];
                     dirty = acc < k;
                     P += 1 + acc;
@@ -1484,7 +1551,7 @@ int main(int argc, char ** argv) {
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
                 if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
-                hist.push_back(tok);
+                hist.push_back(tok); pen_record(tok);
                 ++pos;
             }
             const double dec_ms = now_ms() - td0;
