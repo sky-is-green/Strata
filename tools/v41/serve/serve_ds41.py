@@ -58,8 +58,11 @@ class Ds41Tokenizer(_Tok):
 ST.Tokenizer = Ds41Tokenizer
 
 # ---- reasoning effort: client spellings -> template kwargs (reasoning_effort = an int 1-100, or thinking off)
-EFFORT = {"none": 0, "off": 0, "disabled": 0, "false": 0, "minimal": 50, "low": 50, "medium": 62, "high": 75,
-          "xhigh": 75, "max": 100, "maximum": 100}
+# The model's own levels are the three the encoder knows (dsv41_encoding.REASONING_EFFORT_MAPPINGS: low 50,
+# high 75, max 100, default high); the clients' extra spellings fold onto those, no invented budgets.
+EFFORT = {"none": 0, "off": 0, "disabled": 0, "false": 0,
+          "minimal": 50, "low": 50, "medium": 50,
+          "high": 75, "xhigh": 75, "max": 100, "maximum": 100}
 
 
 def effort_kwargs(value) -> dict:
@@ -174,6 +177,13 @@ def _svc_init_ds41(self, engine, tokenizer, template, *a, **k):
 
 
 S.Service.__init__ = _svc_init_ds41
+
+# ---- the #123 thinking budget must close V4.1's thinking, not Qwen's </think>
+# serve/server.py holds Qwen's markers ("</think>"); both wrap-up texts go through tok.encode(..., parse_special=True),
+# so putting the model's own end-of-thinking token there is what actually closes the thinking and lets it answer.
+S.REASONING_CLOSE = "\n" + E.thinking_end_token + "\n\n"
+S.REASONING_WRAP_UP = ("\n\nI have thought about this long enough; time to give my answer.\n"
+                       + E.thinking_end_token + "\n\n")
 
 # ---- tool calls: DSML
 CALLS_OPEN = f"<{E.dsml_token}{E.tool_calls_block_name}>"           # <｜DSML｜ calls>
