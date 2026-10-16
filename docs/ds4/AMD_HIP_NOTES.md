@@ -265,6 +265,41 @@ With it, the serve numbers on this box are: a 5.8K-token prompt at **230 tok/s**
 229.8 vs 232.8, i.e. no measurable difference here - the author's one-sweep win at 12288 is on a 20K prompt) and
 decode **26-30 tok/s** with DSpark.
 
+## hipBLASLt on the prompt: measured, and it cannot pay here
+
+`tools/hip/` ships hipBLASLt tuning tables per (architecture, library version) - for this card the pair is gfx1100 +
+hipBLASLt 1.4.1 = `tools/hip/gfx1100-hipblaslt-100401.txt`, and `tools/hip/tune_hipblaslt.cpp` calibrates more
+(`cmake --build build-hip-fused --target tune_hipblaslt`). The **V4.1 engine never links that code**: `ds41_generate`
+has zero `strata::prefill::Gemm` symbols (the reader of the table is the Qwen engine's prefill), so the table changes
+nothing for DeepSeek.
+
+The tuner on this card, our prompt shapes, f16 (what ggml feeds a BLAS path at a large batch), best hipBLASLt
+solution against the tuner's own rocBLAS baseline:
+
+| T | N | K | rocBLAS ms | best hipBLASLt ms | ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1536 | 1280 | 5120 | 3.40 | 0.68 | 5.0x |
+| 1536 | 32768 | 1280 | 15.90 | 2.78 | 5.7x |
+| 1536 | 4608 | 5120 | 11.33 | 0.95 | 11.9x |
+| 1536 | 5120 | 2304 | 3.84 | 0.57 | 6.7x |
+| 1536 | 129280 | 5120 | 157.22 | 28.09 | 5.6x |
+| 5787 | 4608 | 5120 | 24.73 | 4.19 | 5.9x |
+
+So the table idea is real (5-12x over plain rocBLAS) - and still not worth wiring: **the prompt is not GEMM-bound**.
+`rocprofv3` on a 5787-token prompt (21.42 s of kernel time):
+
+| family | s | % |
+| --- | ---: | ---: |
+| expert tier (`native_gu` + `native_down`) | 11.34 | 53.0 |
+| flash attention (`flash_attn_tile` + `combine_results`) | 4.77 | 22.3 |
+| Q8_0 MMQ (`mul_mat_q<8,128>`) | 0.85 | 4.0 |
+| rocBLAS/Tensile GEMM (all of it) | 0.75 | 3.5 |
+| quant/dequant, transcode, copies | 0.54 | 2.5 |
+
+A perfect GEMM path would save at most those 0.75 s of 21.4 (3.5%), and the engine's dense prompt does not even use
+rocBLAS for most of its matmuls (the Q8_0 MMQ kernels above). The prompt's levers are the expert tier and flash
+attention, in that order.
+
 ## Expert kernels on gfx1100: the AMD layouts are compiled out, and switching them on is slower
 
 `src/kernels/cuda/iq_kernels.cu` carries two families of grouped-expert kernels: the CUDA layout (mode 0,
