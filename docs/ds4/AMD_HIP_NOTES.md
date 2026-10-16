@@ -333,6 +333,25 @@ A perfect GEMM path would save at most those 0.75 s of 21.4 (3.5%), and the engi
 rocBLAS for most of its matmuls (the Q8_0 MMQ kernels above). The prompt's levers are the expert tier and flash
 attention, in that order.
 
+## The tier's ternary decode: every existing alternative measured, none adopted
+
+The tier is the single biggest kernel family (53% of a 5787-token prompt, 37% of a decode step), and its weights are
+ternary PTQ1_0 blocks (28 bytes per 128 weights, base-3 digits). Four ways to make it cheaper exist in the tree, and
+all four were measured on this card:
+
+| alternative | result |
+| --- | --- |
+| AMD expert layouts (`STRATA_EXP_MODE=2/4`, what gfx906 picks) | 10.4 / 12.0 vs **13.8** tok/s: wave64 tuning, loses on wave32 |
+| `STRATA_PTQ1_QUARTER` (quarter-block dot) | 12.0 vs 13.8 medians: no gain |
+| `STRATA_PROM=1` (row decoded once into LDS, dp4a per entry) | 154.2 vs 219.6 prompt tok/s: much worse |
+| PTQ1_0 -> Q2_0 (the lossless transcode the prompt MMQ path already uses, `STRATA_MMQ_PTQ1`) | 244.5 vs 239.7 prompt tok/s: +2%, inside the noise |
+
+The last one closes the structural idea too: the Q2_0 kernels are not 3-4x cheaper on this engine's real work (the
+per-call difference in the profile is different work per call, not a cheaper op), so transcoding the decode store
+would buy a couple of percent at best while costing ~28% more memory for those experts and a large change in
+`ds41_moe.cpp`. Not done, on this evidence. What is left is the ternary decode arithmetic itself, which is what the
+format costs.
+
 ## Expert kernels on gfx1100: the AMD layouts are compiled out, and switching them on is slower
 
 `src/kernels/cuda/iq_kernels.cu` carries two families of grouped-expert kernels: the CUDA layout (mode 0,
