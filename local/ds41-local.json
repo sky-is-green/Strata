@@ -43,6 +43,9 @@
  "gpu": 0,
  "sampling": {
   "temperature": 1.0,
-  "top_p": 0.95
- }
+  "top_p": 0.95,
+  "top_k": 40,
+  "min_p": 0.05
+ },
+ "reasoning_loop_recovery": "recover"
 }
