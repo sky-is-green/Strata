@@ -426,6 +426,22 @@ saved that. What is left is the thing the numbers point at: 215 stream synchroni
 work. The decode is a per-layer handshake problem, and the fix is in the engine's pipeline (one sync point per layer
 instead of ~5.4, a deferred top-k readback), not in any kernel or in ggml.
 
+### Who causes the 215 stream synchronizations (attributed from the trace)
+
+The 6,865 syncs in the decode window, by the call immediately before them:
+
+| call before the sync | per token | what it is |
+| --- | ---: | --- |
+| `hipMemcpyAsync` | **95.3** | a device->host readback, ~2.4 per layer (routed ids, state) |
+| `hipGraphLaunch` | **76.7** | the dense graph is launched and **synchronized right after**, ~1.9 per layer |
+| `hipGetLastError` | 42.5 | the launch -> error-query -> sync pattern |
+| after the sync | -- | `hipGetDevice` **119.8** (a device query in the wrapper of every following call) |
+
+Two per-layer handshakes show up clearly: the engine launches the dense graph and blocks on it (~1.9x a layer), and
+it copies something back to the host and blocks for it (~2.4x a layer). The `layer sync` the author already skips on
+this path (`layer_synced` false, `ds41_moe.cpp:2682-2691`) is not among them. `hipGetDevice` 120 times a token is the
+cheapest of the lot and lives in the wrapper layer, not in the engine's logic.
+
 ## A fresh long prompt can crash the engine (found 2026-10-16) and the context penalty is smaller than I thought
 
 **The crash.** A 63,613-token prompt, one-shot, `--prompt-batch 12288 --ctx 262144 --arena-gib 75` (the tuned config):
