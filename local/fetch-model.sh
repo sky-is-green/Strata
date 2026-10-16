@@ -20,9 +20,12 @@
 # use ONE_AT_A_TIME=1 (fetch shard 47 -> extract layer 1 -> delete 47 -> fetch 48 -> extract layer 14 -> delete 48),
 # peak about 163 + 101 + 101 GB.  Two disks are better: pass DEST_LAYERS1 / DEST_LAYERS14.
 #
-# Env: GSQ_REPO, FP8_REPO, DELETE_PARTS=1 (0 keeps the parts), KEEP_FP8=0, ONE_AT_A_TIME=0, DRY_RUN=0, FORCE_JOIN=0,
-#      DEST_LAYERS1, DEST_LAYERS14, HF_TOKEN, VERIFY_ROWS=200 (Engram rows checked against the source),
-#      WORK (scratch for the FP8 shards and the size lists, default DEST).
+# Env: GSQ_REPO, FP8_REPO, DELETE_PARTS=1 (0 keeps the parts), KEEP_FP8=0 (1 keeps the FP8 shards after the
+#      extraction, 101 GB each), ONE_AT_A_TIME=0 (1 = Engram shard by shard, for a single disk), DRY_RUN=0 (1 = print
+#      the plan and change nothing), FORCE_JOIN=0 (1 = remove an interrupted joined file and join again),
+#      DEST_LAYERS1, DEST_LAYERS14 (put the two Engram tables on different disks), HF_TOKEN (gated repos only),
+#      VERIFY_ROWS=200 (Engram rows checked against the source), WORK=default DEST (scratch for the FP8 shards and
+#      the size lists).  The README's "Getting the model files" section has the same table.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)

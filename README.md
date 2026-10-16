@@ -90,6 +90,25 @@ shard at a time (peak about 163 + 101 + 101 GB).
 local/fetch-model.sh /path/to/models     # DEST defaults to <repo>/models
 ```
 
+It is resumable and it checks: every expected size comes from the Hugging Face API, a file counts as complete only
+when its size matches (so a partial download is resumed with `curl -C -`, never trusted), the parts are joined by the
+repo's own `reassemble.sh` (which verifies their sha256 first and the joined file at the end), and an interrupted join
+is reported instead of being joined over.  Every parameter:
+
+| variable | default | what it does |
+| --- | --- | --- |
+| first argument | `<repo>/models` | where the trees go |
+| `GSQ_REPO`, `FP8_REPO` | the two repositories linked above | where to fetch from |
+| `DRY_RUN=1` | 0 | print the whole plan (what is complete, what would be fetched, the join, the Engram steps) and change nothing |
+| `DELETE_PARTS` | 1 | drop each GGUF part as it is appended; `0` keeps them and needs the space twice |
+| `ONE_AT_A_TIME` | 0 | Engram one shard at a time: fetch 47, extract layer 1, delete 47, fetch 48, extract layer 14, delete 48 (peak about 163 + 101 + 101 GB on a single disk) |
+| `DEST_LAYERS1`, `DEST_LAYERS14` | `<models>/engram/layers1`, `layers14` | put the two Engram tables on different disks |
+| `KEEP_FP8` | 0 | keep the FP8 shards after the extraction (101 GB each) |
+| `FORCE_JOIN` | 0 | remove an interrupted `V41-GSQ.gguf` and join again (by default it stops and says so) |
+| `VERIFY_ROWS` | 200 | how many random Engram rows are checked against the source |
+| `WORK` | `DEST` | scratch for the FP8 shards and the size lists |
+| `HF_TOKEN` | `~/.cache/huggingface/token` | needed only for gated repositories |
+
 ## Documents
 
 - [docs/ds4/AMD_HIP_NOTES.md](docs/ds4/AMD_HIP_NOTES.md) - every measurement and every setting on this machine.
