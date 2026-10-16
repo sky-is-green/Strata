@@ -113,6 +113,7 @@ is reported instead of being joined over.  Every parameter:
 | --- | --- | --- |
 | first argument | `<repo>/models` | where the trees go |
 | `GSQ_REPO`, `FP8_REPO` | the two repositories linked above | where to fetch from |
+| `JOBS` | 4 | how many GGUF parts are fetched at once (a single Hugging Face connection is throttled to about 5-6 MB/s here; four measured ~27 MB/s) |
 | `DRY_RUN=1` | 0 | print the whole plan (what is complete, what would be fetched, the join, the Engram steps) and change nothing |
 | `DELETE_PARTS` | 1 | drop each GGUF part as it is appended; `0` keeps them and needs the space twice |
 | `ONE_AT_A_TIME` | 1 | Engram one shard at a time: fetch 47, extract layer 1, delete 47, fetch 48, extract layer 14, delete 48 (peak about 163 + 101 + 101 GB); `0` fetches both shards first and needs 163 + 203 + 202 GB |

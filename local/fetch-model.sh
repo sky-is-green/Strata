@@ -25,6 +25,7 @@
 # Env: GSQ_REPO, FP8_REPO, DELETE_PARTS=1 (0 keeps the parts), KEEP_FP8=0 (1 keeps the FP8 shards after the
 #      extraction, 101 GB each), ONE_AT_A_TIME=1 (0 = both shards first, needs 163 + 203 + 202 GB), DRY_RUN=0 (1 = print
 #      the plan and change nothing), FORCE_JOIN=0 (1 = remove an interrupted joined file and join again),
+#      JOBS=4 (parts fetched at once: a single HF connection is throttled to about 5-6 MB/s, four give ~27),
 #      DEST_LAYERS1, DEST_LAYERS14 (put the two Engram tables on different disks), HF_TOKEN (gated repos only),
 #      VERIFY_ROWS=200 (Engram rows checked against the source), WORK=default DEST (scratch for the FP8 shards and
 #      the size lists).  The README's "Getting the model files" section has the same table.
@@ -91,7 +92,19 @@ for f in SHA256SUMS reassemble.sh rank.bin V41-GSQ.gguf.experts.json V41-MTP-Vis
          tokenizer/vocab.json tokenizer/merges.txt tokenizer/token_type.json tokenizer/chat_template.jinja; do
   get "$GSQ_SIZES" "$GSQ_REPO" "$f" "$GSQ"
 done
-for n in $(seq -w 1 16); do get "$GSQ_SIZES" "$GSQ_REPO" "V41-GSQ.gguf.part-$n-of-16" "$GSQ"; done
+# One Hugging Face connection runs at about 5-6 MB/s here, so fetch several parts at once (JOBS=4 measured
+# ~27 MB/s aggregate) and then a check pass for anything a failed job left partial.
+JOBS=${JOBS:-4}
+export JOBS   # fetch_v41.sh reads it too, for the FP8 shards
+say "      $JOBS parts at a time"
+n=0
+for part in $(seq -w 1 16); do
+  get "$GSQ_SIZES" "$GSQ_REPO" "V41-GSQ.gguf.part-$part-of-16" "$GSQ" &
+  n=$((n + 1))
+  if [ $((n % JOBS)) -eq 0 ]; then wait; fi
+done
+wait
+for part in $(seq -w 1 16); do get "$GSQ_SIZES" "$GSQ_REPO" "V41-GSQ.gguf.part-$part-of-16" "$GSQ"; done
 
 say "=== 2/4 join and verify the parts"
 want_gguf=$(awk '/^V41-GSQ\.gguf\.part-/ { s += $2 } END { print s + 0 }' "$GSQ_SIZES")
