@@ -381,6 +381,32 @@ would buy a couple of percent at best while costing ~28% more memory for those e
 `ds41_moe.cpp`. Not done, on this evidence. What is left is the ternary decode arithmetic itself, which is what the
 format costs.
 
+## What `attn_router` really is: the decode is host/sync-bound, not GPU-bound
+
+`rocprofv3 --runtime-trace --kernel-trace` on a decode with a **17K-token state filled** (32 tokens, one-shot, batch
+4096). Under the profiler the wall inflates to 139 ms/token (unprofiled ~75), so read the **split**, not the absolute:
+
+| | per token |
+| --- | ---: |
+| wall (profiled) | 139.0 ms |
+| **GPU kernels** | **32.2 ms (23%)** in 4,238 launches |
+| therefore outside the kernels | **106.9 ms (77%)** |
+| HIP API calls | 2,213 (their summed duration = the whole wall) |
+
+Kernel time by family: `mmvq` 11.7 ms, tier 4.8, `mmvq_f` 3.0, elementwise 2.7, copies/fill 2.2, argsort 1.2,
+quant 0.95. The API calls, per token: `hipGetLastError` **685**, `hipLaunchKernel` **520**, `hipMemcpyAsync`
+**392**, `hipStreamSynchronize` **215**, `hipGetDevice` **206**, `hipEventRecord` 97, `hipGraphLaunch` 77.
+
+So per layer (~40 a token) the engine issues ~5.4 blocking stream synchronizations and ~13 launches, and the GPU sits
+idle while the host walks that sequence. This is the same conclusion the upstream notes reached on CUDA ("removing
+ggml-stream syncs: the wait moves"), but on HIP the syncs cost more, and here they are 57-77% of the token: the
+dense half is not slow because the kernels are slow, it is slow because of how many times the host waits.
+
+**Consequence for the plan:** the levers on the decode are, in order, (1) fewer synchronizations per layer (an engine
+pipeline change, not a kernel), (2) fewer API calls per token - the 685 error queries and the 392 async copies are
+the cheapest to remove - and only then (3) kernel work. A new attention or indexer kernel cannot pay while the GPU is
+idle three quarters of the time.
+
 ## A fresh long prompt can crash the engine (found 2026-10-16) and the context penalty is smaller than I thought
 
 **The crash.** A 63,613-token prompt, one-shot, `--prompt-batch 12288 --ctx 262144 --arena-gib 75` (the tuned config):
