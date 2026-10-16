@@ -66,6 +66,19 @@ peer expert tier on the second card (correct and bit-identical rows, 91.5 rows a
 against 12.6 tok/s), the transcode decode, `STRATA_HIP_WMMA` (the +5.4% was noise: v41 never calls that kernel), a
 cache for `ggml_cuda_get_device` (120 calls a token, 0.06 ms) and the 685 per-token error queries (below 0.3 ms).
 
+## Run it
+
+```sh
+./run-v41-gsq.sh                 # the server on port 8150, with the configuration in local/ds41-local.json
+./run-v41-gsq.sh --port 8151     # extra server arguments are passed straight through
+```
+
+It first checks that the model and the two Engram tables are in `models/` and says what is missing if they are not.
+Loading takes a couple of minutes (152 GiB are mapped, the RAM arena is filled, the Engram tables are opened); once
+it is up, `curl -s http://127.0.0.1:8150/v1/models` answers `"status": {"value": "loaded"}`, and the OpenAI- and
+Anthropic-compatible API is on that port.  For a single generation without the server, use `local/run-one-shot.sh`
+(with `EXE=$PWD/build-hip-fused/ds41_generate` for the fused build the server uses).
+
 ## Getting the model files
 
 The model is not in git (355 GiB in total).  [local/fetch-model.sh](local/fetch-model.sh) builds exactly the layout
