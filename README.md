@@ -1,9 +1,61 @@
 <h1 align="center">Strata-DSV4.1</h1>
 
 <p align="center"><b>DeepSeek-V4.1-Flash (40 layers × 384 experts) on one gaming PC - 152 GiB of experts across VRAM, pinned RAM and NVMe</b><br>
-DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
+DeepSeek-V4.1 and V4-Flash engines built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · AMD (HIP, gfx1100) · MIT</p>
 
 <p align="center"><b>RTX 4090 + 90 GB RAM:&nbsp; prefill ~250 tok/s (exact) &nbsp;·&nbsp; DSpark decode 17-30 tok/s at the coding-safe bias (x0.5) &nbsp;·&nbsp; 512K context</b></p>
+
+<p align="center"><b>RX 7900 XTX (gfx1100, ROCm 7.14) + 128 GiB RAM:&nbsp; prefill 240-363 tok/s &nbsp;·&nbsp; DSpark decode 24.3 tok/s &nbsp;·&nbsp; 256K context, 8-bit KV</b></p>
+
+## AMD (gfx1100): this repo on one RX 7900 XTX
+
+Everything in this section was measured on this machine, on **one** RX 7900 XTX (gfx1100, ROCm 7.14) with 128 GiB of
+RAM and one 2 TB NVMe; the engine runs on a single card (`"gpu": 0` in `local/ds41-local.json`).  On disk:
+`models/V41-GSQ/V41-GSQ.gguf` (152 GiB), the 5.3 GiB DSpark draft with its small files, and the two Engram tables in
+`models/engram/` (189 GiB, layer 1 and layer 14).  A second card in the machine was tried as an expert tier, verified
+correct and then dropped (see the negatives below): behind its PCIe 4.0 **x2** bridge it is worth +10-20% as extra
+cache, not 2x.
+
+| measured here, one sequence | |
+| --- | ---: |
+| decode, 4K state, DSpark off | 13.7 tok/s |
+| decode, 64K state, DSpark off | 14.0 tok/s |
+| decode through the server, DSpark depth 4, ggml graphs off | 22.8 -> 24.3 tok/s |
+| prompt, 5787 tokens | 240-245 tok/s |
+| prompt, 63,617 tokens, fresh, through the server | 363 tok/s |
+
+### The optimizations, each with what it was worth
+
+| change | measured effect |
+| --- | --- |
+| ggml's fused dense ops (`local/build-ggml-fused.sh`: `dsv41-fake-quant.patch` + `dsv41-fuse.patch`) | +13% decode, +23% with DSpark; last-row logits top-1 identical, mean abs difference 0.156 |
+| `--arena-gib 75` (from 60) | +40% decode (16.4-17.4 -> 23.8-25.2 tok/s), prompt file wait 16.6 -> 11.0 s; 80 and above are worse or unstable |
+| `GGML_CUDA_DISABLE_GRAPHS=1` | +6.6% decode, +3% prompt in the server |
+| `STRATA_PRESTAGE_GIB=1.5` | +5.8% prompt (231.2 -> 244.5 tok/s) |
+| `--kv-q8` (8-bit KV, not 4-bit) | lossless here: last-row cosine 0.998987, top-5 5/5, +0.37 GiB |
+| DSpark depth 4 with `KEEP 64` | depth 5, depth 6, `KEEP 32` and `KEEP 128` all measured worse |
+| `STRATA_SERVE_PASS_BIAS=0` | the author's 0.5/0.3 bias gives 2.2x the expert misses here: 12.1 against 25.1 tok/s |
+| the v41 serve's thinking budget (`reasoning_budget_tokens 8192`, `reasoning_close_retry`) | a runaway reasoning loop is now closed at the budget and the model answers (tested with a 128-token budget) |
+| the effort mapping aligned with the reference implementation | `low`/`medium`/`xhigh` resolve the way DwarfStar resolves them for V4.1 (75/75/75) |
+| DSML tool-call parsing in the local path | tool calls reach the client (streaming and not) |
+| prompt batching | a fresh 63K prompt at `--prompt-batch 12288` can run out of memory and segfault the one-shot CLI; the server sizes the batch itself and does 363 tok/s |
+
+Where the time goes (runtime trace, 17K state): the GPU kernels are 32.2 ms of a 139 ms profiled token, and the 215
+`hipStreamSynchronize` calls a token account for 105 ms - 95.3 of them after a device-to-host readback and 76.7 after
+the dense graph's launch - with 4,238 kernel launches a token.  Decode is host/sync-bound, not GPU-bound, and the
+lever that is left is the launch count, not the pipeline (measured and closed in
+[docs/ds4/V41_PIPELINE_OVERLAP.md](docs/ds4/V41_PIPELINE_OVERLAP.md)).
+
+Tried and reverted, with the numbers, so they are not repeated: `--pf-b` below 1.0 (-19% decode; the default 1.43
+sits just above that cliff), DSpark depth 5 and 6, `KEEP 32` and `128`, `STRATA_DSPARK_ADAPT`, the adaptive arena,
+`STRATA_PROM=1`, the peer expert tier on the second card (correct and bit-identical rows, 91.5 rows a token moved off
+card 0, but 11.8 against 12.6 tok/s), the transcode decode, `STRATA_HIP_WMMA` (the +5.4% was noise: v41 never calls
+that kernel), a cache for `ggml_cuda_get_device` (120 calls a token, 0.06 ms) and the 685 per-token error queries
+(below 0.3 ms).
+
+Documents: [docs/ds4/AMD_HIP_NOTES.md](docs/ds4/AMD_HIP_NOTES.md) (every measurement and every setting),
+[docs/ds4/V41_PIPELINE_OVERLAP.md](docs/ds4/V41_PIPELINE_OVERLAP.md) (the per-layer host handshake) and
+[docs/ds4/V41_AMD_PEER_TIER.md](docs/ds4/V41_AMD_PEER_TIER.md) (the second-card design that was dropped).
 
 > **Status: experimental, single-developer research code, measured on one PC.** The V4.1 engine generates correct
 > text, its GPU prompt path is deterministic (byte-identical logits run to run), and it serves an OpenAI / Anthropic
