@@ -381,6 +381,27 @@ would buy a couple of percent at best while costing ~28% more memory for those e
 `ds41_moe.cpp`. Not done, on this evidence. What is left is the ternary decode arithmetic itself, which is what the
 format costs.
 
+## DSpark's adaptive bypass (DwarfStar's scheduler): implemented, measured, does NOT pay here
+
+DwarfStar's adaptive scheduler probes four speculative cycles and requires an average of four accepted tokens per
+cycle; below that it bypasses speculation, which caps the draft's overhead at 1.1% on their stack
+(`speed-bench/gfx1151-prefill-results.md:45-54`). Our low-acceptance case looked like the same problem (prose 16.3
+tok/s against 26.7 on code), so the bypass was implemented in this engine's serve loop (`STRATA_DSPARK_ADAPT`,
+threshold `STRATA_DSPARK_ADAPT_MIN`, probe after 4 passes, re-probe every 64) and measured on the same creative
+prompt, 400 tokens, fresh server a side:
+
+| | decode tok/s | accepted/pass |
+| --- | ---: | ---: |
+| adaptive off | **13.5 / 13.9** | 2.19 |
+| adaptive on (threshold 2.0) | 12.1 | bypassed (1.50 at the probe) |
+| adaptive on (threshold 1.7) | 12.8 | bypassed (1.50 at the probe) |
+
+Two reasons it cannot win here: the probe's four passes are the *least* predictable part of a generation (the
+acceptance rises to 2.19 as the text settles - so the bypass fires on bad evidence), and this engine's speculative
+pass is cheap enough that it beats the non-speculative one even at 1.5 accepted/pass (74 ms/token against 78
+bypassed). The patch was removed; the numbers are the record. Same shape as the confidence trim: a technique that
+pays on another stack (their DSpark is 1.32x, ours 1.7-2x) does not pay on this one.
+
 ## The author's serve settings, measured on this box (2026-10-16)
 
 `tools/v41/serve/ds41-engine.sh` + `strata-ds41.json` are the author's production serve settings. Every one that

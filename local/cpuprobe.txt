@@ -1,0 +1,4 @@
+engine pid=1602627
+CPU del motore: 1843 tick / 1000 tick-secondi = 184% di un core
+thread del motore: 92 totali, 1 in esecuzione adesso
+    PID UTENTE   PR   NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMANDO
