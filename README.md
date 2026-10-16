@@ -73,14 +73,16 @@ this branch uses:
 
 1. the 16 parts of `V41-GSQ.gguf` plus `SHA256SUMS`, `rank.bin`, `V41-GSQ.gguf.experts.json`, the DSpark draft and the
    tokenizer, from [IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)
-   (resumable), joined and verified by the repo's own `reassemble.sh` - it checks every part's sha256 before appending;
+   (resumable), joined and verified by the repo's own `reassemble.sh` - it checks every part's sha256 before appending
+   and drops each part as it goes (`DELETE_PARTS=0` keeps them), so what stays is the joined `V41-GSQ.gguf`, exactly
+   the tree the numbers above were measured on;
 2. the two Engram tables, which are **not** in that repo: they are shards 47 (layer 1) and 48 (layer 14) of
    [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8),
    fetched by `tools/v41/fetch_v41.sh` and extracted with `tools/v41/extract_engram.py` into `models/engram/layers1`
    and `models/engram/layers14`, with the merged index from `local/engram_index.py` (the engine needs it because the
    two tables live in different directories).
 
-Space: 163 GB of parts for the GGUF, and 101 GB per Engram table plus the 101 GB shard each comes from.  With two
+Space: 163 GB of parts for the GGUF (the join needs the same again only with `DELETE_PARTS=0`), and 101 GB per Engram table plus the 101 GB shard each comes from.  With two
 disks, set `DEST_LAYERS1` and `DEST_LAYERS14`; on one disk use `ONE_AT_A_TIME=1`, which extracts and deletes one
 shard at a time (peak about 163 + 101 + 101 GB).
 

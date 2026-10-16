@@ -9,20 +9,20 @@
 #
 # DEST defaults to <repo>/models.  Needs curl and python3.
 #
-# Space: the GGUF is 163 GB of parts (the join needs the same again, or use DELETE_PARTS=1 to free each part as it is
-# joined) and the Engram is 101 GB per table plus the 101 GB shard it comes from.  On one disk the tightest order is
-# ONE_AT_A_TIME=1 (fetch shard 47 -> extract layer 1 -> delete 47 -> fetch 48 -> extract layer 14 -> delete 48): peak
-# about 163 + 101 + 101 GB.  Two disks are better: pass DEST_LAYERS1 / DEST_LAYERS14.
+# Space: the GGUF arrives as 163 GB of parts, and the join drops each part as it appends it (DELETE_PARTS=0 keeps
+# them, which needs the same space again) and the Engram is 101 GB per table plus the 101 GB shard it comes from.  On
+# one disk the tightest order is ONE_AT_A_TIME=1 (fetch shard 47 -> extract layer 1 -> delete 47 -> fetch 48 -> extract
+# layer 14 -> delete 48): peak about 163 + 101 + 101 GB.  Two disks are better: pass DEST_LAYERS1 / DEST_LAYERS14.
 #
-# Env: GSQ_REPO, FP8_REPO, DELETE_PARTS=1, KEEP_FP8=0, ONE_AT_A_TIME=0, DEST_LAYERS1, DEST_LAYERS14, HF_TOKEN,
-#      VERIFY_ROWS=200 (Engram rows checked against the source), WORK (scratch for the FP8 shards, default DEST).
+# Env: GSQ_REPO, FP8_REPO, DELETE_PARTS=1 (0 keeps the 16 parts), KEEP_FP8=0, ONE_AT_A_TIME=0, DEST_LAYERS1,
+#      DEST_LAYERS14, HF_TOKEN, VERIFY_ROWS=200 (Engram rows checked against the source), WORK (FP8 scratch, default DEST).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 DEST=${1:-$HERE/models}
 GSQ_REPO=${GSQ_REPO:-IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored}
 FP8_REPO=${FP8_REPO:-dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8}
-DELETE_PARTS=${DELETE_PARTS:-0}
+DELETE_PARTS=${DELETE_PARTS:-1}   # 1 = drop each part right after the join, so the tree ends as models/ is now
 KEEP_FP8=${KEEP_FP8:-0}
 ONE_AT_A_TIME=${ONE_AT_A_TIME:-0}
 VERIFY_ROWS=${VERIFY_ROWS:-200}
@@ -80,6 +80,11 @@ fi
 
 say "=== 4/4 the merged index the engine reads (it resolves every tensor across all --engram dirs)"
 python3 "$HERE/local/engram_index.py" "$DEST_L1" "$DEST_L14"
+rmdir "$WORK/fp8" 2>/dev/null || true
+
+say "=== layout under $DEST, to compare with the machine these numbers came from"
+du -sh "$GSQ" "$DEST_L1" "$DEST_L14" 2>/dev/null
+ls -1 "$GSQ" "$DEST_L1" "$DEST_L14"
 
 say "=== done.  Point the config at these two directories, for example:"
 say "    --engram $DEST_L1:$DEST_L14"
