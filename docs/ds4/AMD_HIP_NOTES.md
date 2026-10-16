@@ -265,6 +265,23 @@ With it, the serve numbers on this box are: a 5.8K-token prompt at **230 tok/s**
 229.8 vs 232.8, i.e. no measurable difference here - the author's one-sweep win at 12288 is on a 20K prompt) and
 decode **26-30 tok/s** with DSpark.
 
+## Prompt streaming: layer prestage (the DMA overlap)
+
+`STRATA_PRESTAGE_GIB=<GiB>` keeps a device region where the NEXT routed layer's arena experts are DMA'd on a second
+stream while the current layer's dense half runs (`chunk_pstage_issue` / `Gpu::p_buf`); `run_chunk` then launches
+from there and streams only the rest. Measured through the server (`--serve`, the path it belongs to), 5787-token
+prompt, one request a side, fresh server each time, batch 12288 + `STRATA_HIP_WMMA=1`:
+
+| `STRATA_PRESTAGE_GIB` | prompt tok/s |
+| --- | ---: |
+| unset (baseline) | 231.2 |
+| 1.5 (adopted) | **244.5** |
+| 3.0 | 236.2 |
+
+It only moves data (no arithmetic), so the tokens are unchanged. One request a side, so read the +5.8% as the
+direction; 1.5 (the author's value) beats 3.0 here. With `STRATA_HIP_WMMA=1` the served prompt on this box goes from
+~220 to ~245 tok/s on a 5787-token prompt (both opt-ins are in `local/ds41-local.json`).
+
 ## Prompt attention on the matrix cores (gfx11)
 
 `STRATA_HIP_WMMA=1` switches the int8-KV prompt attention to the WMMA path (`src/kernels/cuda/qsa_prompt_attn.cu`,
