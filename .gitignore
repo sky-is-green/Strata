@@ -79,3 +79,6 @@ build-vision-cuda12.bat
 /local/*.ids
 /.hf-cache/
 /.run/
+
+# our launcher is part of this branch (the run-*.sh files the setup generates are not)
+!/run-v41-gsq.sh

@@ -27,7 +27,9 @@ V41 = HERE.parent
 # Strata's server this shim sits in front of.  Default: the installed layout (~/AI/Strata).  STRATA_HOME points it at
 # another tree, and this checkout is one (a Strata fork ships its own serve/), so a self-contained install needs no
 # ~/AI/Strata at all.
-STRATA = Path(os.environ.get("STRATA_HOME") or (Path.home() / "AI" / "Strata"))
+# STRATA_HOME names the checkout that provides serve/, tools/ and strata_tokenizer.  This repository is one, so
+# that is the default; the upstream flow pointed it at an ambient ~/AI/Strata install instead.
+STRATA = Path(os.environ.get("STRATA_HOME") or Path(__file__).resolve().parents[3])
 sys.path.insert(0, str(STRATA))
 sys.path.insert(0, str(STRATA / "tools"))
 sys.path.insert(0, str(V41.parent))          # Strata-DS4/tools: strata_tokenizer.py with the joyai-llm pre-split
@@ -317,7 +319,6 @@ _TEXT_LOG = os.environ.get("STRATA_TEXT_LOG", "/tmp/strata-ds41-text.log")
 _text_lock = _th.Lock()
 _text_state = {"kind": None}
 _KIND_LABEL = {"reasoning": "thinking", "content": "answer", "tool_start": "tool call", "tool_call": "tool call"}
-
 
 def _text_write(s: str):
     if not _TEXT_LOG or _TEXT_LOG == "0":
