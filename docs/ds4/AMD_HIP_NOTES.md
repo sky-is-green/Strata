@@ -381,6 +381,37 @@ would buy a couple of percent at best while costing ~28% more memory for those e
 `ds41_moe.cpp`. Not done, on this evidence. What is left is the ternary decode arithmetic itself, which is what the
 format costs.
 
+## A fresh long prompt can crash the engine (found 2026-10-16) and the context penalty is smaller than I thought
+
+**The crash.** A 63,613-token prompt, one-shot, `--prompt-batch 12288 --ctx 262144 --arena-gib 75` (the tuned config):
+
+```
+chunk prestage: 2.32 GiB device region
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 2194.81 MiB on device 0: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate ROCm0 buffer of size 2301427712
+ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying
+Segmentation fault (core dumped)
+```
+
+The dense pass graph wants ~2.19 GiB at that batch, does not fit next to a 75 GiB arena's expert cache at 256K, the
+retry frees the prestage region and then **segfaults** instead of falling back to a smaller batch. Same prompt with
+`--prompt-batch 4096`: **works**, 63,613 tokens in 174.91 s = **363.7 tok/s** prefill. The serve path caps the batch
+from free VRAM itself ("serve: VRAM 14.87 GiB free -> prompt batch 10316"), which is why the long sessions in the
+server have not crashed, but a *fresh* 60K+ prompt on the one-shot path is a crash, not a slowdown. Upstream is
+tracking the same budget question (their run21 note: 16384 needs a speed knob, not a precision change).
+
+**The context penalty, re-measured with the phase timer** (same binary, `STRATA_DEC_PROF`, 64 decode steps):
+
+| prompt | begin | predict | attn_router | tier | finish | total | decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 113 token (4K state) | 4.08 | 0.46 | 43.35 | 18.68 | 5.61 | 72.2 ms | 13.67 tok/s |
+| 63,613 token (64K state) | 0.50 | 0.40 | 57.66 | 11.43 | 5.20 | 75.2 ms | **14.00 tok/s** |
+
+So from 4K to 64K the token does **not** get materially slower: `attn_router` grows by 14 ms and the tier and `begin`
+give most of it back. The earlier 12.7 / 14.1 / 9.8 tok/s at ctx 4K / 32K / 256K was confounded. What dominates at
+every context is `attn_router` (43-58 ms, 57-77% of the token), and it is **not** the indexer scaling with the
+context - which weakens the "batched indexer top-k" lead as the next step.
+
 ## DSpark's adaptive bypass (DwarfStar's scheduler): implemented, measured, does NOT pay here
 
 DwarfStar's adaptive scheduler probes four speculative cycles and requires an average of four accepted tokens per
