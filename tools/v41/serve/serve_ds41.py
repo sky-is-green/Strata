@@ -60,8 +60,12 @@ ST.Tokenizer = Ds41Tokenizer
 # ---- reasoning effort: client spellings -> template kwargs (reasoning_effort = an int 1-100, or thinking off)
 # The model's own levels are the three the encoder knows (dsv41_encoding.REASONING_EFFORT_MAPPINGS: low 50,
 # high 75, max 100, default high); the clients' extra spellings fold onto those, no invented budgets.
+# Faithful to the reference implementation (DwarfStar ds4.h:29, ds4.c:44201-44208): DeepSeek-V4.1 renders the
+# effort as "Reasoning Effort: N (range 1-100, ...)", with HIGH pinned to 75 and MAX to 100; the low/medium names
+# belong to Qwen3.8 and "other models render them as HIGH". A numeric 1-100 is also accepted and rendered as given,
+# which is the only way to ask for something between the two named levels.
 EFFORT = {"none": 0, "off": 0, "disabled": 0, "false": 0,
-          "minimal": 50, "low": 50, "medium": 50,
+          "minimal": 75, "low": 75, "medium": 75,
           "high": 75, "xhigh": 75, "max": 100, "maximum": 100}
 
 
@@ -81,13 +85,13 @@ def effort_kwargs(value) -> dict:
 
 
 def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget mapped onto the model's three levels (low 50, high 75, max 100): under 2K low,
-    under 8K high, else max - the encoder only defines those three (dsv41_encoding.REASONING_EFFORT_MAPPINGS)."""
+    """Anthropic's thinking budget: V4.1 has two named levels (HIGH 75, MAX 100), so a small or medium budget asks
+    for HIGH and a large one for MAX (the reference renders low/medium as HIGH, ds4.h:29)."""
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": 50 if n < 2048 else 75 if n < 8192 else 100}
+    return {"reasoning_effort": 75 if n < 8192 else 100}
 
 
 for mod in (F, S):
