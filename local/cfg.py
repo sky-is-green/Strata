@@ -26,9 +26,9 @@ def save(d):
 
 
 def drop_args(args, flags):
-    """Rimuove i flag indicati e il loro valore (un flag consuma il token successivo solo se non e' a sua volta un
-    flag).  La versione precedente aveva la condizione invertita e poteva mangiare il flag seguente o lasciare il
-    valore: e' cosi' che un --arena-gib 64 e' rimasto negli args."""
+    """Drop the named flags and their values (a flag consumes the next token only when that token is not itself a
+    flag).  The earlier version had the condition inverted and could eat the following flag or leave the value
+    behind: that is how a stray --arena-gib 64 stayed in the args."""
     out, i = [], 0
     while i < len(args):
         if args[i] in flags:
