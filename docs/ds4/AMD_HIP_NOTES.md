@@ -381,6 +381,39 @@ would buy a couple of percent at best while costing ~28% more memory for those e
 `ds41_moe.cpp`. Not done, on this evidence. What is left is the ternary decode arithmetic itself, which is what the
 format costs.
 
+## ggml's HIP graph capture costs more than it saves here (`GGML_CUDA_DISABLE_GRAPHS=1`)
+
+`rocprofv3 --runtime-trace` on a decode: **6,986 HIP runtime calls per token** - 1,822 launches, 951 `hipMemcpyAsync`
+(508 of them host->device), 3,130 `hipGetLastError`, 652 `hipGetDevice`, 176 `hipStreamSynchronize`, and **20
+`hipStreamBeginCapture` + 20 `hipStreamEndCapture` per token**. That is the ~14 ms/token between the 69.4 ms of GPU
+kernel time and the 83 ms a token really takes. ggml re-captures its dense graph instead of replaying it (its key
+includes pointers that this engine moves as the context grows), so the capture is pure cost.
+
+| (same flags, `--kv-q8`, arena 75, 256K, Engram) | prompt tok/s | decode tok/s |
+| --- | ---: | ---: |
+| graphs on (ggml default) | 232.6 | 22.8 |
+| **`GGML_CUDA_DISABLE_GRAPHS=1`** | **240.1** | **24.3** |
+
+Through `--serve`, 5787-token prompt + 96-token reply, fresh server a side (wall 29.1 -> 28.1 s); one-shot, 64
+tokens, 3 runs a side: 13.9 [13.9 15.3 13.4] -> **15.4 [15.6 15.4 15.0]**. Adopted in `local/ds41-local.json`.
+
+On the numbers it is not bit-identical, and that is worth stating: the last-token logits of a single step are equal
+to the last bit (`--dump-last`, max|delta| 0.0000, top-1 19 both ways), and in a 64-token greedy run the first **50**
+tokens match and then a near-tie flips (11 of 64 differ). Same class as every other kernel choice here: the same
+model, a different summation order - not a different model. Independent confirmation that graphs do not pay on RDNA: hipfire's experiment measured
+4.31 us/launch native against 18.25 us/node with a graph (N=200), hipEngine 1.00x on gfx1100, and rocWMMA+graphs
+crashes on gfx1201 (llama.cpp #24961) - the workaround is this same env.
+
+## The second card sits on a PCIe 4.0 x2 uplink
+
+`lspci` topology, this box: card 0 is `03:00.0` behind `02:00.0` (**x16**, 16 GT/s); card 1 is `16:00.0` behind
+`15:00.0` (x16) which is behind **`14:00.0`: width 2, 16 GT/s = PCIe 4.0 x2** (~4 GB/s against ~32). The card
+negotiates x16, so `current_link_width` on the endpoint alone is misleading - the bridge is the bottleneck.
+
+That is a second, hardware reason the peer expert tier could not win (its per-layer hand-off rides that link), on top
+of the dense half being 63% of the step. For two cards here, only work with little cross-traffic pays; a layer split
+or a peer store served over x2 does not.
+
 ## Expert kernels on gfx1100: the AMD layouts are compiled out, and switching them on is slower
 
 `src/kernels/cuda/iq_kernels.cu` carries two families of grouped-expert kernels: the CUDA layout (mode 0,
