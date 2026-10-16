@@ -31,6 +31,10 @@
 #      the size lists).  The README's "Getting the model files" section has the same table.
 set -euo pipefail
 
+# The parts are fetched as background children, so Ctrl+C must take the whole process group with it: without
+# this the curls keep downloading after the script has gone (measured: three of them survived a Ctrl+C).
+trap 'trap - INT TERM; kill 0 2>/dev/null' INT TERM
+
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 DEST=${1:-$HERE/models}
 GSQ_REPO=${GSQ_REPO:-IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored}
