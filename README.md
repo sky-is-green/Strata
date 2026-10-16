@@ -74,6 +74,9 @@ cache for `ggml_cuda_get_device` (120 calls a token, 0.06 ms) and the 685 per-to
 ```
 
 It first checks that the model and the two Engram tables are in `models/` and says what is missing if they are not.
+It picks the interpreter itself: `STRATA_PY` if set, then a `.venv` in the repository, then `venv/`, then `python3` -
+the first one that imports **pillow, psutil, regex and jinja2**, which are the only packages the server needs
+(`python3 -m venv .venv && .venv/bin/pip install pillow psutil regex jinja2`; `.venv/` is already gitignored).
 Loading takes a couple of minutes (152 GiB are mapped, the RAM arena is filled, the Engram tables are opened); once
 it is up, `curl -s http://127.0.0.1:8150/v1/models` answers `"status": {"value": "loaded"}`, and the OpenAI- and
 Anthropic-compatible API is on that port.  For a single generation without the server, use `local/run-one-shot.sh`
@@ -86,25 +89,30 @@ this branch uses:
 
 1. the 16 parts of `V41-GSQ.gguf` plus `SHA256SUMS`, `rank.bin`, `V41-GSQ.gguf.experts.json`, the DSpark draft and the
    tokenizer, from [IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)
-   (resumable), joined and verified by the repo's own `reassemble.sh` - it checks every part's sha256 before appending
-   and drops each part as it goes (`DELETE_PARTS=0` keeps them), so what stays is the joined `V41-GSQ.gguf`, exactly
-   the tree the numbers above were measured on;
+   (resumable), joined and verified by the repo's own `reassemble.sh`, which checks the sha256 of every part before
+   appending anything and verifies the joined file at the end.  The join keeps the parts until the file is verified
+   (so an interruption can be re-run) and only then removes them; with less than twice the model free it joins in
+   place instead, dropping each part as it appends it, and says so in the log.  What stays is the joined
+   `V41-GSQ.gguf`, byte for byte the tree the numbers above were measured on;
 2. the two Engram tables, which are **not** in that repo: they are shards 47 (layer 1) and 48 (layer 14) of
    [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8),
    fetched by `tools/v41/fetch_v41.sh` and extracted with `tools/v41/extract_engram.py` into `models/engram/layers1`
    and `models/engram/layers14`, with the merged index from `local/engram_index.py` (the engine needs it because the
    two tables live in different directories).
 
-Space: 163 GB of parts for the GGUF (the join needs the same again only with `DELETE_PARTS=0`), and 101 GB per Engram table plus the 101 GB shard each comes from.  The default
-`ONE_AT_A_TIME=1` extracts and deletes one shard at a time (peak about 163 + 101 + 101 GB, one disk);
-`ONE_AT_A_TIME=0` fetches both shards first and then extracts both, so it needs 163 + 203 + 202 GB.  With two disks,
-`DEST_LAYERS1` and `DEST_LAYERS14` put the two tables in two places.
+Space: 163 GB for the GGUF, then the two Engram tables (101 GB each) plus the two 101 GB shards they are extracted
+from.  `extract_engram.py` works on the whole set - it validates every shard the index names and needs a `--to` for
+every Engram layer - so both shards must be on disk at once and both destinations are given in one call: there is no
+one-table-at-a-time order (measured: "shard not found: model-00048-of-00048.safetensors" with only 47 present, and
+"no --to for layers.14" with a single `--to`).  Peak for that phase is therefore 163 + 203 + 202 GB, which is why
+`WORK` and `DEST_LAYERS1`/`DEST_LAYERS14` exist: put the shards on one disk and the tables on another, and the peak
+split across the two is what the machine has to hold.
 
 ```sh
 local/fetch-model.sh /path/to/models     # DEST defaults to <repo>/models
 ```
 
-It is resumable and it checks: every expected size comes from the Hugging Face API, a file counts as complete only
+It is resumable, it uses `aria2c` when it is installed (8 connections per file: measured 270 MiB/s against 5.7 MB/s for a single `curl`), and it checks: every expected size comes from the Hugging Face API, a file counts as complete only
 when its size matches (so a partial download is resumed with `curl -C -`, never trusted), the parts are joined by the
 repo's own `reassemble.sh` (which verifies their sha256 first and the joined file at the end), and an interrupted join
 is reported instead of being joined over.  Every parameter:
@@ -113,10 +121,11 @@ is reported instead of being joined over.  Every parameter:
 | --- | --- | --- |
 | first argument | `<repo>/models` | where the trees go |
 | `GSQ_REPO`, `FP8_REPO` | the two repositories linked above | where to fetch from |
-| `JOBS` | 4 | how many GGUF parts are fetched at once (a single Hugging Face connection is throttled to about 5-6 MB/s here; four measured ~27 MB/s) |
+| `JOBS` | 1 | how many files are fetched at once (one by default) |
+| `CONN` | 4 | connections per file with `aria2c`.  The Hugging Face CDN throttles each connection: measured on this repo, 1 gives 5.7 MB/s, 4 gives ~27 MB/s and 8 gives **140 MiB/s** |
+| `ARIA2` | 1 when `aria2c` is installed | `0` forces `curl` |
 | `DRY_RUN=1` | 0 | print the whole plan (what is complete, what would be fetched, the join, the Engram steps) and change nothing |
 | `DELETE_PARTS` | 1 | drop each GGUF part as it is appended; `0` keeps them and needs the space twice |
-| `ONE_AT_A_TIME` | 1 | Engram one shard at a time: fetch 47, extract layer 1, delete 47, fetch 48, extract layer 14, delete 48 (peak about 163 + 101 + 101 GB); `0` fetches both shards first and needs 163 + 203 + 202 GB |
 | `DEST_LAYERS1`, `DEST_LAYERS14` | `<models>/engram/layers1`, `layers14` | put the two Engram tables on different disks |
 | `KEEP_FP8` | 0 | keep the FP8 shards after the extraction (101 GB each) |
 | `FORCE_JOIN` | 0 | remove an interrupted `V41-GSQ.gguf` and join again (by default it stops and says so) |
