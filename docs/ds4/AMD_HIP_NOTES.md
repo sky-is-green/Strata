@@ -407,6 +407,25 @@ pipeline change, not a kernel), (2) fewer API calls per token - the 685 error qu
 the cheapest to remove - and only then (3) kernel work. A new attention or indexer kernel cannot pay while the GPU is
 idle three quarters of the time.
 
+### Follow-up: the error checks are noise, the synchronizations are everything
+
+Same trace, cost of each HIP call summed over the decode window (per token):
+
+| call | calls/token | ms/token |
+| --- | ---: | ---: |
+| `hipStreamSynchronize` | 215 | **105.0** |
+| `hipMemcpyAsync` | 392 | 9.7 |
+| `hipGraphLaunch` | 77 | 7.2 |
+| `hipLaunchKernel` | 520 | 3.2 |
+| `hipGetLastError` | 685 | **< 0.3 (not in the top nine)** |
+
+So the "cheap win" I had queued first - making the error checks optional - is worth **nothing** (a third of a
+millisecond), and patching the vendored ggml for it would have cost a 20-minute rebuild for noise. Measuring first
+saved that. What is left is the thing the numbers point at: 215 stream synchronizations per token, each waiting
+~0.49 ms, i.e. the host spends 76% of the token's wall inside a stream sync while the GPU has only ~32 ms of kernel
+work. The decode is a per-layer handshake problem, and the fix is in the engine's pipeline (one sync point per layer
+instead of ~5.4, a deferred top-k readback), not in any kernel or in ggml.
+
 ## A fresh long prompt can crash the engine (found 2026-10-16) and the context penalty is smaller than I thought
 
 **The crash.** A 63,613-token prompt, one-shot, `--prompt-batch 12288 --ctx 262144 --arena-gib 75` (the tuned config):
