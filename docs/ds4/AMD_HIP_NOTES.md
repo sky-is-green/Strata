@@ -381,6 +381,28 @@ would buy a couple of percent at best while costing ~28% more memory for those e
 `ds41_moe.cpp`. Not done, on this evidence. What is left is the ternary decode arithmetic itself, which is what the
 format costs.
 
+## The author's serve settings, measured on this box (2026-10-16)
+
+`tools/v41/serve/ds41-engine.sh` + `strata-ds41.json` are the author's production serve settings. Every one that
+differs from ours was measured here through `--serve`, same 5787-token prompt + 64-token reply, fresh server a side:
+
+| setting | author | ours | measured |
+| --- | --- | --- | --- |
+| `--route-bias` / `--route-bias-file` | 0.5 / 0.3 | 1.0 / 0.6 (engine defaults) | **12.1 vs 25.1 tok/s**: the softer bias routes 2.2x more rows to PCIe/file (4,677/511 vs 2,086/138) and the pass goes 140 -> 274 ms. The author's value is routing fidelity, not speed |
+| `--arena-adapt --arena-gib 64` | yes | `--arena-gib 75` fixed | 21.5 vs 25.1 tok/s (7,119 vs 8,229 experts in RAM); the adaptive arena did not grow past its base |
+| `STRATA_DSPARK_CONF` | 0.6 | off | changes the generated tokens on 2 of 2 prompts **even with `STRATA_SERVE_PASS_BIAS=0`** (+13% on one, -23% on the other): still not adoptable |
+| `STRATA_SERVE_PASS_BIAS` | 0 | 0 (adopted) | not a speed knob: it makes the decode-side prompt passes route exactly. Adopted for fidelity |
+| `STRATA_SERVE_STEP_MAX` | 96 | 768 (engine default) | untested; the author's own comment puts the batch/pass crossover at ~765 tokens, so the default keeps small new chunks on the fast pass path |
+| `STRATA_DSPARK_DEPTH` | 4 | 4 | 4 is right: 25.1 vs 20.3 (depth 5) vs 17.0 tok/s (depth 6) - deeper drafts add work per pass without raising acceptance |
+| `STRATA_DSPARK_KEEP` | 64 | 64 | 64 is right: 25.1 vs 17.3 (32) vs 14.2 tok/s (128): fewer experts make the draft guess worse, more make its forward slower |
+| `--ctx` / KV | 524288 / `--kv-fp4` | 262144 / `--kv-q8` | the user's call (no 4-bit KV) |
+| `--threads` | (unset) | 24 | untested |
+| `systemd-run MemoryMax=84G` | yes | no | robustness, not speed |
+
+Conclusion: on this machine the engine's own defaults beat the author's serve tuning almost everywhere - his values
+buy routing fidelity and a smaller memory footprint, not tokens per second. The only thing worth taking from his
+script was `STRATA_SERVE_PASS_BIAS=0`.
+
 ## ggml's HIP graph capture costs more than it saves here (`GGML_CUDA_DISABLE_GRAPHS=1`)
 
 `rocprofv3 --runtime-trace` on a decode: **6,986 HIP runtime calls per token** - 1,822 launches, 951 `hipMemcpyAsync`
