@@ -175,6 +175,8 @@ were measured for **the same** configuration.
 | `STRATA_PROM=1` (prompt-batch expert kernels) | neutral on decode (23.7 vs 23.8), worse on the prompt (43.1 vs 52.4 tok/s) |
 | `STRATA_DSPARK_DEPTH=5` | 4.364 tokens/pass but a 160.7 ms verify vs 3.692 / 128.8 at depth 4: net neutral (25.4 vs 25.2); depth 6 is refused by design (1..5) |
 | `--vram-margin 0.25`, `--pf-b 2.0`, `--pcie 0.50`, `--pcie 0.85` | inside the noise |
+| `STRATA_TIER_GRAPH=1` (tier graph capture), 1536-token prompt + DSpark, 3 runs a side | inside the noise: base median 19.68 [22.40 19.36 19.68] vs 20.21 [20.21 19.37 20.92]; the first 2-run screen suggested +13.6%, 3 runs did not hold it up (the author measured the same capture as bit-identical and neutral on CUDA) |
+| `--vram-margin 0.25` / `STRATA_DMA_OVERLAP=1` / `STRATA_D3_PF=2`, same 3-run A/B | 20.83 / ~20.1 / decode 18.8 with prompt 51.8 -> 57.8 tok/s: nothing outside the spread, `STRATA_D3_PF=2` only moves the prompt |
 | serve `--prompt-batch 2048 -> 12288` on a 5.8K-token prompt | 229.8 -> 232.8 tok/s: no measurable difference (the engine sizes the batch from free VRAM anyway) |
 
 Adopted: `--arena-gib 75`, `--kv-q8`, `--ctx 262144`, Engram from two drives, DSpark depth 4 with the 64-expert
@@ -262,6 +264,35 @@ the same arithmetic as the composite it replaces, in one node). The server runs 
 With it, the serve numbers on this box are: a 5.8K-token prompt at **230 tok/s** (fused engine, batch 2048 or 12288:
 229.8 vs 232.8, i.e. no measurable difference here - the author's one-sweep win at 12288 is on a 20K prompt) and
 decode **26-30 tok/s** with DSpark.
+
+## Expert kernels on gfx1100: the AMD layouts are compiled out, and switching them on is slower
+
+`src/kernels/cuda/iq_kernels.cu` carries two families of grouped-expert kernels: the CUDA layout (mode 0,
+`native_gu_kernel`, one output row per warp, 8 rows a block) and the AMD layouts (`native_gu_amd_kernel` modes 1/2/4,
+`native_gu_lds_kernel` and `native_gu_fused_kernel` modes 5-8) selected by `STRATA_EXP_MODE` (and per weight type by
+`STRATA_EXP_MODE_T<type>`). The AMD layouts are only **compiled** for `STRATA_HIP_GFX906` (`STRATA_EXP_LAYOUTS` is 0
+for every other HIP architecture), so on this card the tier has always run mode 0 - the layout the author measured at
+~136 GB/s on the fork's ternary weights (nsys).
+
+Measured 2026-10-16, same binary, same prompt/flags, 48-token replies, 3 runs a side (fused build, no DSpark):
+
+| `STRATA_EXP_MODE` | decode tok/s |
+| --- | ---: |
+| 0 (today's default) | **13.8** [14.0 13.8 10.4] |
+| 2 (R2: two rows per warp in one loop) | 10.4 [13.2 8.0 10.4] |
+| 4 (32 rows a block) | 12.0 [11.4 14.7 12.0] |
+
+Mode 2 is also what gfx906 lands on for these types through `kExpFallback`, so the AMD layout is not a missing win
+here: it is tuned for a 64-lane wavefront and loses on RDNA3's wave32. The kernels can be compiled in as an opt-in
+(`-DCMAKE_HIP_FLAGS=-DSTRATA_HIP_EXP_LAYOUTS=1`, patch in `iq_kernels.cu`, default mode stays 0) for anyone who wants
+to re-measure; the shipped build keeps the flag off.
+
+## DSpark's confidence trim at 0.9: still not adoptable
+
+`STRATA_DSPARK_CONF=0.9` (the trim that verifies only the leading drafts the confidence head is sure about) on three
+prompts, 48 tokens each, against the same run without it: `long` identical and +8%, but `code_review` and `capital`
+produce **different tokens** (`capital` also slower, 34.5 -> 22.6 tok/s). Changing the answer on 2 of 3 prompts for an
+inconsistent gain is not adoptable; the trim stays off (the 0.6 threshold was rejected earlier for worse).
 
 ## The second GPU: implemented, measured, not adopted
 

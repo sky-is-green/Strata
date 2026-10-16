@@ -2837,7 +2837,10 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 
 // The AMD layouts below (STRATA_EXP_MODE) also build for CUDA: Volta takes mode 8 by default (exp_mode), every
 // other CUDA card keeps mode 0, the CUDA layout above.
-#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__)
+// STRATA_HIP_EXP_LAYOUTS (opt-in, gfx1100 here): COMPILE the AMD expert kernels on another HIP architecture so a run
+// can pick them with STRATA_EXP_MODE / STRATA_EXP_MODE_T<type>.  Mode 0 stays the layout below, unchanged, so the
+// default behaviour of the engine does not move.
+#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__) || defined(STRATA_HIP_EXP_LAYOUTS)
 #define STRATA_EXP_LAYOUTS 1
 #else
 #define STRATA_EXP_LAYOUTS 0
@@ -2846,6 +2849,12 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 constexpr int kExpModeDefault = 7;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
 constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
+#elif defined(STRATA_HIP_EXP_LAYOUTS)
+// The AMD layouts are an experiment on this architecture, so the default stays the CUDA layout (mode 0) and every
+// mode is chosen per run.  kExpFallback matches gfx906's, where the fork types (PTQ1_0/Q3_K/Q2_0) land on mode 2.
+constexpr int kExpModeDefault = 0;
+constexpr int kExpFallback = 2;
+constexpr bool kExpLds16 = true;
 #else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
