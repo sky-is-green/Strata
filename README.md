@@ -66,6 +66,28 @@ peer expert tier on the second card (correct and bit-identical rows, 91.5 rows a
 against 12.6 tok/s), the transcode decode, `STRATA_HIP_WMMA` (the +5.4% was noise: v41 never calls that kernel), a
 cache for `ggml_cuda_get_device` (120 calls a token, 0.06 ms) and the 685 per-token error queries (below 0.3 ms).
 
+## Getting the model files
+
+The model is not in git (355 GiB in total).  [local/fetch-model.sh](local/fetch-model.sh) builds exactly the layout
+this branch uses:
+
+1. the 16 parts of `V41-GSQ.gguf` plus `SHA256SUMS`, `rank.bin`, `V41-GSQ.gguf.experts.json`, the DSpark draft and the
+   tokenizer, from [IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)
+   (resumable), joined and verified by the repo's own `reassemble.sh` - it checks every part's sha256 before appending;
+2. the two Engram tables, which are **not** in that repo: they are shards 47 (layer 1) and 48 (layer 14) of
+   [dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8](https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8),
+   fetched by `tools/v41/fetch_v41.sh` and extracted with `tools/v41/extract_engram.py` into `models/engram/layers1`
+   and `models/engram/layers14`, with the merged index from `local/engram_index.py` (the engine needs it because the
+   two tables live in different directories).
+
+Space: 163 GB of parts for the GGUF, and 101 GB per Engram table plus the 101 GB shard each comes from.  With two
+disks, set `DEST_LAYERS1` and `DEST_LAYERS14`; on one disk use `ONE_AT_A_TIME=1`, which extracts and deletes one
+shard at a time (peak about 163 + 101 + 101 GB).
+
+```sh
+local/fetch-model.sh /path/to/models     # DEST defaults to <repo>/models
+```
+
 ## Documents
 
 - [docs/ds4/AMD_HIP_NOTES.md](docs/ds4/AMD_HIP_NOTES.md) - every measurement and every setting on this machine.
