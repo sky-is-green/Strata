@@ -29,6 +29,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -463,17 +464,17 @@ int iq256_variant() noexcept {
 int iq256_variants() noexcept { return kIq256Gather | (vnni_on() ? kIq256Vnni : 0); }
 
 void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
-                     const void* const* act, int nt, float* const* ff, int r0, int r1) {
+                     const void* const* act, int nt, float* const* ff, int r0, int r1, float lim) {
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
     if (variant & kIq256Vnni) {
-        if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
-        else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim);
+        else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim);
         return;
     }
 #endif
-    if (g) plain::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
-    else plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+    if (g) plain::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim);
+    else plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, lim);
 }
 
 void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
@@ -491,8 +492,8 @@ void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int
 }
 
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
-                   float* const* ff, int r0, int r1) {
-    iq256_gu_rows_v(iq256_variant(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1);
+                   float* const* ff, int r0, int r1, float lim) {
+    iq256_gu_rows_v(iq256_variant(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, lim);
 }
 
 void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,

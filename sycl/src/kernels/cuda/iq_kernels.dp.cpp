@@ -2857,6 +2857,32 @@ inline void dq_q4_1(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     store_run<dst_t, 4>(y + 16 + 4 * il, v1);
 }
 template <typename dst_t>
+inline void dq_q4_0(const void *vx, int64_t ibs, dst_t *yy, int tid) {
+    const block_q4_0* x = (const block_q4_0*) vx + ibs * (QK_K / QK4_0);
+    const int ib = tid % 8, il = tid / 8;
+    const float d = sycl::vec<sycl::half, 1>(x[ib].d)
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q4_0 for value pairs iqs, iqs + 16
+        y[iqs] = cvt<dst_t>(((float) (x[ib].qs[iqs] & 0xf) - 8.0f) * d);
+        y[iqs + 16] = cvt<dst_t>(((float) (x[ib].qs[iqs] >> 4) - 8.0f) * d);
+    }
+}
+template <typename dst_t>
+inline void dq_q4_1(const void *vx, int64_t ibs, dst_t *yy, int tid) {
+    const block_q4_1* x = (const block_q4_1*) vx + ibs * (QK_K / QK4_1);
+    const int ib = tid % 8, il = tid / 8;
+    const sycl::float2 dm =
+        (x[ib].dm).template convert<float, sycl::rounding_mode::automatic>();
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q4_1 for value pairs iqs, iqs + 16
+        y[iqs] = cvt<dst_t>((float)(x[ib].qs[iqs] & 0xf) * dm.x() + dm.y());
+        y[iqs + 16] = cvt<dst_t>((float)(x[ib].qs[iqs] >> 4) * dm.x() + dm.y());
+    }
+}
+template <typename dst_t>
 inline void dq_q5_1(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     const block_q5_1* x = (const block_q5_1*) vx + ibs * (QK_K / QK5_1);
     const int ib = tid / 4, il = tid % 4;   // lanes 4b..4b+3 write block b: neighbouring lanes, neighbouring values
@@ -2876,6 +2902,28 @@ inline void dq_q5_1(const void *vx, int64_t ibs, dst_t *yy, int tid) {
     }
     store_run<dst_t, 4>(y + 4 * il, v0);
     store_run<dst_t, 4>(y + 16 + 4 * il, v1);
+}
+template<typename dst_t>
+void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    // llama.cpp's dequantize_q6_K (dequantize.cuh, written for 64 threads) folded onto the kernel's 32: each of the
+    // 64 thread roles runs at tid and tid + 32.
+    const block_q6_K* x = (const block_q6_K*) vx;
+    for (int tt = tid; tt < 64; tt += 32) {
+        const int64_t ip = tt / 32;                 // 0 or 1
+        const int64_t il = tt - 32 * ip;            // 0...31
+        const int64_t is = 8 * ip + il / 16;
+        dst_t* y = yy + 128 * ip + il;
+        const float d =
+            sycl::vec<sycl::half, 1>(x[ibs].d)
+                .convert<float, sycl::rounding_mode::automatic>()[0];
+        const uint8_t* ql = x[ibs].ql + 64 * ip + il;
+        const uint8_t qh = x[ibs].qh[32 * ip + il];
+        const int8_t* sc = x[ibs].scales + is;
+        y[0]  = cvt<dst_t>(d * sc[0] * ((int8_t) ((ql[0]  & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+        y[32] = cvt<dst_t>(d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+        y[64] = cvt<dst_t>(d * sc[4] * ((int8_t) ((ql[0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+        y[96] = cvt<dst_t>(d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    }
 }
 template<typename dst_t>
 void dq_q6_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {

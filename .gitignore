@@ -19,6 +19,14 @@ __pycache__/
 # plan v0.3 P1 (repository hygiene, review E1): profiler captures and large diagnostic dumps stay out of git.
 *.nsys-rep
 
+# ds4 phase 0 tooling: compiled probes (build from the headers in tools/ds4/) and
+# golden dumps (large; regenerate with tools/ds4/make_goldens.sh).
+tools/ds4/route_probe
+tools/ds4/golden_dump
+bench/ds4-2026-10-05/goldens/
+bench/ds4-2026-10-05/profile-decode/
+bench/ds4-2026-10-08/ctx/
+
 # Pi harness metadata (local session state, not project source)
 *.sqlite
 *.npz
@@ -61,3 +69,16 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# The AMD/HIP port's local run artifacts (docs/ds4/AMD_HIP_NOTES.md): the Engram sources and tables, the prompt
+# dumps and the HF cache are data (hundreds of GB), not source.  local/*.py and local/*.json are kept.
+/local/engram-src/
+/local/engram/
+/local/prompts/
+/local/*.bin
+/local/*.ids
+/.hf-cache/
+/.run/
+
+# our launcher is part of this branch (the run-*.sh files the setup generates are not)
+!/run-v41-gsq.sh

@@ -7,9 +7,11 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
-#include "strata/prefill/mmq_kq_abi.hpp"
+#include <cstdint>
 
+#include "strata/prefill/mmq_kq_abi.hpp"
 #include <cstdio>
+#include <stdexcept>
 #include <cstdlib>
 #include <cstring>
 
@@ -152,6 +154,17 @@ __global__ void down_row_scales_kernel(float* __restrict__ sd, const int32_t* __
     while (q + 1 < n && r >= bounds[q + 1]) ++q;
     sd[r] = tails[4 * q + 2];
 }
+// DeepSeek-V4's SwiGLU clamp, exactly as the native expert kernels apply it (iq_kernels.cu): gate <= lim, |up| <= lim
+__global__ void swiglu_clamp_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
+                                    bool interleaved, float lim) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n_ff) return;
+    const int64_t r = i / n_ff, k = i % n_ff;
+    const float* row = gu + r * 2 * n_ff;
+    const float g = fminf(interleaved ? row[2 * k] : row[k], lim);
+    const float u = fminf(fmaxf(interleaved ? row[2 * k + 1] : row[n_ff + k], -lim), lim);
+    h[i] = g / (1.0f + __expf(-g)) * u;
+}
 
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -206,11 +219,17 @@ bool supported(int t) {
         case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
-            return true;
 #ifdef STRATA_MMQ_KQUANTS
         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:
             return kq_ok();
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:   // MiMo-V2.6-Flash RL GSQ-RCO experts are Q2_K/Q3_K (2/3-bit K-quants)
+        case GGML_TYPE_MXFP4:                       // ...and its MXFP4 expert outliers (the fork's)
+            return true;
+#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS)
+        case GGML_TYPE_Q6_K:   // HIP: the dense GGUF projections (STRATA_DENSE_MMQ); CUDA: only the opt-in -DSTRATA_Q6K_EXPERTS=ON build
+            return kq_ok();
+#endif
 #endif
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_NVFP4:
@@ -232,7 +251,13 @@ bool fits(int t, int64_t w_rows) {
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
         for (int J = 8; J <= 128 && !any; J += 8) {
+#if defined(STRATA_MMQ_PREC_SRC1)
+            // ggml's newer host API takes the src1 precision explicitly (the tree this was written against defaulted
+            // it to Q8_1); Q8 is what the fork's MMQ always used
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc, GGML_PREC_Q8);
+#else
             const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
+#endif
             any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
         }
         if (!any) {
@@ -335,6 +360,9 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
+    // mul_mat_q_case's host code in the vendored ggml (3cf0325) picks J_best itself from ncols_opt (the per-call
+    // row count); the pinned llama.cpp gains the host-side J_best field by upstream #29953 - revisit that spelling
+    // when the pinned copy is bumped.  Ours is the spelling the paired ABI shim exports.
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
@@ -342,9 +370,14 @@ void Context::run(const Product& p, void* stream) {
                         p.max_rows, p.max_rows};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+#if defined(STRATA_MMQ_PREC_SRC1)
+#define STRATA_MMQ_CASE(T) mul_mat_q_case<T, GGML_PREC_Q8>(ctx, a, s)   // newer ggml: prec_src1 is a template argument
+#else
+#define STRATA_MMQ_CASE(T) mul_mat_q_case<T>(ctx, a, s)
+#endif
     switch (t) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
-        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
+        case GGML_TYPE_Q5_0: STRATA_MMQ_CASE(GGML_TYPE_Q5_0); break;
 #endif
         case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
@@ -369,6 +402,9 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+        case GGML_TYPE_Q2_K: mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, a, s); break;    // MiMo GSQ-RCO experts
+        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;    // MiMo GSQ-RCO experts
+        case GGML_TYPE_MXFP4: mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, a, s); break;  // MiMo GSQ-RCO experts
 #endif
 #if !defined(GGML_USE_HIP)   // NVFP4: CUDA only (no HIP instance, no W4A8 unit)
         case GGML_TYPE_NVFP4:
@@ -380,6 +416,7 @@ void Context::run(const Product& p, void* stream) {
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
     }
+#undef STRATA_MMQ_CASE
     ck(cudaGetLastError(), "mul_mat_q");
 }
 
@@ -452,6 +489,12 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (rows <= 0) return;
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void swiglu_clamp(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, float limit, void* stream) {
+    if (rows <= 0) return;
+    swiglu_clamp_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved, limit);
+    ck(cudaGetLastError(), "swiglu_clamp");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {

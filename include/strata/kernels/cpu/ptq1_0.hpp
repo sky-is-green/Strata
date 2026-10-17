@@ -1,10 +1,18 @@
-// src/kernels/cpu/ptq1_0.hpp - Scion PTQ1_0 (ggml type 143) expert rows on the CPU.
+// include/strata/kernels/cpu/ptq1_0.hpp - PTQ1_0 ternary expert rows on the CPU.  TWO dialects share the
+// container (GGML type id 143, 128 weights in 28 bytes: qs[24] of base-3 trits + qh[2] + fp16 d) but differ in
+// the activation format the dot products take, and in the entry points each model family dispatches to:
 //
-// Block: 128 values in 28 bytes - qs[24] (staged base-3 trits, 5/byte:
-// bytes 0..15 hold values n*16+m, bytes 16..23 hold 80+n*8+m), qh[2]
-// (values 120+n*2+h), fp16 d.  Activation: ggml Q8_K (256 values), one
-// block per two weight blocks; the dot uses the block-level d only, like the
-// iq_avx kernels.
+// The llama-tq dialect (github.com/LL4nc33/llama-tq, MIT; the DeepSeek-V4.1 mixed-tier quant, GSQ export):
+//   qs[0..15]  : 5 trits per byte, value m + 16 n (m = byte, n = trit, most significant first)  -> values   0..79
+//   qs[16..23] : 5 trits per byte, value 80 + m + 8 n                                          -> values  80..119
+//   qh[0..1]   : 4 trits per byte, value 120 + h + 2 n (stored shifted to the top trit)         -> values 120..127
+//   d          : fp16 scale
+// A byte b holds trits as round-up(t0 t1 t2 t3 t4 (base 3) * 256 / 243); trit n is ((uint8)(b * 3^n) * 3) >> 8.
+// Activations are Q8_0 (ggml's block_q8_0: fp16 d + 32 int8), i.e. a 128-weight block meets 4 activation blocks.
+// The dot product is d_w * sum_k d_a[k] * sum_i (t_i - 1) q_i, computed as sum t q - sum q on the {0,1} digits.
+//
+// The Scion dialect (this fork's own lane): the same block, but activations are ggml Q8_K (256 values), one
+// block per two weight blocks; the dot uses the block-level d only, like the iq_avx kernels.
 #pragma once
 
 #include <cstddef>
@@ -12,6 +20,32 @@
 
 namespace strata::kernels::cpu {
 
+inline constexpr int kPtq1Type = 143;      ///< GGML type id in llama-tq (not in upstream ggml: GGML_TYPE_COUNT is 43)
+inline constexpr int kPtq1Block = 128;     ///< weights per block
+inline constexpr int kPtq1Bytes = 28;      ///< bytes per block
+
+/// Bytes of one PTQ1_0 row of n weights (n a multiple of 128).
+inline size_t ptq1_0_row_bytes(int64_t n) { return (size_t) (n / kPtq1Block) * kPtq1Bytes; }
+
+/// Packs ternary codes t in {-1, 0, +1} (n of them) with one scale per 128 into PTQ1_0 blocks (GSQ export).
+void ptq1_0_pack(const int8_t* t, const float* d, uint8_t* dst, int64_t n);
+/// Round-to-nearest reference quantizer (amax scale), bit-identical to llama-tq's quantize_row_ptq1_0_ref.
+void ptq1_0_quantize_ref(const float* x, uint8_t* dst, int64_t n);
+/// Codes back out of a row (t in {-1,0,+1}) and the per-block scales.
+void ptq1_0_unpack(const uint8_t* src, int8_t* t, float* d, int64_t n);
+void ptq1_0_dequant(const uint8_t* src, float* y, int64_t n);
+
+/// ggml_vec_dot_t-compatible: s[0] = PTQ1_0 row vx . Q8_0 row vy, n weights (nrc must be 1).
+void ptq1_0_vec_dot_q8_0(int n, float* s, size_t bs, const void* vx, size_t bx, const void* vy, size_t by, int nrc);
+/// The scalar form of the same (the parity reference for the AVX2 one).
+void ptq1_0_vec_dot_q8_0_scalar(int n, float* s, const void* vx, const void* vy);
+/// Rows [r0, r1) of a PTQ1_0 matrix (row stride `row_bytes`, n weights a row) against nt Q8_0 rows (nt <= 8):
+/// out[t][r] = row r . act[t].  The AVX2 path decodes each 128-weight block ONCE for all tokens (every digit in SIMD)
+/// and keeps each 32-weight sub-block's sum exact in int32 (as the scalar dot) - 3.9x the per-token dot at one token,
+/// 6-8x at 2-3 (s11 2026-10-15, one Zen 3 core).  Without AVX2: the per-token dot.
+void ptq1_0_rows_q8_0(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1);
+
+// The Scion dialect's row kernels (Q8_K activations), and the block decoder both dialects share:
 void ptq1_0_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                     int nt, float* const* ff, int r0, int r1);
 void ptq1_0_down_rows(const uint8_t* blob, size_t d_row, int n, const void* const* hq,

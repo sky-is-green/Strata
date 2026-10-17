@@ -61,6 +61,10 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    /// Fork (DS4.1 mixed tiers): this expert's own format on the MULTI-FORMAT native path, so one
+    /// `run_split_multi_native` batch can cover every format class present in a layer.  `nullptr` (every other
+    /// caller) means "the batch's `fmt` argument", i.e. exactly the pre-fork behaviour.
+    const NativeFmt* fmt = nullptr;
 };
 
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
@@ -182,6 +186,12 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    ///
+    /// Fork (DS4.1 mixed tiers): a job whose `ExpertJobMulti::fmt` is set uses THAT format for its own gate/up
+    /// and down kernels (and for the intermediate activation's quantization), so one batch covers several format
+    /// classes at once - the whole point of the one-dispatch-per-layer path.  Jobs with `fmt == nullptr` all use
+    /// `f`, byte-identically to the pre-fork code.  Every job in `f`'s batch must share `n_embd`/`n_ff` (a model's
+    /// geometry is uniform across its format classes; a mixed-geometry batch falls back to one call per job).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
@@ -288,9 +298,13 @@ private:
     // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
     ExpertJobMulti* mjobs_ = nullptr;
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
+    /// Rows per expert of the current phase.  NOT the compile-time `FF`/`H` (Qwen's 640/2560): a native layer's
+    /// width is the model's own (`NativeFmt::n_ff` / `n_embd`), and using the canonical constants here computed
+    /// only the first 640 of DeepSeek-V4's 2048 gate/up rows and 2560 of its 4096 down rows.
+    int64_t mper_ = 0;
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][kNativeFFMax];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };

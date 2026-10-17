@@ -111,6 +111,8 @@ void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const 
                    const float* tails, int64_t row0, void* stream);
 /// sd[r] = the s_down of row r's expert (group-local bounds): the combine applies it as it reads the row.
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream);
+/// swiglu with DeepSeek-V4's clamp (gate <= limit, |up| <= limit), as the native expert kernels apply it.
+void swiglu_clamp(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, float limit, void* stream);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

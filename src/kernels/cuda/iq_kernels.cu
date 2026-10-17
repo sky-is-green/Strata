@@ -41,6 +41,7 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+#include "fork/fork_helpers.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -213,13 +214,6 @@ __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void* __restrict
         for (int k = 0; k < 4; ++k) acc += __low2float(bq8_1[j * stride_col_y + iqs + k].ds) * (float) sumi[j][k];
         result[j] = d * acc;
     }
-}
-
-__device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
-                                                     const int& kbx, const int& iqs) {
-    float result;
-    vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
-    return result;
 }
 
 __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
@@ -441,6 +435,7 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
 // Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
 // gopinath87607), which agree with llama.cpp and with each other.
 constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q4_1 = 2, VDR_Q4_0 = 2, VDR_Q8_0 = 2, VDR_Q6_K = 1;
+#include "fork/fork_vecdot.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 
 __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restrict__ v, const int* __restrict__ u,
                                                              const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m,
@@ -752,9 +747,8 @@ template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
 // of the pass base).
 template<> struct Fmt<142> { static constexpr int qk = 128, ipb = 1, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_pq2_0_q8_1(v, y, kbx, iqs); } };
-// PTQ1_0: one call per 128-value block (the dot consumes all four q8_1 blocks of the pass base)
-template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 1, step = 1;
-    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_ptq1_0_q8_1(v, y, kbx, iqs); } };
+// PTQ1_0 (143) on the GPU is the fork's Fmt (fork_fmt.cuh, whole-block llama-tq dot); the Scion
+// dialect's 143 is a CPU-only dispatch (NativeFmt::ptq_tq).
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -771,21 +765,22 @@ template<> struct Fmt<6> { static constexpr int qk = 32, ipb = QI5_0 / VDR_Q5_0,
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+#include "fork/fork_fmt.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md): the fork's Fmt<10/11/39/143>
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(142) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40) X(143)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(142) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(142) X(12) X(13) X(6) X(2) X(3) X(8) X(40) X(143)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(142) X(12) X(13) X(6) X(2) X(3) X(8) X(40)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(142) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40) X(143)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(142) X(7) X(6) X(2) X(3) X(8) X(13) X(14) X(40)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(142) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(143)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(142) X(7) X(6) X(2) X(3) X(8) X(13) X(40)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(143) X(142)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(142)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -1597,6 +1592,7 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
     }
 }
 
+#include "fork/fork_gu_mixed.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 // native_gu_kernel with the group's entries taken GRP_NC at a time, each weight part decoded once per pass.
 // A group has at most one entry per token of the window (kVerifyMaxT = 8; setup writes --spec 4, and a split window
 // has halves of <= 4), so 4 takes such windows in one pass; 8 would take ~64-80 registers against ~48 (ptxas -v).
@@ -1695,12 +1691,13 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     }
 }
 
+// lim: DeepSeek-V4's SwiGLU clamp (NativeExpertLayout::swiglu_limit); +inf = none (fminf/fmaxf with inf are exact)
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float lim) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    const float g = fminf(gate[i], lim);
+    h[i] = (g / (1.0f + __expf(-g))) * fminf(fmaxf(up[i], -lim), lim);
 }
 
 template<int TD>
@@ -2304,18 +2301,18 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq) {
+                                                                  block_q8_1* __restrict__ hq, float lim) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = gate[i];
+        const float g = fminf(gate[i], lim), u = fminf(fmaxf(up[i], -lim), lim);
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + __expf(-g))) * u;
 #else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = __fmul_rn(g / (1.0f + __expf(-g)), u);
 #endif
         q8_1_store(h, hq, i);
     }
@@ -2469,6 +2466,7 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     defined(__gfx1200__) || defined(__gfx1201__))
         // HIP 5.7 on RDNA1, the HIP compiler on gfx1151 (PR #895, ROCm 7.13) and on RDNA4 gfx1200/gfx1201 (ROCm
         // 7.10, #1474) fold the half path's negative scale times +0 to +0. Preserve the scale's sign, as the FP32/CPU paths do.
+
         if constexpr (std::is_same_v<dst_t, __half>) {
             if (code == 1) {
                 yy[b * 64 + i] = __ushort_as_half(__half_as_ushort(x[b].d) & 0x8000u);
@@ -2479,29 +2477,6 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         yy[b * 64 + i] = cvt<dst_t>(d * (float) (code - 1));
     }
 }
-template<typename dst_t>
-__device__ void dq_ptq1_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
-    // one "superblock" = 256 values = 2 blocks of 128; thread tid writes 8 values of one block.
-    // The base-3 layout of element e: qs[e % 16] * 3^(e / 16) for e < 80, qs[16 + (e-80) % 8] * 3^((e-80)/8)
-    // for 80 <= e < 120, qh[(e-120) % 2] * 3^((e-120)/2) beyond; the uint8 truncation and the *3 >> 8 are the
-    // fork's dequantize_row_ptq1_0, value for value (the same decode the CPU kernel uses).
-    const block_ptq1_0* x = (const block_ptq1_0*) vx + ibs * 2;
-    const int b = tid / 16, part = tid % 16;
-    dst_t* y = yy + b * 128 + part * 8;
-    const float d = __half2float(x[b].d);
-    const uint8_t* qs = x[b].qs;
-    const uint8_t* qh = x[b].qh;
-    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int e = part * 8 + j;
-        const int n = e < 80 ? e / 16 : (e < 120 ? (e - 80) / 8 : (e - 120) / 2);
-        const uint8_t byte = e < 80 ? qs[e % 16] : (e < 120 ? qs[16 + (e - 80) % 8] : qh[(e - 120) % 2]);
-        const uint8_t v = (uint8_t) (byte * pow3[n]);
-        y[j] = cvt<dst_t>(d * (float) (((int) v * 3 >> 8) - 1));
-    }
-}
-
 // PQ2_0 (Scion 35B type 142): the fork's dequantize_row_pq2_0 code for code - Q2_0's 2-bit codec at group
 // size 128, one fp16 scale per block, value d * (code - 1).  One "superblock" = 256 values = 2 blocks of 128;
 // thread tid writes 8 values of one block (the same shape as dq_q2_0/dq_ptq1_0).
@@ -2665,6 +2640,7 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>((float) x[ib].qs[8 * il + j] * d);
 }
 
+#include "fork/fork_dq.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py): 8 values per thread.
 template<typename dst_t>
 __device__ void dq_bf16(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -2700,9 +2676,10 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;
+        case 143: dq_ptq1_0(vx, ibs, y, tid); break;   // fork: PTQ1_0 ternary
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 142: dq_pq2_0(vx, ibs, y, tid); break;
-        case 143: dq_ptq1_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
 #ifdef STRATA_Q6K_EXPERTS
@@ -2714,6 +2691,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 3: dq_q4_1(vx, ibs, y, tid); break;
         case 40: dq_nvfp4(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
         default: break;
     }
@@ -2754,6 +2732,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
+    if (t == 10 || t == 39 || t == 143) return true;   // fork: Q2_K, MXFP4, PTQ1_0 (11 = Q3_K is upstream's)
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 142 ||
            t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
@@ -2767,6 +2746,7 @@ int gu_qk(int t) {
     switch (t) {
 #define STRATA_QK(T) case T: return Fmt<T>::qk;
         STRATA_GU_FMTS(STRATA_QK)
+        STRATA_GU_FMTS_FORK(STRATA_QK)
 #undef STRATA_QK
         default: return 0;
     }
@@ -2775,6 +2755,7 @@ int d_qk(int t) {
     switch (t) {
 #define STRATA_QK(T) case T: return Fmt<T>::qk;
         STRATA_D_FMTS(STRATA_QK)
+        STRATA_D_FMTS_FORK(STRATA_QK)
 #undef STRATA_QK
         default: return 0;
     }
@@ -2783,6 +2764,7 @@ bool gu_split(int t) {
     switch (t) {
 #define STRATA_SP(T) case T: return kSplit<T>;
         STRATA_GU_FMTS(STRATA_SP)
+        STRATA_GU_FMTS_FORK(STRATA_SP)
 #undef STRATA_SP
         default: return false;
     }
@@ -3215,12 +3197,13 @@ void s26_launch_l(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t 
     if (FQ) {
         s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
     } else {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     }
     const dim3 gd((unsigned) (L.n_embd / (8 * RD)), (unsigned) cap_groups);
     s26_down_l_kernel<LX, RD, SL, TS, BD><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }
+#include "fork/fork_prom.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 // ---------------------------------------------------------------- stream B: UD-Q4_K_XL grouped decode experts
 // STRATA_EXPERT_V2K=1: s26_gu_l_kernel / s26_down_l_kernel's structure (4 interleaved rows per warp, the chunk's q8_1
 // activation rows in LDS, SwiGLU + q8_1 fused, optionally STRATA_TSUM's transposed butterfly) for Q4_K / Q5_K gate/up
@@ -3597,6 +3580,10 @@ bool iq_old_kernels() { return g_old_kernels; }
 void native_expert_set_down_rows(bool v) { g_down_rows = v; }
 void native_expert_set_gu_rows(bool v) { g_gu_rows = v; }
 
+void native_expert_prom_set_enabled(bool enabled) { g_prom_enabled = enabled; }
+bool native_expert_prom_enabled() { return g_prom_enabled; }
+void native_expert_prom_set_force(bool force) { g_prom_force = force; }
+
 bool iq_supported(int t) noexcept { return is_iq(t); }
 bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
 
@@ -3611,8 +3598,9 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 29: return (size_t) (n / 256) * sizeof(block_iq1_m);
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
+        case 143: return (size_t) (n / QK_PTQ1_0) * sizeof(strata_block_ptq1_0);   // fork: PTQ1_0
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
-        case 143: return (size_t) (n / 128) * sizeof(block_ptq1_0);
         case 142: return (size_t) (n / 128) * sizeof(block_pq2_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
@@ -3623,6 +3611,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }
@@ -3643,6 +3632,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
     switch (t) {
 #define STRATA_MMVQ(T) case T: launch_mmvq<T>(W, rb, X, y, n_in, n_out, ncols, s); break;
         STRATA_MMVQ_FMTS(STRATA_MMVQ)
+        STRATA_MMVQ_FMTS_FORK(STRATA_MMVQ)
 #undef STRATA_MMVQ
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
@@ -3974,6 +3964,7 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
+#include "fork/fork_layout.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
@@ -3982,7 +3973,10 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 
 // The AMD layouts below (STRATA_EXP_MODE) also build for CUDA: Volta takes mode 8 by default (exp_mode), every
 // other CUDA card keeps mode 0, the CUDA layout above.
-#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__)
+// STRATA_HIP_EXP_LAYOUTS (opt-in, gfx1100 here): COMPILE the AMD expert kernels on another HIP architecture so a run
+// can pick them with STRATA_EXP_MODE / STRATA_EXP_MODE_T<type>.  Mode 0 stays the layout below, unchanged, so the
+// default behaviour of the engine does not move.
+#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__) || defined(STRATA_HIP_EXP_LAYOUTS)
 #define STRATA_EXP_LAYOUTS 1
 #else
 #define STRATA_EXP_LAYOUTS 0
@@ -3991,6 +3985,12 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 constexpr int kExpModeDefault = 7;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
 constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
+#elif defined(STRATA_HIP_EXP_LAYOUTS)
+// The AMD layouts are an experiment on this architecture, so the default stays the CUDA layout (mode 0) and every
+// mode is chosen per run.  kExpFallback matches gfx906's, where the fork types (PTQ1_0/Q3_K/Q2_0) land on mode 2.
+constexpr int kExpModeDefault = 0;
+constexpr int kExpFallback = 2;
+constexpr bool kExpLds16 = true;
 #else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
@@ -4553,7 +4553,8 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         }
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
-            const float gg = res[warp][lane], uu = res[warp][32 + lane];
+            const float gg = fminf(res[warp][lane], L.swiglu_limit);
+            const float uu = fminf(fmaxf(res[warp][32 + lane], -L.swiglu_limit), L.swiglu_limit);
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -4601,6 +4602,21 @@ int exp_mode() {
     }
     return per_dev[dev] - 1;
 #endif
+}
+#endif
+// Strata-DS4 fork (docs/UPSTREAM_SYNC.md): STRATA_EXP_MODE_T<type>=<mode> overrides exp_mode() for one weight
+// type's gate/up and down launches (e.g. STRATA_EXP_MODE_T143=4: PTQ1_0 four rows per warp).  Unset = em0.
+#if STRATA_EXP_LAYOUTS
+int exp_mode_type(int t, int em0) {
+    static int per_type[256];   // 0 unknown, 1 none, else mode + 2
+    if (t < 0 || t >= 256) return em0;
+    if (!per_type[t]) {
+        char name[32];
+        std::snprintf(name, sizeof name, "STRATA_EXP_MODE_T%d", t);
+        const char* v = std::getenv(name);
+        per_type[t] = v ? 2 + std::atoi(v) : 1;
+    }
+    return per_type[t] == 1 ? em0 : per_type[t] - 2;
 }
 #endif
 int g_exp_phase = 0;   // the bench: 0 all, 1 gate/up + swiglu + quantize only, 2 down only
@@ -4677,6 +4693,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped (v2k)");
         return;
     }
+    // PROM (fork): the window's entries per group - the measured break-even is ~64 (test_ds41_prom)
+    const bool prom_large = cap_groups > 0 && cap_entries / cap_groups >= 64;
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
     const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_sub16(L.gu_type)) ? 16 : GU_ROWS;
@@ -4722,7 +4740,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             default: if (em0 >= 7) native_gu_lds_kernel<22, 1, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else if (em0 == 6) native_gu_lds_kernel<22, 1><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); else native_gu_lds_kernel<22, 0><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         }
     } else {
-    const int em = em0 >= 5 ? kExpFallback : em0;
+    const int emt = exp_mode_type(L.gu_type, em0);
+    const int em = emt >= 5 ? kExpFallback : emt;
     const dim3 ggu_amd((unsigned) ((2 * L.n_ff + (em == 1 ? 3 : em == 4 ? 31 : 15)) / (em == 1 ? 4 : em == 4 ? 32 : 16)), (unsigned) cap_groups);
 #define STRATA_GU_AMD(T) \
     case T: if (em == 1) native_gu_amd_kernel<T, 1><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
@@ -4730,18 +4749,30 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             else native_gu_amd_kernel<T, 2><<<ggu_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
     // the AMD layouts cover the IQ packs' gate/up types; Unsloth's Q4_K / Q5_K take the CUDA layout below
     const bool amd_gu = L.gu_type == 16 || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                        L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42;
-    if ((em == 1 || em == 2 || em == 4) && amd_gu) {
+                        L.gu_type == 23 || L.gu_type == 29 || L.gu_type == 42 ||
+                        L.gu_type == 143 || L.gu_type == 11;   // Strata-DS4 fork: PTQ1_0 / Q3_K (V4.1 GSQ)
+    if ((em == 1 || em == 2 || em == 4) && amd_gu && (L.up_type < 0 || L.up_type == L.gu_type)) {
         switch (L.gu_type) {
             STRATA_GU_AMD(16) STRATA_GU_AMD(17) STRATA_GU_AMD(18) STRATA_GU_AMD(21) STRATA_GU_AMD(22) STRATA_GU_AMD(23)
-            STRATA_GU_AMD(29) STRATA_GU_AMD(42)
+            STRATA_GU_AMD(29) STRATA_GU_AMD(42) STRATA_GU_AMD(143) STRATA_GU_AMD(11)
         }
     } else
 #undef STRATA_GU_AMD
 #endif
+    if (L.up_type >= 0 && L.up_type != L.gu_type) {   // MiMo GSQ-RCO: gate and up in different formats
+        if (L.n_ff % GU_ROWS != 0) { std::fprintf(stderr, "native_expert_grouped: mixed gate/up needs n_ff %% %d\n", GU_ROWS); std::exit(1); }
+        if (L.gu_type == 10 && L.up_type == 11)
+            native_gu_mixed_kernel<10, 11><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else if (L.gu_type == 11 && L.up_type == 10)
+            native_gu_mixed_kernel<11, 10><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else { std::fprintf(stderr, "native_expert_grouped: gate %d / up %d\n", L.gu_type, L.up_type); std::exit(1); }
+    } else if (prom_gu(L, gy, prom_large, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) {
+        // PROM prompt-batch kernel (fork slice xk-kernels); the SwiGLU + q8_1 pass below is the caller's
+    } else
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, single_entry); break;
         STRATA_GU_FMTS(STRATA_GU)
+        STRATA_GU_FMTS_FORK(STRATA_GU)
 #undef STRATA_GU
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
@@ -4761,11 +4792,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
     if (!sw_in_down) {
         if (sw_v1) {
-            swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+            swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
             quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
         } else {
             swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                    (int) L.n_ff, hq);
+                                                                                    (int) L.n_ff, hq, L.swiglu_limit);
         }
         check("native_expert_grouped/swiglu");
     }
@@ -4782,7 +4813,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped/down");
         return;
     }
-    const int em = em0 >= 5 ? kExpFallback : em0;
+    const int emt = exp_mode_type(L.d_type, em0);
+    const int em = emt >= 5 ? kExpFallback : emt;
     const dim3 gd_amd((unsigned) ((L.n_embd + (em == 1 ? 3 : em == 4 ? 31 : 15)) / (em == 1 ? 4 : em == 4 ? 32 : 16)), (unsigned) cap_groups);
 #define STRATA_D_AMD(T) \
     case T: if (em == 1) native_down_amd_kernel<T, 1><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
@@ -4790,21 +4822,27 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             else native_down_amd_kernel<T, 2><<<gd_amd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
     // the AMD layouts cover the IQ packs' down types; the others (Unsloth's Q4_K / Q5_K / Q5_1 / Q8_0) take the
     // CUDA layout below
-    if ((em == 1 || em == 2 || em == 4) && (L.d_type == 20 || L.d_type == 23 || L.d_type == 42)) {
+    if ((em == 1 || em == 2 || em == 4) &&
+        (L.d_type == 20 || L.d_type == 23 || L.d_type == 42 || L.d_type == 143 || L.d_type == 11)) {   // fork: +PTQ1_0 / Q3_K
         switch (L.d_type) {
-            STRATA_D_AMD(20) STRATA_D_AMD(23) STRATA_D_AMD(42)
+            STRATA_D_AMD(20) STRATA_D_AMD(23) STRATA_D_AMD(42) STRATA_D_AMD(143) STRATA_D_AMD(11)
         }
     } else
 #undef STRATA_D_AMD
 #endif
+    if (prom_down(L, gy, prom_large, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) {
+        // PROM prompt-batch kernel (fork slice xk-kernels)
+    } else
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, single_entry, \
                                               swiglu_in_down_ok(L, cap_entries) ? gate : nullptr, swiglu_in_down_ok(L, cap_entries) ? up : nullptr); break;
         STRATA_D_FMTS(STRATA_DOWN)
+        STRATA_D_FMTS_FORK(STRATA_DOWN)
 #undef STRATA_DOWN
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
 }
 
+#include "fork/fork_weighted_sum.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 }  // namespace strata::kernels

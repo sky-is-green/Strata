@@ -101,6 +101,12 @@ inline const char* ggml_type_name(uint32_t t) {
         return "IQ4_XS";
     case 24:
         return "I8";
+    case 25:
+        return "I16";
+    case 26:
+        return "I32";
+    case 27:
+        return "I64";
     case 30:
         return "BF16";
     case 34:
@@ -119,7 +125,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "Q1_0_g128";   // the Scion corrections' g128 2-bit container (34 B / 128), same block as PQ2_0
     case 142:
         return "PQ2_0";
-    case 143:
+    case 143:   // llama-tq / ik_llama PTQ1_0 ternary (V4.1 routed experts and the Scion lane's dialect, two
+                // activation conventions; never reaches ggml)
         return "PTQ1_0";
     case 144:
         return "Q3X32";
@@ -249,11 +256,24 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 1;
         bytes = 1;
         return true;
+    case 25:   // I16: one element per 2 bytes
+        elems = 1;
+        bytes = 2;
+        return true;
+    case 26:   // I32: the DSV4 hash router table (ffn_gate_tid2eid.weight)
+        elems = 1;
+        bytes = 4;
+        return true;
+    case 27:   // I64
+        elems = 1;
+        bytes = 8;
+        return true;
     case 40:   // NVFP4: 64 values = 4 UE4M3 sub-block scales + 32 bytes of E2M1 codes
         elems = 64;
         bytes = 36;
         return true;
-    case 39:   // MXFP4: one E8M0 scale + 16 bytes of 4-bit values (Qwen3.6's MXFP4_MOE experts)
+    case 39:   // MXFP4: one E8M0 scale + 16 bytes of e2m1 nibbles (Qwen3.6's MXFP4_MOE experts and the
+               // DeepSeek-V4 MTP head's experts)
         elems = 32;
         bytes = 17;
         return true;

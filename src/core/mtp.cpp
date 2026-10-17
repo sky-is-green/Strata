@@ -463,6 +463,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 #endif
     if (!prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
 #if !defined(STRATA_USE_HIP)
+    // HIP keeps the shared expert on cs_; only CUDA needs this branch stream.
     if (cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&sh_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&sh_join_, cudaEventDisableTiming) != cudaSuccess) {

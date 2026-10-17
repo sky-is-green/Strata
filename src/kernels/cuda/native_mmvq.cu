@@ -80,6 +80,7 @@ struct Q3KBlock {
     uint8_t scales[12];
     half d;
 };
+#include "fork/fork_mmvq_q2k_block.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 struct IQ4XSBlock {
     half d;
     uint16_t scales_h;
@@ -387,6 +388,7 @@ __device__ __forceinline__ float q3_q8_dot_impl(int vl, int vh, const int* __res
     return d3 * sumf;
 }
 
+#include "fork/fork_mmvq_q2k_dot.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 __device__ __forceinline__ float q3_q8_dot(const Q3KBlock* __restrict__ w,
                                           const Q81Block* __restrict__ x, int iqs) {
     const int bq8_offset = 4 * (iqs / 8);
@@ -943,6 +945,7 @@ struct Q20Traits {
         return r.d2 * d8 * sumi;
     }
 };
+#include "fork/fork_mmvq_q2k_traits.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 struct Q3KTraits {
     using Block = Q3KBlock;
     static constexpr int DIV = 256, T = 16, KBY = 8, BPI = WARPS * WARP / 16;
@@ -2405,6 +2408,7 @@ void native_q2_0_f32(const void* weights, const float* x, void* scratch_q8_1,
     native_q2_0_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+#include "fork/fork_mmvq_q2k_launch.cuh"   // Strata-DS4 fork code (docs/UPSTREAM_SYNC.md)
 void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     validate_shape(n_in, ncols, 256);
@@ -2699,8 +2703,8 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
-           ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
+    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 10 ||
+           ggml_type == 11 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
 }
@@ -2713,6 +2717,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 7: block_elems = 32; block_bytes = 24; break;
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
+    case 10: block_elems = 256; block_bytes = 84; break;
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
     case 13: block_elems = 256; block_bytes = 176; break;
@@ -2740,6 +2745,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 10: native_q2_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

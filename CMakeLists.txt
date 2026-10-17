@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -85,6 +85,19 @@ if(STRATA_Q6K_EXPERTS)
   add_compile_definitions(STRATA_Q6K_EXPERTS=1)
 endif()
 option(STRATA_ORCA_Q4KS_MMQ "Build the GGML Q5_0 MMQ instance for OrcaRouter Q4_K_S" OFF)
+# ggml's MMQ host API moved after the pinned commit: ggml_cuda_mmq_get_config takes an explicit
+# `const ggml_prec prec_src1` and mul_mat_q_case is templated on it.  src/prefill/moe_mmq.cu carries both spellings
+# behind STRATA_MMQ_PREC_SRC1, set here from the ggml tree the build actually uses (so a checkout of the pinned
+# commit and a newer one both build).
+function(strata_mmq_api_version target mmq_dir)
+  if(EXISTS "${mmq_dir}/mmq.cuh")
+    file(READ "${mmq_dir}/mmq.cuh" _strata_mmq_h)
+    if(_strata_mmq_h MATCHES "const ggml_prec prec_src1")
+      target_compile_definitions(${target} PRIVATE STRATA_MMQ_PREC_SRC1=1)
+      message(STATUS "Strata: MMQ host API takes prec_src1 (${mmq_dir})")
+    endif()
+  endif()
+endfunction()
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
 endif()
@@ -1263,6 +1276,10 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
+# Dev shortcut for the AMD/HIP port: link the ggml that STRATA_GGML_DIR has ALREADY built (its build directory)
+# instead of compiling that tree again - on gfx1100 the ggml-hip flash-attention template instances take hours.
+# Same source tree, so headers and archives match; the normal CUDA/CPU paths are untouched (empty by default).
+set(STRATA_GGML_PREBUILT "" CACHE PATH "an existing build dir of STRATA_GGML_DIR: link its ggml, do not compile it")
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
@@ -1271,9 +1288,16 @@ if(STRATA_ORCA_Q4KS_MMQ AND NOT STRATA_NATIVE_EXPERTS)
 endif()
 if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
-  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-  set(GGML_STATIC ON CACHE BOOL "" FORCE)
-  set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  # With STRATA_ENABLE_HIP these FORCEs are incompatible with ggml's GPU backend: ggml-hip refuses the static link
+  # ("Static linking not supported for HIP/ROCm", ggml-hip/CMakeLists.txt) and GGML_CUDA must stay off, so the
+  # wave32 build leaves the two knobs alone (shared ggml, as ggml's own HIP build wants) and ggml-hip is selected
+  # with -DGGML_HIP=ON.  The CUDA and CPU builds are byte-identical to before.
+  if(NOT STRATA_ENABLE_HIP)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(GGML_STATIC ON CACHE BOOL "" FORCE)
+    set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  endif()
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/ggml_cuda.cmake OPTIONAL)   # fork: STRATA_GGML_CUDA
   set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -1302,7 +1326,9 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
-  if(STRATA_GGML_DIR)
+  if(STRATA_GGML_PREBUILT)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tools/v41/cmake/ggml_prebuilt.cmake)
+  elseif(STRATA_GGML_DIR)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)
@@ -1425,6 +1451,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    strata_mmq_api_version(strata_mmq "${_strata_mmq}")
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1 q6_k, the experts of Unsloth's UD-Q4/Q5/Q6_K_XL (docs/QUANTS.md; the dispatch
     # follows eddoursul/Strata 7706c1b).  MODEL-UPDATE Phase 1: on CUDA they are a library of their own, strata_kq
@@ -1437,6 +1464,8 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_MMQ_KQUANTS AND STRATA_HIP_GFX906)
       list(APPEND _strata_mmq_cuda_types ${_strata_kq_types})
     elseif(STRATA_MMQ_KQUANTS)
+      # fork adds q2_k / q3_k / mxfp4 (DS4 Q2_K, MiMo GSQ-RCO Q3_K, MXFP4) to the CUDA types; the merged mmq
+      # dispatch has their cases, but the KQ DSO library (ours, proven) covers them only under a follow-up build
       set(_strata_kq_dso ON)
     endif()
     foreach(_t IN LISTS _strata_mmq_cuda_types)
@@ -1558,6 +1587,9 @@ if(STRATA_NATIVE_EXPERTS)
       # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
       # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
       list(APPEND _strata_mmq_types q4_k q5_k q5_1 q6_k)
+      # the fork's MiMo GSQ-RCO / DS4 tiers: the merged mmq dispatch covers them (the CUDA branch keeps
+      # them behind the KQ DSO library; HIP compiles the instances right here)
+      list(APPEND _strata_mmq_types q2_k q3_k mxfp4)
     endif()
     foreach(_t IN LISTS _strata_mmq_types)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
@@ -1570,6 +1602,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    strata_mmq_api_version(strata_mmq "${_strata_mmq}")
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
@@ -1848,3 +1881,5 @@ if(STRATA_HIP_GFX906)
   add_executable(gfx906_qsa_query_swizzle_probe bench/gfx906_qsa_query_swizzle_probe.cpp)
   target_link_libraries(gfx906_qsa_query_swizzle_probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
 endif()
+# Strata-DS4 fork targets (docs/UPSTREAM_SYNC.md): the fork's parity/bench executables, when present
+include(${CMAKE_CURRENT_SOURCE_DIR}/tools/ds4/cmake/fork.cmake OPTIONAL)

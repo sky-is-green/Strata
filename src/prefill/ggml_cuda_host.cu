@@ -9,12 +9,23 @@
 #include <string>
 #include <vector>
 
-[[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
+// The host symbols below are what llama.cpp's MMQ / quantize code references when ggml-cuda.cu is NOT part of the
+// link.  A build that DOES link that backend (ggml-hip on AMD - the V4.1 engine links it for the dense half - and
+// ggml-cuda on CUDA) gets the same symbols from the backend itself, and two strong definitions of one symbol are a
+// link error (measured: duplicate ggml_cuda_error / ggml_cuda_info / ggml_backend_cuda_context::*).  Weak lets the
+// backend's own copy win whenever it is linked, while a build without it (the HIP MMQ parity tests) still links.
+#if defined(_MSC_VER)
+#define STRATA_MMQ_HOST_WEAK
+#else
+#define STRATA_MMQ_HOST_WEAK __attribute__((weak))
+#endif
+
+STRATA_MMQ_HOST_WEAK [[noreturn]] void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     std::fprintf(stderr, "ggml-cuda (strata mmq): %s: %s\n  in %s at %s:%d\n", msg, stmt, func, file, line);
     std::abort();
 }
 
-int ggml_cuda_get_device() {
+STRATA_MMQ_HOST_WEAK int ggml_cuda_get_device() {
     int id = 0;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
@@ -59,7 +70,7 @@ int ggml_cuda_parse_amd_id(const char* device_name) {
 }  // namespace
 #endif
 
-const ggml_cuda_device_info & ggml_cuda_info() {
+STRATA_MMQ_HOST_WEAK const ggml_cuda_device_info & ggml_cuda_info() {
     static ggml_cuda_device_info info = [] {
         ggml_cuda_device_info in = {};
         int n = 0;
@@ -140,8 +151,8 @@ struct CachingPool : ggml_cuda_pool {
 };
 }  // namespace
 
-std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int, int) {
+STRATA_MMQ_HOST_WEAK std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int, int) {
     return std::unique_ptr<ggml_cuda_pool>(new CachingPool());
 }
 
-ggml_backend_cuda_context::~ggml_backend_cuda_context() {}
+STRATA_MMQ_HOST_WEAK ggml_backend_cuda_context::~ggml_backend_cuda_context() {}

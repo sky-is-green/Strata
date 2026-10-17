@@ -1,68 +1,62 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">Strata-DSV4.1 - AMD (gfx1100) branch</h1>
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+<p align="center"><b>DeepSeek-V4.1-Flash (40 layers x 384 experts) on ONE RX 7900 XTX - 152 GiB of experts across VRAM, pinned RAM and NVMe, plus 189 GiB of Engram on disk</b><br>
+The AMD port and tuning of <a href="https://github.com/Indras-Mirror/Strata-DSV4.1">Strata-DSV4.1</a>, itself built on <a href="https://github.com/Niko1221/Strata">Strata</a> - Linux - ROCm/HIP - MIT</p>
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+<p align="center"><b>RX 7900 XTX (gfx1100, ROCm 7.14) + 128 GiB RAM:&nbsp; prefill 240-363 tok/s &nbsp;·&nbsp; DSpark decode 24.3 tok/s &nbsp;·&nbsp; 256K context, 8-bit KV</b></p>
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+## What this branch is
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+This is the **AMD (gfx1100)** branch of the fork `vincalkr/Strata-DSV4.1`: the same engine and serve as upstream, ported
+and tuned to run DeepSeek-V4.1-Flash on **one** RX 7900 XTX.  Every number on this page was measured on that machine;
+the engine runs on a single card (`"gpu": 0` in [local/ds41-local.json](local/ds41-local.json)).
 
-## How fast is it?
+The platform is not ours.  The engine, the serve and the earlier DeepSeek-V4-Flash (0731) path come from
+[Indras-Mirror/Strata-DSV4.1](https://github.com/Indras-Mirror/Strata-DSV4.1), which builds on
+[Niko1221/Strata](https://github.com/Niko1221/Strata) (MIT; `LICENSE` is kept as it is).  Their README - the NVIDIA
+measurements, the 512K-context settings, the API and the V4-Flash engine - is kept verbatim in
+**[docs/upstream/README.md](docs/upstream/README.md)**, with the localized copies next to it; read it for anything that
+is not AMD-specific.  Our contribution is the AMD path: the port, the tuning, the measurements and these notes.
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+## The machine, and what is on disk
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+Two RX 7900 XTX are installed, but **one** is used.  128 GiB of RAM, one 2 TB NVMe, ROCm 7.14.  On disk:
+`models/V41-GSQ/V41-GSQ.gguf` (152 GiB), the 5.3 GiB DSpark draft with its small files, and the two Engram tables in
+`models/engram/` (189 GiB, layers 1 and 14).  The second card was tried as an expert tier and dropped: behind its
+PCIe 4.0 **x2** bridge it is worth +10-20% as extra cache, not 2x (see the negatives below).
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+| measured here, one sequence | |
+| --- | ---: |
+| decode, 4K state, DSpark off | 13.7 tok/s |
+| decode, 64K state, DSpark off | 14.0 tok/s |
+| decode through the server, DSpark depth 4, ggml graphs off | 22.8 -> 24.3 tok/s |
+| prompt, 5787 tokens | 240-245 tok/s |
+| prompt, 63,617 tokens, fresh, through the server | 363 tok/s |
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+## The optimizations, each with what it was worth
 
-</td><td>
-
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
-
-</td></tr>
-</table>
-
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
-
-## What you need
-
-| | |
+| change | measured effect |
 | --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
+| ggml's fused dense ops (`local/build-ggml-fused.sh`: `dsv41-fake-quant.patch` + `dsv41-fuse.patch`) | +13% decode, +23% with DSpark; last-row logits top-1 identical, mean absolute difference 0.156 |
+| `--arena-gib 75` (from 60) | +40% decode (16.4-17.4 -> 23.8-25.2 tok/s), prompt file wait 16.6 -> 11.0 s; 80 and above are worse or unstable |
+| `GGML_CUDA_DISABLE_GRAPHS=1` | +6.6% decode, +3% prompt in the server |
+| `STRATA_PRESTAGE_GIB=1.5` | +5.8% prompt (231.2 -> 244.5 tok/s) |
+| `--kv-q8` (8-bit KV, not 4-bit) | lossless here: last-row cosine 0.998987, top-5 5/5, +0.37 GiB |
+| DSpark depth 4 with `KEEP 64` | depth 5, depth 6, `KEEP 32` and `KEEP 128` all measured worse |
+| `STRATA_SERVE_PASS_BIAS=0` | the upstream default (0.5/0.3) gives 2.2x the expert misses here: 12.1 against 25.1 tok/s |
+| the v41 serve's thinking budget (`reasoning_budget_tokens 8192`, `reasoning_close_retry`) | a runaway reasoning loop is now closed at the budget and the model answers (tested with a 128-token budget) |
+| the effort mapping aligned with the reference implementation | `low`/`medium`/`xhigh` resolve the way the reference server resolves them for V4.1 (75/75/75) |
+| DSML tool-call parsing in the local path | tool calls reach the client, streaming and not |
+| prompt batching | a fresh 63K prompt at `--prompt-batch 12288` can run out of memory and segfault the one-shot CLI; the server sizes the batch itself and does 363 tok/s |
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+## Where the time goes, and what is left
 
-Experimental, written and tested by community members on their own machines:
+A runtime trace at 17K state: the GPU kernels are 32.2 ms of a 139 ms profiled token, and 215 `hipStreamSynchronize`
+calls a token account for 105 ms - 95.3 of them after a device-to-host readback and 76.7 after the dense graph's
+launch - with 4,238 kernel launches a token.  Decode is therefore **host/sync-bound, not GPU-bound**, and the
+synchronizations are mostly real work being waited for (the experts' DMA and the launch latency), not idle overhead.
+The lever that is left is the number of kernel launches.  The per-layer host handshake itself was investigated to the
+end and closed: see [docs/ds4/V41_PIPELINE_OVERLAP.md](docs/ds4/V41_PIPELINE_OVERLAP.md).
 
 - **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
 - **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
@@ -70,26 +64,32 @@ Experimental, written and tested by community members on their own machines:
 - **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
 - **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
 
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+With the numbers, so they are not repeated: `--pf-b` below 1.0 (-19% decode; the default 1.43 sits just above that
+cliff), DSpark depth 5 and 6, `KEEP 32` and `128`, `STRATA_DSPARK_ADAPT`, the adaptive arena, `STRATA_PROM=1`, the
+peer expert tier on the second card (correct and bit-identical rows, 91.5 rows a token moved off card 0, but 11.8
+against 12.6 tok/s), the transcode decode, `STRATA_HIP_WMMA` (the +5.4% was noise: v41 never calls that kernel), a
+cache for `ggml_cuda_get_device` (120 calls a token, 0.06 ms) and the 685 per-token error queries (below 0.3 ms).
 
-## Install
+## Run it
 
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```sh
+./run-v41-gsq.sh                 # the server on port 8150, with the configuration in local/ds41-local.json
+./run-v41-gsq.sh --port 8151     # extra server arguments are passed straight through
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+It first checks that the model and the two Engram tables are in `models/` and says what is missing if they are not.
+It picks the interpreter itself: `STRATA_PY` if set, then a `.venv` in the repository, then `venv/`, then `python3` -
+the first one that imports **pillow, psutil, regex and jinja2**, which are the only packages the server needs
+(`python3 -m venv .venv && .venv/bin/pip install pillow psutil regex jinja2`; `.venv/` is already gitignored).
+Loading takes a couple of minutes (152 GiB are mapped, the RAM arena is filled, the Engram tables are opened); once
+it is up, `curl -s http://127.0.0.1:8150/v1/models` answers `"status": {"value": "loaded"}`, and the OpenAI- and
+Anthropic-compatible API is on that port.  For a single generation without the server, use `local/run-one-shot.sh`
+(with `EXE=$PWD/build-hip-fused/ds41_generate` for the fused build the server uses).
 
-### Or do it yourself
+## Getting the model files
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+The model is not in git (355 GiB in total).  [local/fetch-model.sh](local/fetch-model.sh) builds exactly the layout
+this branch uses:
 
 **Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
 (`xcode-select --install` in Terminal; Xcode itself is not needed). Then open Terminal in the Strata folder and run
@@ -100,17 +100,22 @@ and starts it. Next time, `./setup.sh` starts it right away. Which size fits you
 The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
 asks you a few questions:
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+Space: 163 GB for the GGUF, then the two Engram tables (101 GB each) plus the two 101 GB shards they are extracted
+from.  `extract_engram.py` works on the whole set - it validates every shard the index names and needs a `--to` for
+every Engram layer - so both shards must be on disk at once and both destinations are given in one call: there is no
+one-table-at-a-time order (measured: "shard not found: model-00048-of-00048.safetensors" with only 47 present, and
+"no --to for layers.14" with a single `--to`).  Peak for that phase is therefore 163 + 203 + 202 GB, which is why
+`WORK` and `DEST_LAYERS1`/`DEST_LAYERS14` exist: put the shards on one disk and the tables on another, and the peak
+split across the two is what the machine has to hold.
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+```sh
+local/fetch-model.sh /path/to/models     # DEST defaults to <repo>/models
+```
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
+It is resumable, it uses `aria2c` when it is installed (8 connections per file: measured 270 MiB/s against 5.7 MB/s for a single `curl`), and it checks: every expected size comes from the Hugging Face API, a file counts as complete only
+when its size matches (so a partial download is resumed with `curl -C -`, never trusted), the parts are joined by the
+repo's own `reassemble.sh` (which verifies their sha256 first and the joined file at the end), and an interrupted join
+is reported instead of being joined over.  Every parameter:
 
 **Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
 its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
@@ -125,10 +130,19 @@ sizes are faster. Larger sizes are a bit smarter.
 
 | Your RAM | Take | Why |
 | --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
+| first argument | `<repo>/models` | where the trees go |
+| `GSQ_REPO`, `FP8_REPO` | the two repositories linked above | where to fetch from |
+| `JOBS` | 1 | how many files are fetched at once (one by default) |
+| `CONN` | 4 | connections per file with `aria2c`.  The Hugging Face CDN throttles each connection: measured on this repo, 1 gives 5.7 MB/s, 4 gives ~27 MB/s and 8 gives **140 MiB/s** |
+| `ARIA2` | 1 when `aria2c` is installed | `0` forces `curl` |
+| `DRY_RUN=1` | 0 | print the whole plan (what is complete, what would be fetched, the join, the Engram steps) and change nothing |
+| `DELETE_PARTS` | 1 | drop each GGUF part as it is appended; `0` keeps them and needs the space twice |
+| `DEST_LAYERS1`, `DEST_LAYERS14` | `<models>/engram/layers1`, `layers14` | put the two Engram tables on different disks |
+| `KEEP_FP8` | 0 | keep the FP8 shards after the extraction (101 GB each) |
+| `FORCE_JOIN` | 0 | remove an interrupted `V41-GSQ.gguf` and join again (by default it stops and says so) |
+| `VERIFY_ROWS` | 200 | how many random Engram rows are checked against the source |
+| `WORK` | `DEST` | scratch for the FP8 shards and the size lists |
+| `HF_TOKEN` | `~/.cache/huggingface/token` | needed only for gated repositories |
 
 - **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
   model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,

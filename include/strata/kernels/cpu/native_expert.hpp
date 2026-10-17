@@ -9,18 +9,31 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized gate/up activation any native layer uses.  DeepSeek-V4's n_embd 4096 as Q8_K
+/// (IQ2_XXS's vec_dot_type) is 16 x 292 = 4672, the largest; Qwen's 2560 as Q8_K is 2920 and 4096 as Q8_0 is 4352.
+inline constexpr size_t kNativeActBytes = 5840;   // Strata-DS4 fork: DeepSeek-V4.1 n_embd 5120 as Q8_K (20 x 292)
+/// Bytes of the largest quantized down activation.  DeepSeek-V4's n_ff 2048 as Q8_K (Q2_K's vec_dot_type) is
+/// 8 x 292 = 2336, the largest; Qwen's 640 as Q8_0 is 20 x 34 = 680.
+inline constexpr size_t kNativeHBytes = 2628;   // Strata-DS4 fork: DeepSeek-V4.1 n_ff 2304 as Q8_K (9 x 292)
+/// The widest native expert intermediate (n_ff) any model has.  DeepSeek-V4's 2048 is twice Qwen's 640, so the
+/// pool's per-expert row buffers (ExpertPool::SplitBufMulti::ff) must be sized by THIS and not by the canonical
+/// `FF` (640) that the Q2_0 pack path uses: `native_gu_rows` writes rows [0, n_ff) of the model's own width, and
+/// a buffer sized for Qwen overflows silently into the neighbouring struct (found by tools/ds4/moe_replay).
+inline constexpr int kNativeFFMax = 2304;   // Strata-DS4 fork: DeepSeek-V4.1 n_ff
 
 /// One layer's native expert geometry.
 struct NativeFmt {
     int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    /// The up projection's own type when it differs from the gate's (MiMo-V2.6-Flash GSQ-RCO picks a format per
+    /// tensor: 16 of its 47 routed layers have gate != up).  -1 = the gate's type (every other model).  Set only by
+    /// `native_fmt3`; gate and up must share the activation format (`gu_act`).
+    int up_type = -1;
+    size_t up_row = 0;                  ///< bytes per up row when `up_type` is set (else gu_row)
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
@@ -32,6 +45,13 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+    /// DeepSeek-V4's SwiGLU clamp (`swiglu_clamp_exp`): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
+    /// silu(gate) * up.  +inf (the default, every other model) = no clamp, bit-identical to the unclamped kernels.
+    float swiglu_limit = std::numeric_limits<float>::infinity();
+    /// Which type-143 PTQ1_0 dialect the activations follow: 0 = the Scion lane's (Q8_K activations,
+    /// ptq1_0_gu_rows / ptq1_0_down_rows), 1 = llama-tq's (Q8_0, ptq1_0_rows_q8_0; DS4.1's GSQ exports).
+    /// Both forks claimed GGML type id 143 with the same 28-byte weight block; only the activation side differs.
+    int ptq_tq = 0;
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
@@ -40,6 +60,11 @@ constexpr size_t kNvfp4Tail = 16;
 bool native_experts_available() noexcept;
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+
+/// `native_fmt` with gate and up of different types (MiMo GSQ-RCO).  Equal types give exactly `native_fmt`'s layout.
+/// False when the two need different activation formats (one quantized activation serves both).
+bool native_fmt3(int gate_type, int up_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f,
+                 std::string& err);
 
 /// x (n_embd floats) -> the gate/up activation (act_bytes).
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
