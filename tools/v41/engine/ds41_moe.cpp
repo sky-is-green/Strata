@@ -931,6 +931,7 @@ bool ds41_moe_blob_layout(const Ds41MoeGeom& g, cpu::NativeFmt& f, std::string& 
               std::to_string(g.n_embd) + "/" + std::to_string(g.n_ff) + ": " + e;
         return false;
     }
+    f.ptq_tq = 1;   // DSV4.1's tiers read the llama-tq PTQ1_0 dot (Q8_0 activations); engram/checkpoints apart
     f.swiglu_limit = g.swiglu_limit;
     return true;
 }
@@ -943,6 +944,7 @@ bool ds41_moe_class_layout(const Ds41MoeGeom& g, int64_t c, cpu::NativeFmt& f, s
         err = "class " + std::to_string(c) + ": native_fmt3(" + std::to_string(gu) + "/" + std::to_string(dt) + "): " + e;
         return false;
     }
+    f.ptq_tq = 1;   // DSV4.1's tiers read the llama-tq PTQ1_0 dot (Q8_0 activations); engram/checkpoints apart
     f.swiglu_limit = g.swiglu_limit;
     return true;
 }
@@ -963,6 +965,7 @@ bool ds41_moe_layer_layout(const Ds41MoeGeom& g, int64_t l, cpu::NativeFmt& f, s
               std::to_string(g.up_type(l)) + "/" + std::to_string(g.down_type(l)) + "): " + e;
         return false;
     }
+    f.ptq_tq = 1;   // DSV4.1's tiers read the llama-tq PTQ1_0 dot (Q8_0 activations); engram/checkpoints apart
     f.swiglu_limit = g.swiglu_limit;
     return true;
 }
