@@ -10668,6 +10668,10 @@ int main(int argc, char** argv) {
             int req_penalty_last_n = 0;
             std::string req_bias_text;
             bool req_bias_present = false;
+            // emb=<file>: write the last prompt token's head input (the unembedding input, the decision-head
+            // readout's vector) to <file> and end the request without emitting tokens.  One-shot: no checkpoint.
+            std::string req_emb_path;
+            bool emb_wanted = false;   ///< the window that carries the head-input readback (EMB)
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
@@ -10700,6 +10704,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "emb") req_emb_path = tok.substr(eq + 1);
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
@@ -10729,6 +10734,11 @@ int main(int argc, char** argv) {
                     }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
+            }
+            if (!req_emb_path.empty()) req_ckpt = 0;   // a one-shot hidden-state read: nothing to continue
+            if (!req_emb_path.empty() && (geni || o.batch > 0)) {
+                std::printf("ERR emb: text requests only, without --batch\n");
+                continue;
             }
             std::vector<float> req_bias;
             std::string bias_error;
@@ -11934,6 +11944,7 @@ int main(int argc, char** argv) {
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr
+                                  : !req_emb_path.empty() ? "an EMB request (its vector is the serial loop's first window)"
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
@@ -12728,6 +12739,17 @@ int main(int argc, char** argv) {
                 draft_accepted += a;
                 first_window = false;
                 bool eos = false;
+                if (!req_emb_path.empty()) {
+                    // EMB: the first window's row 0 is the prompt's last token, so its head input (the unembedding
+                    // input, after the output mixer and norm) is the decision-head readout's vector.  Raw float32,
+                    // n_embd floats; the request ends here without emitting a token.
+                    //
+                    // The vector is written after the window's own cleanup (the adaptive thread's join, the
+                    // draft's commit) - a break before it left the adaptive thread unjoined and running when
+                    // the request ended, and the engine died with "terminate called without an active
+                    // exception" on the request after the first EMB one.
+                    emb_wanted = true;
+                } else {
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
@@ -12742,10 +12764,11 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && !emb_wanted && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                // an EMB request ends after this window: there is no next window to draft for
+                const bool drafted = emb_wanted || !use_mtp || eos || produced_n >= max_new ||
+                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -12776,6 +12799,25 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+                }   // the EMB branch above took this window's place
+                if (emb_wanted) {
+                    // The window's cleanup is done (the adaptive thread joined, the draft committed), so the
+                    // readback is safe now: the last prompt token's head input, raw float32, n_embd floats.
+                    std::vector<float> hv((size_t) g.n_embd);
+                    if (!ver.copy_head_mixed(0, hv.data())) {
+                        std::printf("ERR emb: the head input could not be read\n");
+                    } else if (std::FILE* f = std::fopen(req_emb_path.c_str(), "wb")) {
+                        const size_t wrote = std::fwrite(hv.data(), sizeof(float), hv.size(), f);
+                        std::fclose(f);
+                        if (wrote == hv.size()) std::printf("EMB %d %s\n", (int) g.n_embd, req_emb_path.c_str());
+                        else std::printf("ERR emb: a short write to %s\n", req_emb_path.c_str());
+                    } else {
+                        std::printf("ERR emb: cannot write %s\n", req_emb_path.c_str());
+                    }
+                    std::fflush(stdout);
+                    finish = "emb";
+                    break;
+                }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
