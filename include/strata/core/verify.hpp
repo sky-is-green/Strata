@@ -104,6 +104,10 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// Diagnostics: row `t` of the last window's head input (the unembedding input, n_embd floats, after the output
+    /// mixer and norm) to the host.  Valid after run().  A layer split asks the last stage (the earlier stages run
+    /// no head): the decision-head readout's vector.
+    bool copy_head_mixed(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph

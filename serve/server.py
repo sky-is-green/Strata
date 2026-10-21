@@ -57,7 +57,8 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
+from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, TemplateRequestError,  # noqa: E402
+                            anthropic_to_messages,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -1872,6 +1873,49 @@ class StrataEngine:
                     if not self.can_stop:
                         heard = time.monotonic()
 
+    def embed(self, ids: list[int], timeout_s: float = 1800.0) -> list[float]:
+        """The last prompt token's final hidden state, raw float32: the engine's `emb=<file>`, the decision-head
+        readout's vector (the unembedding input).  The caller holds the service FIFO."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this embedding was not sent")
+        with tempfile.NamedTemporaryFile(prefix="strata-emb-", suffix=".f32", delete=False) as f:
+            path = f.name
+        vec: list[float] | None = None
+        try:
+            try:
+                self.proc.stdin.write(f"GEN 1 emb={path} {','.join(str(int(t)) for t in ids)}\n")
+                self.proc.stdin.flush()
+            except OSError:                                  # the pipe is gone: the engine died (not the client)
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            deadline = time.monotonic() + timeout_s
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise self._silent("the engine did not answer an EMB request in time")
+                try:
+                    line = self.lines.get(timeout=min(left, 0.5))
+                except queue.Empty:
+                    continue
+                if line is None:
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                if line.startswith("EMB "):
+                    dim = int(line.split()[1])
+                    vec = list(struct.unpack(f"<{dim}f", Path(path).read_bytes()))
+                    if len(vec) != dim:
+                        raise EngineDied(f"the engine wrote {len(vec)} floats for EMB {dim}")
+                elif line.startswith("DONE"):
+                    self._parse_done(line)
+                    if vec is None:
+                        raise EngineDied("the engine ended an EMB request without a vector")
+                    return vec
+                elif line.startswith("ERR"):
+                    raise ValueError(line[4:].strip())
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
         try:
@@ -2928,6 +2972,7 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
+        self.decision_head: dict | None = None        # the run config's `decision_head` (POST /v1/verdict)
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
@@ -3954,6 +3999,53 @@ class Service:
             print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
+
+    def embed_text(self, content: str, normalize: int | None = None) -> tuple[list[float], int]:
+        """POST /embedding, /v1/embeddings: the content's last-token hidden state (the decision-head readout's
+        vector, also the unembedding input), raw float32.  `normalize`: 2 = L2, -1/None = raw.  ValueError (a 400)
+        for an empty content or one longer than the context; the caller holds nothing (this takes the FIFO)."""
+        ids = self.tok.encode(content, parse_special=True)
+        if not ids:
+            raise ValueError("the content has no tokens")
+        if not callable(getattr(self.engine, "embed", None)):
+            raise ValueError("this engine cannot embed (an older build without emb=)")
+        ctx = self.reported_ctx()
+        if ctx > 0 and len(ids) > max(1, ctx - 1):
+            raise ValueError(f"the content is {len(ids)} tokens; the context is {ctx}")
+        self.last_request_at = time.time()
+        with self.fifo:
+            self.ensure_loaded()
+            vec = self.engine.embed(ids)
+        if normalize == 2:
+            s = math.sqrt(sum(float(v) * float(v) for v in vec))
+            if s > 0:
+                vec = [float(v) / s for v in vec]
+        return vec, len(ids)
+
+    def verdict(self, task: str, candidate: str, system: str | None = None) -> dict:
+        """The decision head's readout for one (task, candidate): the model judges, and the head reads the
+        judge prompt's last hidden state through the engine's `emb=`.  Pure Python; no numpy, no torch.
+
+        -> {"p_correct", "threshold", "accept", "tokens", "ms"}.  ValueError when no head is configured or the
+        prompt cannot be built."""
+        head = self.decision_head
+        if head is None:
+            raise ValueError('no decision head is configured (set "decision_head" in the run config)')
+        body = DECISION_BODY.format(task=task, candidate=candidate)
+        messages = [{"role": "system", "content": system or DECISION_SYSTEM},
+                    {"role": "user", "content": body}]
+        try:
+            prompt = self.template.render(messages, add_generation_prompt=True, enable_thinking=False)
+        except TemplateRequestError:                     # a template without thinking control
+            prompt = self.template.render(messages, add_generation_prompt=True)
+        t0 = time.time()
+        vec, n = self.embed_text(prompt)                 # raw vector, one judge pass through the engine
+        z = head["b"]
+        for wi, mi, si, vi in zip(head["w"], head["mu"], head["sd"], vec):
+            z += wi * ((vi - mi) / si)
+        p = 1.0 / (1.0 + math.exp(-(head["a"] * z + head["c"])))
+        return {"p_correct": p, "threshold": head["threshold"], "accept": p >= head["threshold"],
+                "tokens": n, "ms": round((time.time() - t0) * 1000, 1)}
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
@@ -5139,6 +5231,61 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _apply_template(self, req):
+            """llama.cpp-compatible /apply-template: the model's own chat template, rendered (the decision-head
+            study's scripts call this to build a judge prompt before embedding it)."""
+            msgs = req.get("messages")
+            if not isinstance(msgs, list) or not msgs:
+                raise ValueError("messages: a non-empty list")
+            kwargs = req.get("chat_template_kwargs")
+            kwargs = kwargs if isinstance(kwargs, dict) else {}
+            tools = req.get("tools")
+            try:
+                prompt = svc.template.render(msgs, tools=tools,
+                                             add_generation_prompt=bool(req.get("add_generation_prompt", True)),
+                                             **kwargs)
+            except TemplateRequestError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            self._json(200, {"prompt": prompt})
+
+        def _embeddings(self, req, path):
+            """Text embeddings: the content's last-token hidden state.  /embedding answers llama.cpp's shape (a list
+            of results, `embedding` a list of vectors), /v1/embeddings the OpenAI one."""
+            content = req.get("content") if isinstance(req.get("content"), str) else None
+            if content is None:
+                inp = req.get("input")
+                if isinstance(inp, list):
+                    if len(inp) != 1 or not isinstance(inp[0], str):
+                        raise ValueError("input: one string (the engine embeds one prompt at a time)")
+                    inp = inp[0]
+                if not isinstance(inp, str):
+                    raise ValueError("content (llama.cpp) or input (OpenAI): a string")
+                content = inp
+            norm = req.get("embd_normalize")
+            if norm is None and path == "/v1/embeddings":
+                norm = 2                                     # OpenAI embeddings come out unit-norm by default
+            if norm is not None and norm not in (-1, 0, 2):
+                raise ValueError("embd_normalize: -1 (none) or 2 (L2)")
+            vec, n = svc.embed_text(content, norm)
+            if path == "/embedding":
+                self._json(200, [{"embedding": [vec], "index": 0}])
+            else:
+                self._json(200, {"object": "list", "model": req.get("model") or svc.model,
+                                 "data": [{"object": "embedding", "index": 0, "embedding": vec}],
+                                 "usage": {"prompt_tokens": n, "total_tokens": n}})
+
+        def _verdict(self, req):
+            """POST /v1/verdict {"task": ..., "candidate": ... [, "system": ...]}: the decision head's
+            p_correct for that candidate (the run config must carry a `decision_head` path)."""
+            task, candidate = req.get("task"), req.get("candidate")
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("task: a non-empty string")
+            if not isinstance(candidate, str) or not candidate.strip():
+                raise ValueError("candidate: a non-empty string")
+            system = req.get("system") if isinstance(req.get("system"), str) else None
+            self._json(200, {"model": svc.model, **svc.verdict(task, candidate, system)})
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
             if path.startswith("/fonts/"):
@@ -5414,6 +5561,12 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/apply-template":
+                    self._apply_template(req)
+                elif path in ("/embedding", "/v1/embeddings"):
+                    self._embeddings(req, path)
+                elif path == "/v1/verdict":
+                    self._verdict(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
@@ -6359,6 +6512,31 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
 SAMPLING_ALIASES = {"repeat_penalty": "repetition_penalty", "repeat_last_n": "penalty_last_n"}
 
 
+#: The decision head's judge prompt (the study's wording; the head is format-locked to it).
+DECISION_SYSTEM = "You are a decision function. Reply with the answer label only."
+DECISION_BODY = ("Question: {task}\nCandidate answer: {candidate}\n"
+                 "Is the candidate answer correct?\nA. Yes\nB. No\n")
+
+
+def load_decision_head(path: str) -> dict:
+    """The decision head JSON (the study's export schema) as the readout's constants.
+
+    `weights`: w, mu, sd (same length), b, and the Platt pair.  `test.threshold` becomes the default
+    accept threshold.  A malformed file refuses to start the server, as a bad sampling default does.
+    """
+    h = json.loads(Path(path).read_text(encoding="utf-8"))
+    w = h["weights"]
+    out = {"path": str(path),
+           "w": [float(v) for v in w["w"]], "mu": [float(v) for v in w["mu"]], "sd": [float(v) for v in w["sd"]],
+           "b": float(w["b"]), "a": float(w["platt"][0]), "c": float(w["platt"][1]),
+           "threshold": float((h.get("test") or {}).get("threshold") or 0.5),
+           "model": h.get("model"), "dim": len(w["w"])}
+    if not (len(out["mu"]) == len(out["sd"]) == out["dim"]) or out["dim"] < 1:
+        raise ValueError(f"weights w/mu/sd must be three equal-length arrays (got "
+                         f"{out['dim']}/{len(out['mu'])}/{len(out['sd'])})")
+    return out
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -6662,6 +6840,13 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if cfg.get("decision_head"):                        # the JEV head behind POST /v1/verdict (opt-in)
+        try:
+            svc.decision_head = load_decision_head(cfg["decision_head"])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise SystemExit(f"[strata] decision_head {cfg['decision_head']}: {e}")
+        print(f"[strata] decision head: {svc.decision_head['dim']} dims from {svc.decision_head['path']} "
+              f"(threshold {svc.decision_head['threshold']:g})", flush=True)
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)

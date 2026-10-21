@@ -698,6 +698,9 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 | The same for Prometheus, with vLLM's metric names (asked with `Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
 | Request totals and what is running in Prometheus' text format, under llama-server's metric names | `GET /metrics/prometheus` |
+| Text embeddings: the content's last-token hidden state, raw (the decision head's vector) | `POST /embedding` (llama.cpp's shape, `embd_normalize` `-1` or `2`), `POST /v1/embeddings` (OpenAI's, unit-norm) |
+| Render the model's own chat template (build a prompt before embedding it) | `POST /apply-template` |
+| Answer verification (the decision head: is the candidate correct?) | `POST /v1/verdict` (needs a `decision_head` path in the run config; one judge pass, ~ms) |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `GET /metrics` answers a Prometheus scrape (`Accept: text/plain` or `application/openmetrics-text`) in the text

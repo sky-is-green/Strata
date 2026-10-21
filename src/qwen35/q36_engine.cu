@@ -1296,6 +1296,38 @@ struct Engine {
     int64_t probe_pos = 0;
     bool probe_have = false;
     long long probe_n = 0;
+    // The EOT byte-logit dump, the distillation-target half of arXiv:2609.12303 (opt-in, measurement/training
+    // only): STRATA_Q36_LOGIT_DUMP=<file> with STRATA_Q36_BYTE_TABLE=<byte-table.bin from tools/byte_table.py>.
+    // Every prompt row whose continuation is known writes one record: the gold token, its probability, the exact
+    // byte-string probability and the End-Of-Token byte distributions along its bytes (tools/byte_table.py --verify
+    // checks the identity product(dist) == p_exact).  A table without the EOT slot gives Marginalize-It instead.
+    std::FILE* logit_dump = nullptr;
+    std::vector<int16_t> bt;             // vocab x width: bytes 0..255, 256 = EOT, -1 padding
+    std::vector<uint8_t> bt_rows;        // rows per token (bytes + EOT slot when the table has one)
+    std::vector<uint8_t> bt_blen;        // the token's true byte length
+    int bt_w = 0, bt_vocab = 0, bt_eot = 0, bt_nsym = 256;
+    std::vector<float> dump_lg, dump_probs, dump_acc;   // host: one group's logits, probabilities, one accumulator
+    std::vector<int32_t> dump_alive;
+    float* dump_logits_dev = nullptr;                   // its own head output: `logits`/`pick` keep their meaning
+    int32_t* dump_pick_dev = nullptr;
+    long long dump_rows = 0;
+    // The JEV decision head (opt-in): STRATA_Q36_JEV_HEAD=<head.bin from decision-heads-work/head_bin.py>.  An EMB
+    // request then answers "EMB <dim> <file> <p_correct>": the last prompt token's hidden state through the
+    // closed-form readout the head carries (ridge on standardised features + Platt).  The vector is the same one
+    // the head was fit on (the normed hidden the unembedding reads), so the fit path and the serve path agree.
+    std::vector<float> jh_w, jh_mu, jh_sd;
+    float jh_b = 0.f, jh_a = 0.f, jh_c = 0.f;
+    int jh_dim = 0;
+    bool jh_ok = false;
+    /// The readout: true when a head is loaded and `n` matches it; p = sigmoid(a * (w.(h-mu)/sd + b) + c).
+    bool jh_readout(const float* h, int n, double& p) const {
+        if (!jh_ok || n != jh_dim) return false;
+        double z = (double) jh_b;
+        for (int i = 0; i < n; ++i)
+            z += (double) jh_w[(size_t) i] * (((double) h[i] - (double) jh_mu[(size_t) i]) / (double) jh_sd[(size_t) i]);
+        p = 1.0 / (1.0 + std::exp(-((double) jh_a * z + (double) jh_c)));
+        return true;
+    }
     // The ablation arm (measurement only: the outputs change, the node costs are read off the step).  Each flag
     // drops one correction / router node (or swaps top-k for a trivial fill) so the graph replay's difference to
     // the full arm is that node's own cost.
@@ -1432,8 +1464,85 @@ struct Engine {
                 std::exit(1);
             }
         }
+        if (const char* dp = std::getenv("STRATA_Q36_LOGIT_DUMP")) {   // host-side: see the members' note
+            const char* tf = std::getenv("STRATA_Q36_BYTE_TABLE");
+            if (tf == nullptr) {
+                std::fprintf(stderr, "strata-q36: STRATA_Q36_LOGIT_DUMP needs STRATA_Q36_BYTE_TABLE "
+                                     "(byte_table.py --out byte-table.bin)\n");
+                std::exit(1);
+            }
+            std::FILE* f = std::fopen(tf, "rb");
+            char magic[4] = {};
+            uint32_t vocab = 0, width = 0, eot = 0;
+            if (f == nullptr || std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "SBT1", 4) != 0 ||
+                std::fread(&vocab, 4, 1, f) != 1 || std::fread(&width, 4, 1, f) != 1 || std::fread(&eot, 4, 1, f) != 1 ||
+                vocab != (uint32_t) g.n_vocab || width < 1 || width > 255) {
+                std::fprintf(stderr, "strata-q36: %s is not a byte table for this model (%u tokens vs %lld)\n", tf,
+                             vocab, (long long) g.n_vocab);
+                std::exit(1);
+            }
+            bt.resize((size_t) vocab * width);
+            if (std::fread(bt.data(), 2, bt.size(), f) != bt.size()) {
+                std::fprintf(stderr, "strata-q36: %s is short\n", tf);
+                std::exit(1);
+            }
+            std::fclose(f);
+            bt_vocab = (int) vocab;
+            bt_w = (int) width;
+            bt_eot = eot ? 1 : 0;
+            bt_nsym = 256 + bt_eot;
+            bt_rows.resize(vocab);
+            bt_blen.resize(vocab);
+            for (size_t v = 0; v < vocab; ++v) {
+                int n = 0;
+                while (n < bt_w && bt[v * bt_w + n] >= 0) ++n;
+                bt_rows[v] = (uint8_t) n;
+                bt_blen[v] = (uint8_t) (n - bt_eot);
+            }
+            logit_dump = std::fopen(dp, "wb");
+            if (!logit_dump) {
+                std::fprintf(stderr, "strata-q36: cannot write the logit dump %s\n", dp);
+                std::exit(1);
+            }
+            char dh[4] = {'S', 'B', 'D', '1'};
+            uint32_t nsym = (uint32_t) bt_nsym;
+            std::fwrite(dh, 1, 4, logit_dump);
+            std::fwrite(&nsym, 4, 1, logit_dump);
+            dump_lg.resize((size_t) kVerify * (size_t) vocab);
+            dump_probs.resize(vocab);
+            dump_acc.resize((size_t) bt_nsym);
+            dump_alive.reserve(vocab);
+        }
+        if (const char* jf = std::getenv("STRATA_Q36_JEV_HEAD")) {
+            std::FILE* f = std::fopen(jf, "rb");
+            char magic[4] = {};
+            uint32_t dim = 0, flags = 0;
+            if (f == nullptr || std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "SJH1", 4) != 0 ||
+                std::fread(&dim, 4, 1, f) != 1 || std::fread(&flags, 4, 1, f) != 1 ||
+                dim != (uint32_t) g.n_embd) {
+                std::fprintf(stderr, "strata-q36: %s is not a decision head for this model (dim %u vs %lld)\n", jf,
+                             dim, (long long) g.n_embd);
+                std::exit(1);
+            }
+            jh_w.resize(dim); jh_mu.resize(dim); jh_sd.resize(dim);
+            if (std::fread(jh_w.data(), 4, dim, f) != dim || std::fread(jh_mu.data(), 4, dim, f) != dim ||
+                std::fread(jh_sd.data(), 4, dim, f) != dim || std::fread(&jh_b, 4, 1, f) != 1 ||
+                std::fread(&jh_a, 4, 1, f) != 1 || std::fread(&jh_c, 4, 1, f) != 1) {
+                std::fprintf(stderr, "strata-q36: %s is short\n", jf);
+                std::exit(1);
+            }
+            std::fclose(f);
+            jh_dim = (int) dim;
+            jh_ok = true;
+            std::fprintf(stderr, "strata-q36: decision head loaded (%d dims, platt a=%.3f c=%.3f) from %s\n",
+                         jh_dim, jh_a, jh_c, jf);
+        }
         x = dalloc(T * N); h = dalloc(T * N); y = dalloc(T * N); hmain = dalloc(T * N); hlast = dalloc(N);
         if (mtp_probe) probe_hd = dalloc(N);
+        if (logit_dump) {
+            dump_logits_dev = dalloc((size_t) kVerify * g.n_vocab);
+            dump_pick_dev = dalloc_t<int32_t>(kVerify);
+        }
         if (m->sc_loaded) {
             sc_x = dalloc(2 * N); sc_z = dalloc((size_t) m->sc_width); sc_out = dalloc(N); sc_hn = dalloc(N);
             sc_e = dalloc(N); sc_tok = dalloc_t<int32_t>(1);
@@ -2386,6 +2495,7 @@ struct Engine {
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             forward(T, pos, i + T == n ? 1 : 0, false, false);
+            if (logit_dump && T > (i + T == n ? 1 : 0)) logit_dump_chunk(toks + i, T, i + T == n);
             if (m->has_mtp && mtp_d > 0) {
                 // seeds: h_{q-1} for each row q: hlast, then this chunk's rows 0 .. T - 2 (in `y`, free here)
                 CK(cudaMemcpyAsync(mtp_seed(), hlast, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
@@ -2611,6 +2721,84 @@ struct Engine {
         if (++probe_n % 128 == 0) std::fflush(mtp_probe);
         if (probe_n == 1) std::fprintf(stderr, "strata-q36: MTP probe: writing the drafter's pairs to %s\n",
                                        mtp_probe_name.c_str());
+    }
+    /// One prompt chunk's rows whose continuation is known: the head over groups of kVerify rows, softmax, the
+    /// byte conversion, one record per row (see the members' note; `toks[t + 1]` is row t's continuation).
+    void logit_dump_chunk(const int32_t* toks, int chunk_T, bool last_chunk) {
+        const int N = (int) m->g.n_embd;
+        const int rows = chunk_T - (last_chunk ? 1 : 0);
+        for (int t = 0; t < rows; t += kVerify) {
+            const int G = std::min(kVerify, rows - t);
+            if (std::getenv("STRATA_Q36_DUMP_DEBUG") != nullptr)
+                std::fprintf(stderr, "dump: group t=%d G=%d rows=%d hmain=%p lg=%p pk=%p\n", t, G, rows,
+                             (const void*) hmain, (void*) dump_logits_dev, (void*) dump_pick_dev);
+            head_rows(hmain + (size_t) t * N, G, dump_logits_dev, dump_pick_dev);
+            if (std::getenv("STRATA_Q36_DUMP_DEBUG") != nullptr) std::fprintf(stderr, "dump: head done\n");
+            CK(cudaMemcpyAsync(dump_lg.data(), dump_logits_dev, (size_t) G * (size_t) m->g.n_vocab * 4,
+                               cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            if (std::getenv("STRATA_Q36_DUMP_DEBUG") != nullptr) std::fprintf(stderr, "dump: copy done\n");
+            for (int g = 0; g < G; ++g)
+                logit_dump_record(toks[t + g + 1], dump_lg.data() + (size_t) g * (size_t) m->g.n_vocab);
+            if (std::getenv("STRATA_Q36_DUMP_DEBUG") != nullptr) std::fprintf(stderr, "dump: records done\n");
+        }
+    }
+    /// One record: the gold token, its probability, the exact byte-string probability, and the byte
+    /// distributions along its bytes (End-Of-Token when the table has the slot, Marginalize-It otherwise).
+    void logit_dump_record(int32_t next_tok, const float* lg) {
+        const int nv = (int) m->g.n_vocab;
+        float mx = lg[0];
+        for (int v = 1; v < nv; ++v) mx = std::max(mx, lg[v]);
+        double sum = 0;
+        for (int v = 0; v < nv; ++v) {
+            const float p = std::exp(lg[v] - mx);
+            dump_probs[(size_t) v] = p;
+            sum += p;
+        }
+        const float inv = (float) (1.0 / sum);
+        for (int v = 0; v < nv; ++v) dump_probs[(size_t) v] *= inv;
+
+        const int rows = bt_rows[next_tok];
+        const int blen = bt_blen[next_tok];
+        const int16_t* gold = bt.data() + (size_t) next_tok * bt_w;
+        double p_exact = 0;
+        for (int v = 0; v < bt_vocab; ++v) {
+            if (bt_blen[v] != blen) continue;
+            bool same = true;
+            for (int k = 0; k < blen && same; ++k) same = bt[(size_t) v * bt_w + k] == gold[k];
+            if (same) p_exact += dump_probs[(size_t) v];
+        }
+        const float p_token = dump_probs[(size_t) next_tok];
+
+        dump_alive.clear();
+        for (int v = 0; v < bt_vocab; ++v)
+            if (bt_rows[v] > 0) dump_alive.push_back(v);
+        std::vector<__half> dist((size_t) rows * (size_t) bt_nsym);
+        for (int k = 0; k < rows; ++k) {
+            std::fill(dump_acc.begin(), dump_acc.end(), 0.f);
+            for (int32_t v : dump_alive)
+                if (bt_rows[v] > k) dump_acc[(size_t) bt[(size_t) v * bt_w + k]] += dump_probs[(size_t) v];
+            float tot = 0;
+            for (int b = 0; b < bt_nsym; ++b) tot += dump_acc[(size_t) b];
+            const float scale = tot > 0 ? 1.f / tot : 0.f;
+            for (int b = 0; b < bt_nsym; ++b)
+                dist[(size_t) k * (size_t) bt_nsym + (size_t) b] = __float2half(dump_acc[(size_t) b] * scale);
+            size_t w = 0;
+            for (size_t i = 0; i < dump_alive.size(); ++i) {
+                const int32_t v = dump_alive[i];
+                if (bt_rows[v] > k + 1 && bt[(size_t) v * bt_w + k] == gold[k]) dump_alive[w++] = v;
+            }
+            dump_alive.resize(w);
+        }
+        struct Rec {
+            int32_t tok;
+            float p_tok;
+            float p_exact;
+            int32_t rows;
+        } rec = {next_tok, p_token, (float) p_exact, rows};
+        std::fwrite(&rec, sizeof rec, 1, logit_dump);
+        std::fwrite(dist.data(), sizeof(__half), dist.size(), logit_dump);
+        if (++dump_rows % 256 == 0) std::fflush(logit_dump);
     }
     void mtp_probe_dump(int32_t tok, const float* h) {   // the T = 1 step: the pick is already in `pick`
         mtp_probe_dump(tok, greedy(), h, pos);
@@ -2923,6 +3111,68 @@ int serve(Engine& E) {
             lines.pop_front();
         }
         if (line.empty()) continue;
+        if (line.rfind("EMB ", 0) == 0) {   // the last token's final hidden state, for readout heads (opt-in: no
+            // GEN/EMB line shares a path, so the default path is untouched).  Runs the prompt and writes N float32
+            // (post output_norm) to <file>; `norm=l2` writes the L2-normalized copy instead.  With a decision head
+            // loaded (STRATA_Q36_JEV_HEAD) the answer also carries p_correct, computed from the raw vector.
+            char* p = const_cast<char*>(line.c_str()) + 4;
+            std::string path;
+            bool l2 = false;
+            for (;;) {
+                while (*p == ' ') ++p;
+                const char* st0 = p;
+                while (*p && *p != ' ') ++p;
+                const std::string tk(st0, (size_t) (p - st0));
+                const size_t eq = tk.find('=');
+                if (tk.empty() || eq == std::string::npos) { p = const_cast<char*>(st0); break; }
+                const std::string key = tk.substr(0, eq);
+                const char* v = tk.c_str() + eq + 1;
+                if (key == "path") path = v;
+                else if (key == "norm" && std::string(v) == "l2") l2 = true;
+            }
+            const std::vector<int32_t> ids = parse_ids(p);
+            if (path.empty() || ids.empty()) {
+                std::printf("ERR expected: EMB path=<file> [norm=l2] <id,id,...>\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if ((int64_t) ids.size() > E.ctx) {
+                std::printf("ERR prompt (%zu tokens) exceeds the context (%d)\n", ids.size(), E.ctx);
+                std::fflush(stdout);
+                continue;
+            }
+            bool bad = false;
+            for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) E.m->g.n_vocab;
+            if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); continue; }
+            E.reset();
+            live.clear();
+            E.process(ids.data(), (int64_t) ids.size(), [](int64_t) {});
+            live.insert(live.end(), ids.begin(), ids.end());   // the state holds the prompt, as a GEN would leave it
+            const int N = (int) E.m->g.n_embd;
+            std::vector<float> hv((size_t) N);
+            CK(cudaMemcpyAsync(hv.data(), E.hlast, (size_t) N * 4, cudaMemcpyDeviceToHost, E.st));
+            CK(cudaStreamSynchronize(E.st));
+            double p_correct = 0.0;
+            const bool verdict = E.jh_readout(hv.data(), N, p_correct);   // the raw vector, before norm=l2
+            if (l2) {
+                double s = 0;
+                for (float v : hv) s += (double) v * v;
+                const float inv = s > 0 ? (float) (1.0 / std::sqrt(s)) : 0.f;
+                for (float& v : hv) v *= inv;
+            }
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (!f) {
+                std::printf("ERR cannot write %s\n", path.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            std::fwrite(hv.data(), 4, (size_t) N, f);
+            std::fclose(f);
+            if (verdict) std::printf("EMB %d %s %.6f\n", N, path.c_str(), p_correct);
+            else std::printf("EMB %d %s\n", N, path.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         if (line.rfind("GEN ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
             std::fflush(stdout);
