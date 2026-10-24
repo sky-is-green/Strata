@@ -72,7 +72,44 @@ their milliseconds per token). **Do not guess the fix before the count exists.**
   copy), measure the call count and `tier` time. A correct change here must leave the expert counts
   (`47204 hit / 556 pcie / 556 file` for 200 tokens) and the tokens identical.
 
-### 3.3 Prefill (optional, but it is the practical long-context limit)
+### 3.3 The k=1 drafter (new; the Scion 35B pattern)
+
+The Scion 35B release proves a **k=1 target-hidden sidecar** is the speculative
+shape that pays: a 50 MB / 25.2M-parameter MLP (`fc1`/GELU/`fc2`) consumes the
+target's post-norm final hidden plus the raw embedding of the next token,
+reuses the target's own `output_norm`/`output`/`token_embd`, and proposes one
+token.  On one 7900 XT it measured 1.17-1.37x with 0.46-0.74 acceptance; a
+DSpark-shaped **multi-token** head built for the same release did *not* beat
+it.  Card: <https://huggingface.co/SkyIsNotGreen/Scion-35B-A3B-mtp-drafter>.
+
+The V4.1 DSpark is exactly that losing shape: a multi-token mtp.0-2 stack,
+5.66 GB at Q2_K, default depth 4, measured 19.07 tok/s against 25.4 baseline.
+Do not conclude that speculative decoding cannot work here; conclude that the
+**multi-token attention/MoE DSpark** cannot.  The V4.1 equivalent to test is a
+k=1 MLP sidecar, not another DSpark pass.
+
+Order of experiments:
+
+1. **Cheap shape check first.** Run the existing DSpark with
+   `STRATA_DSPARK_DEPTH=1` (one draft, one verify) on the single-card path.
+   It is still the heavy 5.66 GB stack, so a loss does not kill the idea; a win
+   would be a useful surprise.  Do not run depth 4 again.
+2. **Build the sidecar.** Export the target's post-norm final hidden and the
+   next token's embedding for a self-distillation corpus (the Scion export used
+   ~3k windows; fineweb/wikitext), train a ~25M MLP with the body frozen, and
+   add a sidecar loader/draft path to `ds41_generate`.  Reuse the target's
+   output head; no second vocabulary projection.
+3. **Verify like a draft.** Every sidecar token goes through the existing
+   `pass_v` verification; near-tie flips are possible, so the quality gate is
+   PPL + a token-identity check on a fixed prompt, and the speed is measured
+   with acceptance, not just tok/s.
+
+Memory: the sidecar is ~50 MB and runs on the **same backend/context** as the
+target; it does not need the second card, and transferring hidden state across
+PCIe each token would be a loss.  V4.1 runs alone; the second card is idle (or
+holds expert cache), never another big model.
+
+### 3.4 Prefill (optional, but it is the practical long-context limit)
 
 75 tokens prefill at ~18 tok/s; a 5,389-token prompt at ~20.7 tok/s, so long prompts cost minutes before decode
 starts. Ideas: sweep `--prompt-batch` (512 / 1024 / 2048), check whether the prompt path uses the MMQ/fused class
