@@ -502,6 +502,13 @@ hand-off). Two defects were found and one fixed:
   CPU and round differently. The author's equivalent test used a fixed cache. A gate that removes the confound is
   needed before the split can be trusted.
 
+Re-run 2026-10-24, after the streaming and routing changes: the two-stage load was stopped by `local/mem-guard.sh` at
+**17.6 GiB of GTT** before the first token. A single-card run never approaches the guard's 4 GiB ceiling; two 4 GiB
+pinned arenas alone are 8 GiB, and the per-stage read staging makes up the rest. So the split cannot be measured on
+this box at all now, and its earlier 420 ms/token is moot until the memory fits. **Verdict: keep it parked.** It is
+a feature for the author's 128 GiB rig; on 31.7 GiB the second card buys an expert tier this box cannot feed.
+Revisit with more RAM, not with a faster kernel.
+
 Neither defect is the box's memory. The earlier global OOMs were blamed on the engine's cgroup, which was wrong:
 its peak was 6.9 GB of a 12 GB cap, and at the OOM the kernel's own dump accounted for only ~17.6 GB of 29.6 GB.
 The missing ~12 GB is consistent with amdgpu's GTT, whose budget here is 29.4 GB of system RAM and whose pages are
