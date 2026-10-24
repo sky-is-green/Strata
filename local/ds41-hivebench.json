@@ -33,7 +33,7 @@
   "GGML_CUDA_DISABLE_GRAPHS": "1",
   "STRATA_PRESTAGE_GIB": "1.5",
   "STRATA_SERVE_PASS_BIAS": "0",
-  "DS41_EXE": "build-hip/ds41_generate",
+  "DS41_EXE": "build-hip-pre/ds41_generate",
   "STRATA_SERVE_DSPARK": "models/V41-GSQ/V41-MTP-Vision.Q2_K.gguf",
   "STRATA_DSPARK_DEPTH": "4",
   "STRATA_DSPARK_KEEP": "tools/v41/serve/dspark_expert_counts.txt:64",

@@ -502,12 +502,22 @@ hand-off). Two defects were found and one fixed:
   CPU and round differently. The author's equivalent test used a fixed cache. A gate that removes the confound is
   needed before the split can be trusted.
 
-Re-run 2026-10-24, after the streaming and routing changes: the two-stage load was stopped by `local/mem-guard.sh` at
-**17.6 GiB of GTT** before the first token. A single-card run never approaches the guard's 4 GiB ceiling; two 4 GiB
-pinned arenas alone are 8 GiB, and the per-stage read staging makes up the rest. So the split cannot be measured on
-this box at all now, and its earlier 420 ms/token is moot until the memory fits. **Verdict: keep it parked.** It is
-a feature for the author's 128 GiB rig; on 31.7 GiB the second card buys an expert tier this box cannot feed.
-Revisit with more RAM, not with a faster kernel.
+Re-run 2026-10-24, after the streaming and routing changes.  With the cache sized from free VRAM (`--arena-gib 1`,
+no `--slots`) the two-stage load was stopped by the guard at **16.7 GiB of GTT** before the second stage started;
+stage 1 alone had reserved 1.82 GB of dense weights and **16.02 GiB of expert slots**.  The overflow was the cache
+sizing, not the box: the same run with **`--slots 400`** loaded both stages cleanly - card0 6.0 GiB, card1 8.0 GiB
+of VRAM, GTT under 0.1 GiB, 19.9 GiB of RAM free.  So the byte budget over-allocates for this 9-format mixed-size
+model, and the excess lands in system memory.
+
+That does not make the split useful yet. 400 slots a stage is 3.2 GB of cache against one card's 13.7 GB, and
+prefill fell to 4.5 tok/s.  Beating one card needs roughly 1,200-1,600 slots a stage - the range the byte budget
+blew up in - and decode then aborted with `[ds41_dense] missing weight blk.20.ffn_norm.weight`, a stage-2
+weight-range bug the prefill path does not hit.
+
+Verdict: still parked, but for three specific reasons now (the mixed-size cache sizing, the boundary weight, the
+8.8 ms/layer stall), not because the box cannot fit it.  Even with all three fixed the ceiling is small: layers run
+sequentially, so card 2 is idle while card 1 computes, and the only gain is fewer file-tier misses - about 1.5 ms
+of a 41.6 ms token.
 
 Neither defect is the box's memory. The earlier global OOMs were blamed on the engine's cgroup, which was wrong:
 its peak was 6.9 GB of a 12 GB cap, and at the OOM the kernel's own dump accounted for only ~17.6 GB of 29.6 GB.
