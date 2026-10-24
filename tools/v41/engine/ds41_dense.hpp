@@ -195,6 +195,15 @@ public:
     /// A loaded weight on the backend (nullptr if absent) - for sharing the trunk head with the DSpark draft stack.
     ggml_tensor * weight(const std::string & name) const;
 
+    struct ProfCounters {
+        long submits = 0, syncs = 0, hostcopy_calls = 0;
+        double submit_ms = 0, sync_ms = 0, hostcopy_ms = 0;
+        double attn_submit_ms = 0, finish_submit_ms = 0, other_submit_ms = 0;
+        long attn_submits = 0, finish_submits = 0, other_submits = 0;
+    };
+    static void prof_reset();
+    static ProfCounters prof_counters();
+
 private:
     std::unique_ptr<Impl> p_;
 };

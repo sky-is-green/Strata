@@ -526,3 +526,27 @@ charged to the driver rather than the process, so no cgroup cap can see them. `l
 `mem_info_gtt_used` and `MemAvailable` every 0.3 s and kills only the engine; it fired at 1.8 GB available and
 saved the box where the 2 s watchdog lost the race.
 
+
+---
+
+## Single-card lane pass — 2026-10-24
+
+### Baseline reproduced
+25.42 tok/s mean (25.96 / 25.28 / 25.01), q4_K PPL 2.9084 / top-1 0.753. Phase: attn_router 25.0, tier 11.3, finish 1.4, begin 0.5 ms.
+
+### Instrumentation added
+`STRATA_DEC_PROF=2` now counts graph submits / synchronizes / host copies (and their ms) in both the dense half and reports them every 64 steps. Dense per token: **82 submits (40 attn + 40 finish + 2 other), 40 syncs, 137 host copies**; submit 27 ms (attn 25, finish 1.4), sync 0.5–2.5, hostcopy 2.0 ms.
+
+### Experiments run
+| change | result | decision |
+|---|---|---|
+| Merge per-layer `finish()` into next `attn()` graph | submits 82→43, tokens identical, but attn_router unchanged (~25 ms) and decode slightly slower (23–24) | **reverted** — per-graph overhead is not the cost; per-kernel dispatch is |
+| Disable CUDA graphs (one-shot, 3 runs) | 23.1–23.6 vs 24.1–24.5 tok/s | **reverted / stays parked** — loss on this path |
+| `--kv-q8` | PPL 2.9049 vs 2.9084 (top-1 identical), decode 25.15/25.73/24.61 vs 25.05/26.07/23.14 (noise) | **not adopted** — no measurable decode win |
+| DS41Engine sync-bound analysis (external) | 215 syncs/token, 105 ms, 76% of wall; tier holds ~175 of them | **next engineering task** — extend the counter to the tier, then reduce per-layer syncs |
+
+### System-level
+`local/power-tune.sh` added (CPU governor + NVMe APST + C-states), +11–21% expected. Requires root; not auto-applied.
+
+### Conclusion
+No merged change reaches ≥26 tok/s on this pass. The dense graph merge and graph-disable are dead ends on this path; the remaining ~8 ms is per-kernel HIP dispatch inside the 40 attention graphs, and the sync-bound tier (per DS41Engine) is the unmeasured cost. Next lever: tier-side instrumentation + sync reduction, then kernel fusion (custom ops) if warranted.

@@ -636,7 +636,8 @@ int main(int argc, char ** argv) {
     std::vector<float> crouted_m((size_t) std::max(pass_max, 17) * n_embd);   // 17: pass_v's DSpark seeding / verify passes
     std::string ferr;
     // STRATA_DEC_PROF=1: per-stage wall time of the decode step (begin / predict+prefetch / attn_router / tier / finish)
-    static const bool dprof = std::getenv("STRATA_DEC_PROF") != nullptr;
+    static const int dprof_level = std::getenv("STRATA_DEC_PROF") ? std::atoi(std::getenv("STRATA_DEC_PROF")) : 0;
+    static const bool dprof = dprof_level >= 1;
     // decode: finish(l) and predict(l+1) as one graph (identical results; STRATA_NO_FUSE_PREDICT=1 = separate graphs)
     static const bool fuse_predict = std::getenv("STRATA_NO_FUSE_PREDICT") == nullptr;
     // STRATA_ADVISE_AHEAD=k (0 = off): at layer l, predict layer l+k's routing from the current state and hint its
@@ -790,9 +791,20 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        if (dprof && ++dp_n % 64 == 0)
+        if (dprof && ++dp_n % 64 == 0) {
             std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f spec %.2f (%ld steps)\n",
                          dp[0] / dp_n, dp[1] / dp_n, dp[2] / dp_n, dp[3] / dp_n, dp[4] / dp_n, dp[5] / dp_n, dp_n);
+            if (dprof_level >= 2) {
+                auto pc = Ds41Dense::prof_counters();
+                std::fprintf(stderr, "  prof2: submits %ld (%.2f ms: attn %ld/%.2f finish %ld/%.2f other %ld/%.2f) syncs %ld (%.2f ms) hostcopy %ld (%.2f ms) per token (cumulative avg)\n",
+                             pc.submits / dp_n, pc.submit_ms / dp_n,
+                             pc.attn_submits / dp_n, pc.attn_submit_ms / dp_n,
+                             pc.finish_submits / dp_n, pc.finish_submit_ms / dp_n,
+                             pc.other_submits / dp_n, pc.other_submit_ms / dp_n,
+                             pc.syncs / dp_n, pc.sync_ms / dp_n,
+                             pc.hostcopy_calls / dp_n, pc.hostcopy_ms / dp_n);
+            }
+        }
         have_prev = true;   // the next token can be hinted with this one's routing
         return true;
     };
@@ -1937,6 +1949,7 @@ int main(int argc, char ** argv) {
         }
     }
 #endif
+    if (dprof_level >= 2) Ds41Dense::prof_reset();
     for (; !spec && gen < a.n_predict; ++gen) {
         int tok = sample_p(lg.data(), nv, a.temp, 0, 1.0f, 0.0f, rng);
         if (gen < (int) forced.size()) {

@@ -27,6 +27,68 @@
 using namespace strata;
 using namespace strata::v41;
 
+// ---- opt-in profiling (STRATA_DEC_PROF=2) ---------------------------------------------------------------
+static int ds41_prof_level() {
+    static int v = []() { const char * e = std::getenv("STRATA_DEC_PROF"); return e ? std::atoi(e) : 0; }();
+    return v;
+}
+static bool ds41_prof2() { return ds41_prof_level() >= 2; }
+static double ds41_now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+static long   g_prof_submits = 0, g_prof_syncs = 0, g_prof_hostcopy = 0;
+static double g_prof_submit_ms = 0, g_prof_sync_ms = 0, g_prof_hostcopy_ms = 0;
+static long   g_prof_attn_submits = 0, g_prof_finish_submits = 0, g_prof_other_submits = 0;
+static double g_prof_attn_submit_ms = 0, g_prof_finish_submit_ms = 0, g_prof_other_submit_ms = 0;
+static int    g_prof_kind = 0;   // 1=attn, 2=finish, 0=other
+
+static ggml_status ds41_graph_compute(ggml_backend_t b, ggml_cgraph * g) {
+    double t = ds41_prof2() ? ds41_now_ms() : 0;
+    ggml_status s = ggml_backend_graph_compute(b, g);
+    if (ds41_prof2()) {
+        const double dt = ds41_now_ms() - t;
+        ++g_prof_submits; g_prof_submit_ms += dt;
+        if (g_prof_kind == 1) { ++g_prof_attn_submits; g_prof_attn_submit_ms += dt; }
+        else if (g_prof_kind == 2) { ++g_prof_finish_submits; g_prof_finish_submit_ms += dt; }
+        else { ++g_prof_other_submits; g_prof_other_submit_ms += dt; }
+    }
+    return s;
+}
+static void ds41_sync(ggml_backend_t b) {
+    double t = ds41_prof2() ? ds41_now_ms() : 0;
+    ggml_backend_synchronize(b);
+    if (ds41_prof2()) { ++g_prof_syncs; g_prof_sync_ms += ds41_now_ms() - t; }
+}
+static void ds41_tensor_set(ggml_tensor * t, const void * data, size_t off, size_t sz) {
+    double tt = ds41_prof2() ? ds41_now_ms() : 0;
+    ggml_backend_tensor_set(t, data, off, sz);
+    if (ds41_prof2()) { ++g_prof_hostcopy; g_prof_hostcopy_ms += ds41_now_ms() - tt; }
+}
+static void ds41_tensor_get(const ggml_tensor * t, void * data, size_t off, size_t sz) {
+    double tt = ds41_prof2() ? ds41_now_ms() : 0;
+    ggml_backend_tensor_get(t, data, off, sz);
+    if (ds41_prof2()) { ++g_prof_hostcopy; g_prof_hostcopy_ms += ds41_now_ms() - tt; }
+}
+static void ds41_tensor_get_async(ggml_backend_t b, const ggml_tensor * t, void * data, size_t off, size_t sz) {
+    double tt = ds41_prof2() ? ds41_now_ms() : 0;
+    ggml_backend_tensor_get_async(b, t, data, off, sz);
+    if (ds41_prof2()) { ++g_prof_hostcopy; g_prof_hostcopy_ms += ds41_now_ms() - tt; }
+}
+
+void Ds41Dense::prof_reset() {
+    g_prof_submits = g_prof_syncs = g_prof_hostcopy = 0;
+    g_prof_submit_ms = g_prof_sync_ms = g_prof_hostcopy_ms = 0;
+    g_prof_attn_submits = g_prof_finish_submits = g_prof_other_submits = 0;
+    g_prof_attn_submit_ms = g_prof_finish_submit_ms = g_prof_other_submit_ms = 0;
+}
+Ds41Dense::ProfCounters Ds41Dense::prof_counters() {
+    ProfCounters c;
+    c.submits = g_prof_submits; c.syncs = g_prof_syncs; c.hostcopy_calls = g_prof_hostcopy;
+    c.submit_ms = g_prof_submit_ms; c.sync_ms = g_prof_sync_ms; c.hostcopy_ms = g_prof_hostcopy_ms;
+    c.attn_submit_ms = g_prof_attn_submit_ms; c.finish_submit_ms = g_prof_finish_submit_ms; c.other_submit_ms = g_prof_other_submit_ms;
+    c.attn_submits = g_prof_attn_submits; c.finish_submits = g_prof_finish_submits; c.other_submits = g_prof_other_submits;
+    return c;
+}
+
 namespace {
 
 constexpr float NEG_INF = -INFINITY;
@@ -347,7 +409,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     }
                 });
             for (auto & x : th) x.join();
-            ggml_backend_tensor_set(t, dst.data(), 0, dst.size());
+            ds41_tensor_set(t, dst.data(), 0, dst.size());
             return dst.size();
         };
         for (size_t s = 0; s < model.size(); ++s)
@@ -360,7 +422,7 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
                     ++pq_n;
                 }
                 if ((int) t->type == (int) ti.type) {
-                    ggml_backend_tensor_set(t, src, 0, ggml_nbytes(t));
+                    ds41_tensor_set(t, src, 0, ggml_nbytes(t));
                     continue;
                 }
                 rq_to += convert_upload(t, ti, src);
@@ -456,7 +518,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
         ok_alloc = a.alloc(gf, false);
     }
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
+    if (ds41_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
     return true;
 }
 
@@ -933,8 +995,8 @@ bool Ds41Dense::write_state(const std::vector<float> & x, const std::vector<floa
         im.err = "write_state: the hand-off sizes do not match the pass";
         return false;
     }
-    ggml_backend_tensor_set(im.x_state, x.data(), 0, nx * 4);
-    ggml_backend_tensor_set(im.pre_state, pre.data(), 0, np * 4);
+    ds41_tensor_set(im.x_state, x.data(), 0, nx * 4);
+    ds41_tensor_set(im.pre_state, pre.data(), 0, np * 4);
     return true;
 }
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
@@ -997,7 +1059,7 @@ bool Ds41Dense::set_columns(int nc) {
     Impl & im = *p_;
     const int64_t want = std::max<int64_t>(im.S, std::min<int64_t>(nc, im.NCmax));
     if (want == im.NC) return true;
-    ggml_backend_synchronize(im.backend);
+    ds41_sync(im.backend);
     // every cached graph holds views of the old columns (their addresses are fixed at the first allocation), and the
     // allocators remember graphs by address - all of it goes, and is rebuilt lazily for the new tensors
     im.graphs.clear();
@@ -1142,7 +1204,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     ggml_backend_buffer_clear(im.sbuf, 0);
     // the ratio-2 state scores start at -1e30 (an unwritten state gets softmax weight 0); sel = 0 (a valid row)
     for (auto & L : im.ly)
-        if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
+        if (L.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ds41_tensor_set(L.st_sc, v.data(), 0, v.size() * 4); }
     // inputs
     ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
     im.ictx = ggml_init(ipp);
@@ -1155,10 +1217,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     {
         std::vector<float> v((size_t) im.neg_ramp->ne[0]);
         for (size_t i = 0; i < v.size(); ++i) v[i] = -(float) i;
-        ggml_backend_tensor_set(im.neg_ramp, v.data(), 0, v.size() * 4);
+        ds41_tensor_set(im.neg_ramp, v.data(), 0, v.size() * 4);
         v.assign((size_t) im.blk_ramp->ne[0], 0);
         for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
-        ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
+        ds41_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
     }
     ggml_init_params gp = { ggml_tensor_overhead() * 200000 + ggml_graph_overhead_custom(8192, false) * 400, nullptr, true };
     im.gctx = ggml_init(gp);
@@ -1187,7 +1249,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
 void Ds41Dense::set_route_bias(int il, const float * bias) {
     Impl & im = *p_;
     if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;
-    ggml_backend_tensor_set(im.ly[(size_t) il].rbias, bias, 0, (size_t) im.NE * 4);
+    ds41_tensor_set(im.ly[(size_t) il].rbias, bias, 0, (size_t) im.NE * 4);
 }
 
 void Ds41Dense::set_oom_hook(std::function<bool()> hook) { p_->oom_hook = std::move(hook); }
@@ -1220,7 +1282,7 @@ static bool engram_ready(Ds41Dense::Impl & im) {
     if (!im.engram.wait(im.eng_batch, im.err)) { im.eng_batch.reset(); return false; }
     im.eng_batch.reset();
     for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
-        ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+        ds41_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
     return true;
 }
 
@@ -1238,11 +1300,11 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
             for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
         }
-        ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+        ds41_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
     }
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
-    ggml_backend_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);
+    ds41_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);
     // window: per query the SWA positions [p - SWA + 1, p] as rows of [ring (RAW) | pass rows]
     std::vector<int32_t> widx((size_t) (SWA * n));
     std::vector<float> wm((size_t) (SWA * n));
@@ -1259,13 +1321,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             wm[(size_t) (t * SWA + j)] = m;
         }
     }
-    ggml_backend_tensor_set(im.i_widx, widx.data(), 0, widx.size() * 4);
-    ggml_backend_tensor_set(im.i_wmask, wm.data(), 0, wm.size() * 4);
+    ds41_tensor_set(im.i_widx, widx.data(), 0, widx.size() * 4);
+    ds41_tensor_set(im.i_wmask, wm.data(), 0, wm.size() * 4);
     {
         const int64_t k = std::min<int64_t>(n, RAW);
         std::vector<int32_t> ws((size_t) k);
         for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pos0 + n - k + j) % RAW);
-        ggml_backend_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
+        ds41_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
     }
     // compressed rows per ratio
     for (int r = 1; r <= 2; ++r) {
@@ -1278,13 +1340,13 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             cs[t] = (int32_t) (done ? p / r : im.cmax[r]);   // an open group writes the spare row
             cp[t] = (int32_t) ((p / r) * r);
         }
-        ggml_backend_tensor_set(im.i_nvis[r], nv.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cslot[r], cs.data(), 0, (size_t) n * 4);
-        ggml_backend_tensor_set(im.i_cpos[r], cp.data(), 0, (size_t) n * 4);
+        ds41_tensor_set(im.i_nvis[r], nv.data(), 0, (size_t) n * 4);
+        ds41_tensor_set(im.i_cslot[r], cs.data(), 0, (size_t) n * 4);
+        ds41_tensor_set(im.i_cpos[r], cp.data(), 0, (size_t) n * 4);
         if (r == 1) {
             std::vector<float> lb(n);
             for (int t = 0; t < n; ++t) lb[t] = (float) ((nv[t] - 1) >= 0 ? (int64_t) (nv[t] - 1) / im.CBS : -1);
-            ggml_backend_tensor_set(im.i_lastblk, lb.data(), 0, (size_t) n * 4);
+            ds41_tensor_set(im.i_lastblk, lb.data(), 0, (size_t) n * 4);
         }
     }
     {   // ratio-2 state: rows of [ring (2) | pass states] for each token's group (2g, 2g+1); open groups repeat 2g
@@ -1297,8 +1359,8 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
         }
         const int64_t k = std::min<int64_t>(n, 2);
         for (int64_t j = 0; j < k; ++j) ss.push_back((int32_t) ((pos0 + n - k + j) % 2));
-        ggml_backend_tensor_set(im.i_sidx, si.data(), 0, si.size() * 4);
-        ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
+        ds41_tensor_set(im.i_sidx, si.data(), 0, si.size() * 4);
+        ds41_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
     }
     // Engram rows: hash the whole pass now and START the (dedup/sort/coalesce) reads; they are waited - and the rows
     // moved to the state tensor - by the first Engram layer's span (engram_ready), so the disk read overlaps the
@@ -1316,7 +1378,7 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
                 if (++eng_n % 64 == 0) std::fprintf(stderr, "engram decode reads: %.3f ms/call over %ld calls\n", eng_ms / eng_n, eng_n);
             }
             for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
-                ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+                ds41_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
         } else {
             im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
             if (!im.eng_batch) return false;
@@ -1400,7 +1462,7 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
                 widx[(size_t) (t * im.SWA + j)] = q < 0 ? 0 : (int32_t) (q >= pbase ? im.RAW + (q - pbase) : q % im.RAW);
             }
         }
-        ggml_backend_tensor_set(im.i_widx, widx.data(), (size_t) col0 * im.SWA * 4, widx.size() * 4);
+        ds41_tensor_set(im.i_widx, widx.data(), (size_t) col0 * im.SWA * 4, widx.size() * 4);
     }
     {
         std::vector<int32_t> si((size_t) (2 * n));
@@ -1410,19 +1472,19 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
             si[(size_t) (2 * t)] = row(g0);
             si[(size_t) (2 * t + 1)] = row(p >= g0 + 1 ? g0 + 1 : g0);
         }
-        ggml_backend_tensor_set(im.i_sidx, si.data(), (size_t) col0 * 2 * 4, si.size() * 4);
+        ds41_tensor_set(im.i_sidx, si.data(), (size_t) col0 * 2 * 4, si.size() * 4);
     }
     {
         const int64_t k = std::min<int64_t>(n, im.RAW);
         std::vector<int32_t> ws((size_t) k);
         for (int64_t j = 0; j < k; ++j) ws[(size_t) j] = (int32_t) ((pbase + n - k + j) % im.RAW);
-        ggml_backend_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
+        ds41_tensor_set(im.i_wslot, ws.data(), 0, ws.size() * 4);
     }
     {
         const int64_t k = std::min<int64_t>(n, 2);
         std::vector<int32_t> ss((size_t) k);
         for (int64_t j = 0; j < k; ++j) ss[(size_t) j] = (int32_t) ((pbase + n - k + j) % 2);
-        ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
+        ds41_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
     }
     return true;
 }
@@ -1452,17 +1514,17 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     ggml_free(gc);
     if (!ok) return false;
     // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
-    ggml_backend_synchronize(im.backend);
+    ds41_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
+    ds41_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ds41_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
+    ds41_sync(im.backend);
     return true;
 }
 
 bool Ds41Dense::upload_routed(const float * routed_host, int B) {
     Impl & im = *p_;
     if (!routed_host || B < 1 || B > im.batch) { im.err = "bad routed batch"; return false; }
-    ggml_backend_tensor_set(im.routed, routed_host, 0, (size_t) B * im.D * 4);
+    ds41_tensor_set(im.routed, routed_host, 0, (size_t) B * im.D * 4);
     return true;
 }
 
@@ -1508,14 +1570,16 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n);
     }
+    if (ds41_prof2()) g_prof_kind = 1;
     const bool ok = im.compute(gf, cached);
+    if (ds41_prof2()) g_prof_kind = 0;
     if (gc) ggml_free(gc);
     if (!ok) return false;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
-    ggml_backend_synchronize(im.backend);
+    ds41_tensor_get_async(im.backend, im.o_fn, im.host_fn.data(), 0, (size_t) (im.D * n) * 4);
+    ds41_tensor_get_async(im.backend, im.o_ids, im.host_ids.data(), 0, (size_t) (im.NU * n) * 4);
+    ds41_tensor_get_async(im.backend, im.o_wts, im.host_wts.data(), 0, (size_t) (im.NU * n) * 4);
+    ds41_sync(im.backend);
     std::memcpy(ids, im.host_ids.data(), (size_t) (im.NU * n) * 4);
     std::memcpy(wts, im.host_wts.data(), (size_t) (im.NU * n) * 4);
     *fn_host = im.host_fn.data();
@@ -1536,7 +1600,7 @@ bool Ds41Dense::predict(int il, int * top_ids, int n_top) {
     }
     if (!im.compute(it->second, true)) return false;
     int32_t buf[16];
-    ggml_backend_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
+    ds41_tensor_get(im.predict_out[il], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
@@ -1556,7 +1620,7 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     }
     o = im.predict_out_n[{ il, (int) n }];
     if (!im.compute(it->second, true)) return false;
-    ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
+    ds41_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
     return true;
 }
 
@@ -1564,7 +1628,7 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     Impl & im = *p_;
     (void) il;
     const int64_t n = im.n;
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
+    if (routed_sum) ds41_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
@@ -1579,7 +1643,9 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
+    if (ds41_prof2()) g_prof_kind = 2;
     const bool ok = im.compute(gf, cached);
+    if (ds41_prof2()) g_prof_kind = 0;
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1588,7 +1654,7 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
     Impl & im = *p_;
     (void) il;
     if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
+    if (routed_sum) ds41_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
     const Impl::GKey key { next_il, 5, 0, 1 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
@@ -1599,7 +1665,7 @@ bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, in
     }
     if (!im.compute(it->second, true)) return false;
     int32_t buf[16];
-    ggml_backend_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
+    ds41_tensor_get(im.fpredict_out[next_il], buf, 0, sizeof(buf));
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[i];
     return true;
 }
@@ -1610,7 +1676,7 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
     (void) il;
     if (ahead <= 0 || !ahead_ids) return finish_predict(il, routed_sum, next_il, top_ids, n_top);
     if (im.n != 1 || n_top < 1 || n_top > 16 || next_il < 0 || next_il >= (int) im.ly.size()) return false;
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
+    if (routed_sum) ds41_tensor_set(im.routed, routed_sum, 0, (size_t) im.D * 4);
     const Impl::GKey key { next_il, 6, ahead, 1 };
     auto it = im.graphs.find(key);
     if (it == im.graphs.end()) {
@@ -1628,7 +1694,7 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
     const int rows = (int) ao.size();
     const size_t rs = ao[0]->nb[1] / 4;
     std::vector<int32_t> buf(rs * (size_t) (rows - 1) + 16);
-    ggml_backend_tensor_get(ao[0], buf.data(), 0, buf.size() * 4);
+    ds41_tensor_get(ao[0], buf.data(), 0, buf.size() * 4);
     for (int i = 0; i < n_top; ++i) top_ids[i] = buf[(size_t) i];
     for (int a = 0; a < ahead; ++a) {
         if (a + 1 < rows) std::copy(buf.begin() + (ptrdiff_t) (rs * (size_t) (a + 1)), buf.begin() + (ptrdiff_t) (rs * (size_t) (a + 1) + 16),
@@ -1647,7 +1713,7 @@ bool Ds41Dense::logits(int row0, int nrows, float * out) {
     ggml_tensor * lg = nullptr;
     ggml_cgraph * gf = build_head(im, gc, row0, nrows, &lg);
     const bool ok = im.compute(gf, false);
-    if (ok) ggml_backend_tensor_get(lg, out, 0, (size_t) nrows * (size_t) im.g.vocab * 4);
+    if (ok) ds41_tensor_get(lg, out, 0, (size_t) nrows * (size_t) im.g.vocab * 4);
     ggml_free(gc);
     return ok;
 }
@@ -1656,8 +1722,8 @@ bool Ds41Dense::read_state(std::vector<float> & x, std::vector<float> & pre) {
     Impl & im = *p_;
     x.resize((size_t) (im.D * im.HC * im.n));
     pre.resize((size_t) (im.HC * im.n));
-    ggml_backend_tensor_get(im.x_state, x.data(), 0, x.size() * 4);
-    ggml_backend_tensor_get(im.pre_state, pre.data(), 0, pre.size() * 4);
+    ds41_tensor_get(im.x_state, x.data(), 0, x.size() * 4);
+    ds41_tensor_get(im.pre_state, pre.data(), 0, pre.size() * 4);
     return true;
 }
 
@@ -1666,7 +1732,7 @@ bool Ds41Dense::read_state_cols(int c0, int n, std::vector<float> & x) {
     if (c0 < 0 || n < 1 || c0 + n > im.NC) { im.err = "read_state_cols: bad range"; return false; }
     const size_t col = (size_t) (im.D * im.HC) * sizeof(float);   // x_state [D, HC, NC]: a column is contiguous
     x.resize((size_t) (im.D * im.HC * n));
-    ggml_backend_tensor_get(im.x_state, x.data(), (size_t) c0 * col, (size_t) n * col);
+    ds41_tensor_get(im.x_state, x.data(), (size_t) c0 * col, (size_t) n * col);
     return true;
 }
 
@@ -1676,7 +1742,7 @@ bool Ds41Dense::snapshot(int pos) {
         ggml_backend_tensor_copy(L.raw, L.raw_snap);
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv, L.st_kv_snap); ggml_backend_tensor_copy(L.st_sc, L.st_sc_snap); }
     }
-    ggml_backend_synchronize(im.backend);
+    ds41_sync(im.backend);
     im.snap_pos = pos;
     return true;
 }
@@ -1688,7 +1754,7 @@ bool Ds41Dense::restore() {
         ggml_backend_tensor_copy(L.raw_snap, L.raw);
         if (L.st_kv) { ggml_backend_tensor_copy(L.st_kv_snap, L.st_kv); ggml_backend_tensor_copy(L.st_sc_snap, L.st_sc); }
     }
-    ggml_backend_synchronize(im.backend);
+    ds41_sync(im.backend);
     return true;
 }
 
@@ -1697,11 +1763,11 @@ int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 bool Ds41Dense::park(int64_t positions) {
     Impl & im = *p_;
     if (im.snap_pos < 0 || positions < 1) return false;
-    ggml_backend_synchronize(im.backend);
+    ds41_sync(im.backend);
     im.parked.clear();
     auto put = [&](ggml_tensor * t, size_t off, size_t n) {
         Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
-        ggml_backend_tensor_get(t, r.b.data(), off, n);
+        ds41_tensor_get(t, r.b.data(), off, n);
         im.parked.push_back(std::move(r));
     };
     for (auto & L : im.ly) {
@@ -1722,9 +1788,9 @@ bool Ds41Dense::park(int64_t positions) {
 bool Ds41Dense::unpark() {
     Impl & im = *p_;
     if (im.parked_pos < 0) return false;
-    ggml_backend_synchronize(im.backend);
-    for (auto & r : im.parked) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
-    ggml_backend_synchronize(im.backend);
+    ds41_sync(im.backend);
+    for (auto & r : im.parked) ds41_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    ds41_sync(im.backend);
     im.snap_pos = im.parked_pos;
     drop_park();
     return true;
@@ -1750,8 +1816,8 @@ bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & ma
     const int64_t k = std::min<int64_t>(cap, im.ITOP);
     std::vector<int32_t> s((size_t) (im.ITOP * im.n));
     std::vector<float> m((size_t) (im.ITOP * im.n));
-    ggml_backend_tensor_get(L.sel, s.data(), 0, s.size() * 4);
-    ggml_backend_tensor_get(L.selm, m.data(), 0, m.size() * 4);
+    ds41_tensor_get(L.sel, s.data(), 0, s.size() * 4);
+    ds41_tensor_get(L.selm, m.data(), 0, m.size() * 4);
     for (int t = 0; t < im.n; ++t)
         for (int64_t j = 0; j < k; ++j) {
             sel.push_back(s[(size_t) (t * im.ITOP + j)]);
