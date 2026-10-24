@@ -38,7 +38,8 @@
   "STRATA_DSPARK_DEPTH": "4",
   "STRATA_DSPARK_KEEP": "tools/v41/serve/dspark_expert_counts.txt:64",
   "STRATA_TEXT_LOG": "local/v41-text.log",
-  "STRATA_DENSE_REQUANT": "q4_K"
+  "STRATA_DENSE_REQUANT": "q4_K",
+  "STRATA_ADVISE_PREV": "1"
  },
  "cwd": ".",
  "tokenizer": "models/V41-GSQ/tokenizer",

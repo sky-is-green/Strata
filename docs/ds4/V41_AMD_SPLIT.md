@@ -370,6 +370,28 @@ What that leaves, in order of value per risk:
   and leave the computation untouched (the hint only warms the page cache, so tokens stay identical).  Untested.
 * The ~8 ms in the dense loop is host submit time.  A profiler cannot see it; it needs counting the submits.
 
+### The ahead-predictor was removable (measured 2026-10-24)
+
+The 5.0 ms `predict` phase above was `STRATA_ADVISE_AHEAD=6`: one synchronised prediction graph per layer, whose
+only effect is a call to `advise_file` (a page-cache hint).  Routing barely changes between adjacent tokens, so
+`STRATA_ADVISE_PREV=1` hints layer l with the experts it actually routed on the previous token and drops the
+prediction graph entirely.  A hint cannot change the arithmetic - `advise_file` never moves an expert - but it is
+opt-in and the engine default stays off.
+
+200-token runs, same prompt, alternating arms, three each (fused build, q4_K dense, advise-ahead 6, direct 0):
+
+| arm | tok/s | predict ms | attn_router ms | tier ms |
+|---|---:|---:|---:|---:|
+| ahead-predictor | 22.27 / 22.65 / 22.86 (mean **22.59**) | 3.76-4.07 | 26.3-26.8 | 10.8-11.4 |
+| **previous token** | **23.80 / 25.36 / 24.82 (mean 24.66)** | **0.18** | 25.1-26.0 | 11.1-12.3 |
+
+**+9.2%**, and every variant run beat every baseline run.  Quality: PPL **5.6463 either way** on the 5,389-token
+corpus at `--prompt-batch 1` (the per-token path that actually runs the changed code), and the 75-row logit dump is
+byte-identical.  That 5.6463 is not comparable to the 2.9084 baseline above: different prefill batch sizes produce
+different bits, which is why the gate compares arms, not absolutes.  Enabled in `local/bench-v41.sh` and
+`local/ds41-hivebench.json`.
+
+
 
 ### The prefetch was a loss on this box (biggest single finding)
 

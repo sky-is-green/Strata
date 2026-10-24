@@ -623,6 +623,14 @@ int main(int argc, char ** argv) {
     // ---- the forward pieces
     std::vector<int> ids1((size_t) top_k);
     std::vector<float> w1((size_t) top_k), routed1((size_t) n_embd), logits1((size_t) nv);
+    // STRATA_ADVISE_PREV=1: hint layer l's file tier with the experts layer l actually routed on the PREVIOUS
+    // token, instead of running the ahead-predictor graph for it.  advice only warms the page cache (advise_file
+    // never moves an expert), so the generated tokens are identical; what goes away is one synchronised predict
+    // graph per layer - 5 ms/token on this box.  The first token has no previous routing and falls back to the
+    // predictor when STRATA_ADVISE_AHEAD is set.  Off by default: the predict path is unchanged.
+    const bool advise_prev = std::getenv("STRATA_ADVISE_PREV") != nullptr;
+    std::vector<int> prev_ids(advise_prev ? (size_t) n_layer * (size_t) top_k : 0, -1);
+    bool have_prev = false;
     // --serve's short-turn passes (STRATA_SERVE_PASS_M tokens per dense pass; 1 = single decode steps)
     const int pass_max = std::max(1, std::getenv("STRATA_SERVE_PASS_M") ? std::atoi(std::getenv("STRATA_SERVE_PASS_M")) : 16);
     std::vector<float> crouted_m((size_t) std::max(pass_max, 17) * n_embd);   // 17: pass_v's DSpark seeding / verify passes
@@ -700,7 +708,9 @@ int main(int argc, char ** argv) {
                                 for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
                 }
             }
-            if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
+            if (advise_prev && have_prev) {   // this layer's experts on the previous token: a free hint
+                T.advise_file(l, prev_ids.data() + (size_t) l * top_k, std::min(advise_top, top_k));
+            } else if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
                 int ta[16];
                 if (D.predict(l + advise_ahead, ta, 16)) T.advise_file(l + advise_ahead, ta, advise_top);
             }
@@ -718,6 +728,8 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!D.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = D.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
+            if (advise_prev)
+                for (int j = 0; j < top_k; ++j) prev_ids[(size_t) l * top_k + j] = ids1[(size_t) j];
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
@@ -781,6 +793,7 @@ int main(int argc, char ** argv) {
         if (dprof && ++dp_n % 64 == 0)
             std::fprintf(stderr, "decode step ms/token: begin %.2f predict %.2f attn_router %.2f tier %.2f finish %.2f spec %.2f (%ld steps)\n",
                          dp[0] / dp_n, dp[1] / dp_n, dp[2] / dp_n, dp[3] / dp_n, dp[4] / dp_n, dp[5] / dp_n, dp_n);
+        have_prev = true;   // the next token can be hinted with this one's routing
         return true;
     };
     // a few tokens in ONE dense pass (the dense weights - ~8 GB - read once for m tokens, not per token), the routed

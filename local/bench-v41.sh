@@ -25,7 +25,8 @@ echo "== $LABEL: $(date +%H:%M:%S)" | tee "$OUT"
 # needs buffered decode reads, and prefetch (pf-b) is off because there is no arena to stage into
 STRATA_DEC_PROF=1 STRATA_NO_LARGEPAGES=1 \
 STRATA_DENSE_REQUANT="${STRATA_DENSE_REQUANT:-q4_K}" \
-STRATA_ADVISE_AHEAD="${STRATA_ADVISE_AHEAD:-6}" STRATA_DECODE_DIRECT="${STRATA_DECODE_DIRECT:-0}" \
+STRATA_ADVISE_AHEAD="${STRATA_ADVISE_AHEAD:-6}" STRATA_ADVISE_PREV="${STRATA_ADVISE_PREV:-1}" \
+STRATA_DECODE_DIRECT="${STRATA_DECODE_DIRECT:-0}" \
     systemd-run --user --scope --quiet \
         -p MemoryMax=12G -p MemoryHigh=9G -p MemorySwapMax=0 \
         ./build-hip-pre/ds41_generate \
