@@ -550,3 +550,11 @@ saved the box where the 2 s watchdog lost the race.
 
 ### Conclusion
 No merged change reaches ≥26 tok/s on this pass. The dense graph merge and graph-disable are dead ends on this path; the remaining ~8 ms is per-kernel HIP dispatch inside the 40 attention graphs, and the sync-bound tier (per DS41Engine) is the unmeasured cost. Next lever: tier-side instrumentation + sync reduction, then kernel fusion (custom ops) if warranted.
+
+### Lane closed — 2026-10-24
+
+No merged change reached ≥26 tok/s on the single-card decode path. Final best: **25.42 tok/s mean** (baseline 24.66 → +3.1%, inside the ~4% run-to-run noise band for a "merged" claim).
+
+Exhausted levers (all reverted or not adopted): graph-merge of finish into attn, graph-disable, --kv-q8, DSpark (slower on this path), tier ternary alternatives. Remaining gap (~0.6 tok/s) is per-kernel HIP dispatch inside the 40 attention graphs; closing it needs new fused kernels, out of scope for this lane.
+
+Durable deliverables: `STRATA_DEC_PROF=2` counter (dense), `local/power-tune.sh`, the runtime-trace methodology, and this report. Serve path already reaches 26–30 tok/s with DSpark on contexts where it helps.
