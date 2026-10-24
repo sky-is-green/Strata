@@ -97,6 +97,13 @@ struct Args {
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
+    // The two-card split: the layers [0, layer_split) on the first card, [layer_split, n) on the second one, and the
+    // hand-off between them (the residual and the pre-mix the boundary's finish() leaves behind).  Each card holds
+    // only its own layers' weights and its own layers' experts, so the two together hold about twice the experts one
+    // card holds.  The boundary must not split a source layer from the layers that read it (the engine says so).
+    // Off by default: one card, every layer, the path unchanged.
+    int64_t layer_split = -1;   // --layer-split K: the first layer of the second card
+    int  split_device = -1;     // --split-device D: the second card's device index
 };
 
 std::vector<int> parse_csv(const std::string & s) {
@@ -116,6 +123,8 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--ids-file") a.ids_file = next();
         else if (k == "-n" || k == "--n-predict") a.n_predict = std::atoi(next().c_str());
         else if (k == "--backend") a.backend = next();
+        else if (k == "--layer-split") a.layer_split = std::atoll(next().c_str());
+        else if (k == "--split-device") a.split_device = std::atoi(next().c_str());
         else if (k == "--experts") a.experts = next();
         else if (k == "--engram") { std::stringstream ss(next()); std::string d; while (std::getline(ss, d, ':')) a.engram.push_back(d); }
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
@@ -309,7 +318,11 @@ double log_softmax_at(const float * lg, int nv, int tok) {
 
 int main(int argc, char ** argv) {
     if (!std::getenv("DS41_GGML_DEBUG"))
-        ggml_log_set([](ggml_log_level lv, const char * text, void *) { if (lv != GGML_LOG_LEVEL_DEBUG) std::fputs(text, stderr); }, nullptr);
+        // STRATA_LOG_DEBUG=1 also passes ggml's DEBUG lines through (graph capture decisions, scheduling).
+        ggml_log_set([](ggml_log_level lv, const char * text, void *) {
+            static const bool dbg = std::getenv("STRATA_LOG_DEBUG") != nullptr;
+            if (lv != GGML_LOG_LEVEL_DEBUG || dbg) std::fputs(text, stderr);
+        }, nullptr);
     Args a;
     if (!parse(argc, argv, a)) {
         std::fprintf(stderr, "usage: see tools/v41/engine/ds41_generate.cpp\n");
@@ -395,6 +408,23 @@ int main(int argc, char ** argv) {
     Ds41Dense dense;
     std::string err;
     const double t_load = now_ms();
+    // The two-card split (--layer-split K --split-device D): the layers [0, K) on the first card, [K, n) on the
+    // second one.  Each card then keeps its own layers' weights, its own layers' KV / indexer state and its own
+    // expert tier, so the two together hold about twice the experts one card holds - that is where the decode
+    // speed comes from (the expert tier is ~78% of a decode step).  The boundary is a hand-off: the residual and
+    // the pre-mix the first stage's last finish() leaves behind.  Off by default: one card, every layer, the path
+    // unchanged.  The dense half refuses a boundary that splits a source layer from the layers that read it.
+    const int64_t split_at = a.layer_split > 0 ? a.layer_split : -1;
+    if (split_at > 0 && (a.serve || PB > 1)) {
+        std::fprintf(stderr, "ds41_generate: --layer-split is not wired for --serve or a layer-major prompt batch yet\n");
+        return 2;
+    }
+    if (split_at > 0) {
+        dc.layer_lo = 0;
+        dc.layer_hi = split_at;
+        dc.own_head = false;      // the second stage owns the head
+        dc.own_embed = true;      // the first stage owns the embeddings
+    }
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds41_generate: dense init: %s\n", err.c_str()); return 1; }
     const Ds41Geometry & G = dense.geom();
     const int n_layer = (int) dense.n_layer(), n_embd = (int) G.n_embd, top_k = (int) G.n_used, nv = (int) G.vocab;
@@ -477,14 +507,77 @@ int main(int argc, char ** argv) {
             for (int64_t l = 0; l < TG.n_layers; ++l)
                 for (int64_t e = 0; e < TG.n_experts; ++e) ranked.emplace_back((int32_t) l, (int32_t) e);
         }
+        // the split: each card's tier holds its OWN layers' experts, so the two cards partition the experts
+        // instead of both chasing the same global head.
+        std::vector<std::pair<int32_t, int32_t>> ranked0;
+        if (split_at > 0) {
+            ranked0.reserve(ranked.size() / 2 + 1);
+            for (const auto & le : ranked)
+                if (le.first < split_at) ranked0.push_back(le);
+        }
+        const std::vector<std::pair<int32_t, int32_t>> & ranked_first = split_at > 0 ? ranked0 : ranked;
         const double t0 = now_ms();
-        if (defer_vram ? !tier.build_arena_ranked(ranked, err) : !tier.seed_from_ranked(ranked, err)) {
+        if (defer_vram ? !tier.build_arena_ranked(ranked_first, err) : !tier.seed_from_ranked(ranked_first, err)) {
             std::fprintf(stderr, "ds41_generate: seed: %s\n", err.c_str());
             return 1;
         }
         std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
+    }
+    // ---- the second card (the split): its own backend, its own dense half over the upper layers and its own expert
+    // tier over the SAME layers' experts - so the two cards hold disjoint expert sets and about twice what one card
+    // holds.  The tier's share of the profile is filtered to its own layers; the VRAM budget is that card's own free
+    // memory; the host arena is half of the first card's (the two share the RAM).
+    ggml_backend_t be2 = nullptr;
+    Ds41Dense dense2;
+    Ds41MoeTier tier2;
+    if (split_at > 0) {
+        // the second GPU device
+        ggml_backend_dev_t dev2 = nullptr;
+        int seen = 0;
+        for (size_t i = 0, nd = ggml_backend_dev_count(); i < nd; ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+            if (seen++ == a.split_device) { dev2 = d; break; }
+        }
+        if (!dev2) { std::fprintf(stderr, "ds41_generate: --split-device %d: no such GPU\n", a.split_device); return 2; }
+        be2 = ggml_backend_dev_init(dev2, nullptr);
+        if (!be2) { std::fprintf(stderr, "ds41_generate: cannot open the second card\n"); return 1; }
+        Ds41DenseConfig dc2 = dc;
+        dc2.backend = be2;
+        dc2.layer_lo = split_at;
+        dc2.layer_hi = -1;
+        dc2.engram_dirs.clear();   // the Engram layers (1 and 14) are the first stage's
+        dc2.own_head = true;      // the second stage owns the head
+        dc2.own_embed = false;    // the first stage owns the embeddings
+        if (!dense2.init(a.model, dc2, err)) { std::fprintf(stderr, "ds41_generate: dense2 init: %s\n", err.c_str()); return 1; }
+        dense2.set_oom_hook([&]() { return tier2.release_prestage(); });
+        // the tier on the second card: its own VRAM budget and its own share of the profile
+        size_t fr2 = 0, tot2 = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be2), &fr2, &tot2);
+        const double slot_gib2 = std::max(0.0, ((double) fr2 - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+        Ds41MoeConfig mc2 = mc;
+        mc2.device = a.split_device;
+        mc2.slot_gib = a.slots > 0 ? 0.0 : slot_gib2;
+        mc2.arena_gib = std::max(0.0, mc.arena_gib / 2.0);
+        mc2.max_arena_gib = mc2.arena_gib;
+        if (!tier2.init(TG, &src, mc2, err)) { std::fprintf(stderr, "ds41_generate: tier2 init: %s\n", err.c_str()); return 1; }
+        // the second card's share of the profile: its own layers' experts, so the two cards never hold the same one
+        std::vector<std::pair<int32_t, int32_t>> ranked2;
+        ranked2.reserve(ranked.size() / 2 + 1);
+        for (const auto & le : ranked)
+            if (le.first >= split_at) ranked2.push_back(le);
+        const double t1 = now_ms();
+        if (defer_vram ? !tier2.build_arena_ranked(ranked2, err) : !tier2.seed_from_ranked(ranked2, err)) {
+            std::fprintf(stderr, "ds41_generate: seed2: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "split: card 0 layers 0-%lld, card %d layers %lld-%d; card 1 tier: %lld experts in VRAM, "
+                     "%lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
+                     (long long) split_at - 1, a.split_device, (long long) split_at, n_layer - 1,
+                     (long long) tier2.resident(), (long long) tier2.arena_experts(), tier2.arena_gib(),
+                     (long long) tier2.file_tier(), (now_ms() - t1) / 1000.0);
     }
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
@@ -497,8 +590,14 @@ int main(int argc, char ** argv) {
             if (!r) { r = 1; ++got; }
         }
     }
+    // the split: the layer's own stage's tier knows whether its expert is resident (the two cards hold different
+    // experts, so the first tier's answer would be wrong for the upper layers).
+    auto in_arena_now = [&](int64_t l, int64_t e) {
+        return (split_at > 0 && l >= split_at) ? tier2.in_arena(l, e) : tier.in_arena(l, e);
+    };
     auto resident_now = [&](int64_t l, int64_t e) {
-        return proxy_res.empty() ? tier.resident(l, e) : proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+        if (!proxy_res.empty()) return proxy_res[(size_t) (l * TG.n_experts + e)] != 0;
+        return (split_at > 0 && l >= split_at) ? tier2.resident(l, e) : tier.resident(l, e);
     };
     // bias_now: route-bias / file penalty are DECODE levers - before the VRAM seed (the prompt) only the prune part
     // applies, unless --bias-prompt measures them (the prompt's file tier is prefetched; a penalty there buys nothing)
@@ -513,7 +612,7 @@ int main(int argc, char ** argv) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !in_arena_now(l, e)) ? -a.route_bias_file : 0.0f;
             dense.set_route_bias((int) l, rb.data());
         }
     };
@@ -566,9 +665,13 @@ int main(int argc, char ** argv) {
     // the host sum; no parts readback / routed upload per layer).  STRATA_DEC_HOSTSUM=1 = the host round trip
     // the routed tensor's device address: re-read after every dense.set_columns (elastic columns reallocate it)
     float * rdev1 = (!mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense.routed_dev() : nullptr;
+    // the split's second stage: its own routed tensor, on its own card
+    float * rdev2 = (split_at > 0 && !mc.cpu_only && !std::getenv("STRATA_DEC_HOSTSUM")) ? dense2.routed_dev() : nullptr;
+    // the head's owner: the last stage (the split's second one)
+    Ds41Dense & HD = (split_at > 0) ? dense2 : dense;
     double dp[6] = {0, 0, 0, 0, 0, 0};
     long dp_n = 0;
-    auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via dense.logits
+    auto step = [&](int tok, int pos) -> bool {   // one token through every layer; logits via D.logits
         double ta = dprof ? now_ms() : 0;
         if (dump_main) {
             dm_tok = tok;
@@ -576,42 +679,49 @@ int main(int argc, char ** argv) {
             dm_row.assign((size_t) 3 * n_embd, 0.0f);
         }
         if (!dense.begin(&tok, 1, pos)) { ferr = dense.last_error(); return false; }
+        // the second stage's pass: its own positions, window ring and compressed rows (the embeddings are the
+        // first stage's, and the residual and the pre-mix come over at the hand-off)
+        if (split_at > 0 && !dense2.begin(&tok, 1, pos)) { ferr = dense2.last_error(); return false; }
         if (dprof) { const double t = now_ms(); dp[0] += t - ta; ta = t; }
         int32_t top16[16];
         bool have_pred = false;
         for (int l = 0; l < n_layer; ++l) {
+            // the stage that owns this layer: its dense half and its expert tier (the split)
+            Ds41Dense & D = (split_at > 0 && l >= split_at) ? dense2 : dense;
+            Ds41MoeTier & T = (split_at > 0 && l >= split_at) ? tier2 : tier;
+            float * const rdev = (split_at > 0 && l >= split_at) ? rdev2 : rdev1;
             if (file_pred) {
                 for (int k = 1; k <= kFP; ++k) {
                     int * const pk = fp_ids.data() + ((size_t) (k - 1) * n_layer + (size_t) (l + k < n_layer ? l + k : 0)) * 16;
-                    if (l + k < n_layer && !dense.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);
+                    if (l + k < n_layer && !D.predict(l + k, pk, 16)) std::fill(pk, pk + 16, -1);
                     if (l + k < n_layer)   // file-tier candidates = the reads a speculative fetch would issue
                         for (int i = 0; i < 16; ++i)
-                            if (pk[i] >= 0 && !tier.resident(l + k, pk[i]) && !tier.in_arena(l + k, pk[i]))
+                            if (pk[i] >= 0 && !T.resident(l + k, pk[i]) && !T.in_arena(l + k, pk[i]))
                                 for (int c = 0; c < 3; ++c) fp_cand[k][c] += i < (4 << c);
                 }
             }
             if (advise_ahead > 0 && l + advise_ahead < n_layer) {   // file-tier readahead for layer l+k's predicted experts
                 int ta[16];
-                if (dense.predict(l + advise_ahead, ta, 16)) tier.advise_file(l + advise_ahead, ta, advise_top);
+                if (D.predict(l + advise_ahead, ta, 16)) T.advise_file(l + advise_ahead, ta, advise_top);
             }
             if (mc.pf_b > 0 && !mc.cpu_only) {   // the DMAs run under this layer's attention
                 int t16[16];
                 if (have_pred) {                  // predicted by the previous layer's finish_predict (same state)
-                    tier.prefetch(l, top16, 16);
-                } else if (dense.predict(l, t16, 16)) {
+                    T.prefetch(l, top16, 16);
+                } else if (D.predict(l, t16, 16)) {
                     for (int i = 0; i < 16; ++i) top16[i] = t16[i];
-                    tier.prefetch(l, top16, 16);
+                    T.prefetch(l, top16, 16);
                 }
                 have_pred = false;
             }
             if (dprof) { const double t = now_ms(); dp[1] += t - ta; ta = t; }
             const float * fn = nullptr;
-            if (!dense.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = dense.last_error(); return false; }
+            if (!D.attn_router(l, ids1.data(), w1.data(), &fn)) { ferr = D.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[2] += t - ta; ta = t; }
             if (file_pred) {
                 for (int j = 0; j < top_k; ++j) {
                     const int e = ids1[(size_t) j];
-                    if (e < 0 || tier.resident(l, e) || tier.in_arena(l, e)) continue;
+                    if (e < 0 || T.resident(l, e) || T.in_arena(l, e)) continue;
                     ++fp_miss[0];
                     for (int k = 1; k <= kFP; ++k) {
                         if (l - k < 0) continue;   // nothing predicted this layer k layers ago
@@ -625,29 +735,39 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
-            const bool tok = rdev1 ? tier.run_to_dev(l, ids1.data(), w1.data(), fn, rdev1)
-                                   : tier.run(l, ids1.data(), w1.data(), fn, routed1.data());
-            if (!tok) { ferr = "tier.run failed"; return false; }
+            // rdev, not rdev1: on a split, layers >= split_at belong to the second stage and their routed tensor
+            // lives on the second card (rdev2).  Writing through rdev1 there is a device pointer from the other
+            // GPU - the HIP runtime faults with "page not present" on the second node (measured 2026-10-23).
+            const bool tok = rdev ? T.run_to_dev(l, ids1.data(), w1.data(), fn, rdev)
+                                  : T.run(l, ids1.data(), w1.data(), fn, routed1.data());
+            if (!tok) { ferr = "T.run failed"; return false; }
             if (dprof) { const double t = now_ms(); dp[3] += t - ta; ta = t; }
-            const float * rsum = rdev1 ? nullptr : routed1.data();   // null: already in the routed tensor
-            if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer) {
+            const float * rsum = rdev ? nullptr : routed1.data();   // null: already in the routed tensor
+            if (fuse_predict && mc.pf_b > 0 && !mc.cpu_only && l + 1 < n_layer && !(split_at > 0 && l + 1 == split_at)) {
                 int t16[16];
                 if (spec_top > 0 && spec_ahead > 0) {
                     int ahead[16 * 8];
                     const int na = std::min(spec_ahead, 8);
-                    if (!dense.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = dense.last_error(); return false; }
+                    if (!D.finish_predict_ahead(l, rsum, l + 1, t16, 16, na, ahead)) { ferr = D.last_error(); return false; }
                     if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
-                    if (spec_l1) tier.spec_read(l + 1, t16, std::min(spec_top, 16));
-                    for (int a = 0; a < na; ++a) tier.spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
+                    if (spec_l1) T.spec_read(l + 1, t16, std::min(spec_top, 16));
+                    for (int a = 0; a < na; ++a) T.spec_read(l + 2 + a, ahead + a * 16, std::min(spec_top, 16));
                     if (dprof) { const double t = now_ms(); dp[5] += t - ta; ta = t; }
-                } else if (!dense.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = dense.last_error(); return false; }
+                } else if (!D.finish_predict(l, rsum, l + 1, t16, 16)) { ferr = D.last_error(); return false; }
                 for (int i = 0; i < 16; ++i) top16[i] = t16[i];
                 have_pred = true;
-            } else if (!dense.finish(l, rsum)) { ferr = dense.last_error(); return false; }
+            } else if (!D.finish(l, rsum)) { ferr = D.last_error(); return false; }
             if (dprof) { const double t = now_ms(); dp[4] += t - ta; ta = t; }
+            if (split_at > 0 && l + 1 == split_at) {
+                // the hand-off: this stage's finish left the residual and the pre-mix; the next stage takes them
+                std::vector<float> hx, hpre;
+                dense.read_state(hx, hpre);
+                if (!dense2.write_state(hx, hpre)) { ferr = dense2.last_error(); return false; }
+                have_pred = false;   // the next layer's prediction is the other stage's
+            }
             for (int j = 0; dump_main && j < 3; ++j) {
                 if (l != dm_layers[j]) continue;
-                dense.read_state(dm_x, dm_pre);   // [n_embd, HC] for the one token
+                D.read_state(dm_x, dm_pre);   // [n_embd, HC] for the one token
                 const size_t HC = dm_x.size() / (size_t) n_embd;
                 for (size_t h = 0; h < HC; ++h)
                     for (int64_t d = 0; d < n_embd; ++d) dm_row[(size_t) j * n_embd + d] += dm_x[h * n_embd + d] / (float) HC;
@@ -796,7 +916,7 @@ int main(int argc, char ** argv) {
             }
         }
         vlog.resize((size_t) m * nv);
-        if (!dense.logits(0, m, vlog.data())) { ferr = dense.last_error(); return false; }
+        if (!HD.logits(0, m, vlog.data())) { ferr = dense.last_error(); return false; }
         lap(3);
         return true;
     };
@@ -901,7 +1021,7 @@ int main(int argc, char ** argv) {
         const int t0 = n - tail_keep, lo = std::max(row0, t0), hi = row0 + nrows;
         if (lo >= hi) return true;
         if (tail_logits.size() != (size_t) tail_keep * (size_t) nv) tail_logits.assign((size_t) tail_keep * (size_t) nv, 0.0f);
-        if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
+        if (!HD.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
         return true;
     };
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
@@ -932,6 +1052,7 @@ int main(int argc, char ** argv) {
                 for (;;) {
                     if (B > dense.columns()) {
                         if (dense.set_columns(B)) { if (rdev1) rdev1 = dense.routed_dev(); }
+                        if (split_at > 0 && dense2.set_columns(B)) { if (rdev2) rdev2 = dense2.routed_dev(); }
                         else if (B > SB) {
                             std::fprintf(stderr, "ds41_generate: %d state columns did not fit (%s) - retrying at %d\n",
                                          B, dense.last_error().c_str(), std::max(SB, B / 2));
@@ -1027,10 +1148,10 @@ int main(int argc, char ** argv) {
                     all_logits->resize((size_t) (c0 + B) * (size_t) nv);
                     for (int s = 0; s < B; s += SB) {
                         const int sn = std::min(SB, B - s);
-                        if (!dense.logits(s, sn, all_logits->data() + (size_t) (c0 + s) * nv)) { ferr = dense.last_error(); return false; }
+                        if (!HD.logits(s, sn, all_logits->data() + (size_t) (c0 + s) * nv)) { ferr = dense.last_error(); return false; }
                     }
                     if (c0 + B == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
-                } else if (c0 + B == n && !dense.logits(B - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                } else if (c0 + B == n && !HD.logits(B - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
                 for (int s = 0; tail_keep > 0 && s < B; s += SB)   // one sub-batch at a time, as above
                     if (!capture_tail(n, c0 + s, std::min(SB, B - s), s)) return false;
                 fd_logits += now_ms() - tl;
@@ -1040,9 +1161,15 @@ int main(int argc, char ** argv) {
                 const int m = std::min(NP, n - c0);
                 double t0 = now_ms();
                 if (!dense.begin(ids + c0, m, pos0 + c0)) { ferr = dense.last_error(); return false; }
+                // the second stage's pass: its own positions, window ring and compressed rows (the embeddings are
+                // the first stage's, and the residual and the pre-mix come over at the hand-off)
+                if (split_at > 0 && !dense2.begin(ids + c0, m, pos0 + c0)) { ferr = dense2.last_error(); return false; }
                 for (int l = 0; l < n_layer; ++l) {
+                    // the stage that owns this layer: its dense half and its expert tier (the split)
+                    Ds41Dense & D = (split_at > 0 && l >= split_at) ? dense2 : dense;
+                    Ds41MoeTier & T = (split_at > 0 && l >= split_at) ? tier2 : tier;
                     const float * fn = nullptr;
-                    if (!dense.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = dense.last_error(); return false; }
+                    if (!D.attn_router(l, cids.data(), cw.data(), &fn)) { ferr = D.last_error(); return false; }
                     if (dump_dir) {
                         char nb[64];
                         std::snprintf(nb, sizeof(nb), "L%02d_fn.f32", l);
@@ -1055,8 +1182,8 @@ int main(int argc, char ** argv) {
                     }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
-                    const bool ok = m == 1 ? tier.run(l, cids.data(), cw.data(), fn, crouted.data())
-                                           : tier.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
+                    const bool ok = m == 1 ? T.run(l, cids.data(), cw.data(), fn, crouted.data())
+                                           : T.run_chunk(l, m, cids.data(), cw.data(), fn, crouted.data());
                     if (!ok) { ferr = "tier run refused"; return false; }
                     if (dump_dir) {
                         char nb[64];
@@ -1065,15 +1192,21 @@ int main(int argc, char ** argv) {
                     }
                     t0 = now_ms();
                     fd_tier += t0 - t1;
-                    if (!dense.finish(l, crouted.data())) { ferr = dense.last_error(); return false; }
+                    if (!D.finish(l, crouted.data())) { ferr = D.last_error(); return false; }
+                    if (split_at > 0 && l + 1 == split_at) {
+                        // the hand-off: this stage's finish left the residual and the pre-mix; the next stage takes them
+                        std::vector<float> hx, hpre;
+                        dense.read_state(hx, hpre);
+                        if (!dense2.write_state(hx, hpre)) { ferr = dense2.last_error(); return false; }
+                    }
                 }
                 fd_dense += now_ms() - t0;
                 const double tl = now_ms();
                 if (all_logits) {
                     all_logits->resize((size_t) (c0 + m) * (size_t) nv);
-                    if (!dense.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
+                    if (!HD.logits(0, m, all_logits->data() + (size_t) c0 * nv)) { ferr = dense.last_error(); return false; }
                     if (c0 + m == n) std::copy(all_logits->end() - nv, all_logits->end(), last_logits.begin());
-                } else if (c0 + m == n && !dense.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                } else if (c0 + m == n && !HD.logits(m - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
                 if (!capture_tail(n, c0, m, 0)) return false;
                 fd_logits += now_ms() - tl;
                 c0 += m;
@@ -1082,6 +1215,7 @@ int main(int argc, char ** argv) {
         }
         if (dc.elastic_cols) {   // back to S columns
             if (!dense.set_columns(0)) { ferr = dense.last_error(); return false; }
+            if (split_at > 0 && !dense2.set_columns(0)) { ferr = dense2.last_error(); return false; }
             if (rdev1) rdev1 = dense.routed_dev();
         }
         tier.release_chunk();
@@ -1332,7 +1466,7 @@ int main(int argc, char ** argv) {
                     last_rows = m;
                     if (i / 64 != before / 64 && i < dh) pp(i);
                 }
-                if (!dense.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
+                if (!HD.logits(last_rows - 1, 1, last_logits.data())) { ferr = dense.last_error(); return false; }
                 pp(dh);
                 return true;
             };
@@ -1550,7 +1684,7 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
+                if (!step(tok, pos) || !HD.logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok); pen_record(tok);
                 ++pos;
             }
@@ -1608,7 +1742,7 @@ int main(int argc, char ** argv) {
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
-        if (!step(prompt[(size_t) i], i) || !dense.logits(0, 1, last_logits.data())) {
+        if (!step(prompt[(size_t) i], i) || !HD.logits(0, 1, last_logits.data())) {
             std::fprintf(stderr, "ds41_generate: dump-main prompt step: %s\n", ferr.c_str());
             return 1;
         }
@@ -1805,7 +1939,7 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!step(tok, pos) || !HD.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;

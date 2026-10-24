@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 
 namespace strata::prefill::mmq {
 #if defined(STRATA_KQ_DSO)
@@ -22,6 +24,18 @@ int abi_args_size() { return (int) sizeof(mmq_args); }
 }  // namespace kq
 #endif
 namespace {
+// Does the linked ggml's mmq_args carry `ncols_opt` (upstream #29953)?  The llama-tq ggml - the one with
+// PTQ1_0 as type 143, which the DeepSeek-V4.1 GSQ's mixed tiers need - is on the older side of that change.
+template <typename T, typename = void>
+struct mmq_has_ncols_opt : std::false_type {};
+template <typename T>
+struct mmq_has_ncols_opt<T, std::void_t<decltype(std::declval<T&>().ncols_opt)>> : std::true_type {};
+// The setter has to be a template: `if constexpr` only drops the branch in a template context, and a plain
+// function would still have to name the field.
+template <typename T>
+void mmq_set_ncols_opt(T& a, int64_t v) {
+    if constexpr (mmq_has_ncols_opt<T>::value) a.ncols_opt = v;
+}
 #if defined(STRATA_MMQ_KQUANTS)
 // MODEL-UPDATE Phase 1: the K-quant products through MMQ are opt-in at run time (STRATA_MMQ_KQ=1); on CUDA their
 // kernels are the strata_kq library (mmq_kq_loader.cpp), opened only then
@@ -363,12 +377,16 @@ void Context::run(const Product& p, void* stream) {
     // mul_mat_q_case's host code in the vendored ggml (3cf0325) picks J_best itself from ncols_opt (the per-call
     // row count); the pinned llama.cpp gains the host-side J_best field by upstream #29953 - revisit that spelling
     // when the pinned copy is bumped.  Ours is the spelling the paired ABI shim exports.
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
-                        p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
-                        p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
-                        1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
-    auto& ctx = *(ggml_backend_cuda_context*) ctx_;
+    // The llama-tq ggml (the one that carries PTQ1_0 as type 143, which the GSQ's mixed tiers need) is on the
+    // older side of that change: its mmq_args has no ncols_opt and picks the tile size from ncols_max.  Both
+    // spellings get the same number (the per-call row count), so the only difference is whether the field
+    // exists - detected here instead of by the ggml's version.
+    mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
+                  p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
+                  p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
+                  1, 1, 0, 0, 0,
+                  p.max_rows};
+    mmq_set_ncols_opt(a, p.max_rows);    auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
 #if defined(STRATA_MMQ_PREC_SRC1)
 #define STRATA_MMQ_CASE(T) mul_mat_q_case<T, GGML_PREC_Q8>(ctx, a, s)   // newer ggml: prec_src1 is a template argument

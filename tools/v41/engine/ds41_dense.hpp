@@ -56,6 +56,21 @@ struct Ds41DenseConfig {
     /// --serve: start with max_pass (S) state columns and let set_columns() grow them for a layer-major batch and give
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
+    /// The layers this object owns: [layer_lo, layer_hi).  A split run gives each card a range, so each card holds
+    /// only its own layers' weights and its own layers' KV / indexer state, and its expert cache holds only its own
+    /// layers' experts - two cards, twice the experts resident.  The default is every layer, which is the
+    /// single-card path byte for byte.
+    ///
+    /// A range must not straddle a source layer: a layer reads the compressed KV and the top-k of the nearest
+    /// earlier source of ITS ratio, so a source and every layer that reads it have to be on one card.  For V4.1
+    /// (ratio 2 on layers 2..19 with the sources 2 / 8 / 14, ratio 1 on 20..39 with the source 20 read by every
+    /// later layer) the only boundary with no cross-card state is 20.
+    int64_t layer_lo = 0;
+    int64_t layer_hi = -1;      ///< one past the last layer owned; -1 = every layer
+    /// This object owns output.weight / output_norm.weight and the head graph: the LAST stage does.
+    bool    own_head = true;
+    /// This object uploads the token embeddings: the FIRST stage does.
+    bool    own_embed = true;
 };
 
 class Ds41Dense {
@@ -71,6 +86,13 @@ public:
     /// Blocks present in the file (all 40 for the real model; a prefix for a partial test file).
     int64_t n_layer() const;
     ggml_backend_t backend() const;
+    /// The stage's layer range: [layer_lo(), layer_hi()).
+    int64_t layer_lo() const;
+    int64_t layer_hi() const;
+    /// Import a hand-off: the residual and the pre-mix another stage's finish() left behind.  x is
+    /// n * hc * n_embd floats token-major, pre is n * hc floats; the sizes must match the current pass.  The
+    /// split's crossing: the first stage's finish() writes both, the next stage reads them.
+    bool write_state(const std::vector<float> & x, const std::vector<float> & pre);
 
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).

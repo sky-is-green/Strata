@@ -242,12 +242,41 @@ class Tokenizer:
 
     PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
 
+    def _split_pieces(self, text: str) -> list[str]:
+        """The pre-tokenizer's pieces, the way llama.cpp computes them.
+
+        llama.cpp's `unicode_regex_split` applies the pre-regexes IN ORDER and each one further splits the
+        pieces the previous one left (`unicode.cpp:1291-1367` feeds the accumulating `bpe_offsets` into the
+        next).  Inside a piece the regex's matches become pieces and the gaps around them become pieces too
+        (`unicode_regex_split_stl`), so the pieces are the segments between the matches.
+
+        The qwen35 pattern covers every character, so for it this is the same list the single-pattern
+        `findall` gave - the gaps are always empty.
+        """
+        pieces = [(0, len(text))]
+        for pat in self._pre_res:
+            out: list[tuple[int, int]] = []
+            for (a, b) in pieces:
+                seg = text[a:b]
+                idx = 0
+                for m in pat.finditer(seg):
+                    if m.end() <= m.start():
+                        continue                       # a zero-length match is not a split
+                    if m.start() > idx:
+                        out.append((a + idx, a + m.start()))
+                    out.append((a + m.start(), a + m.end()))
+                    idx = m.end()
+                if idx < len(seg):
+                    out.append((a + idx, b))
+            pieces = out
+        return [text[a:b] for a, b in pieces]
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
-        for piece in self._re.findall(text):
+        for piece in self._split_pieces(text):
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))

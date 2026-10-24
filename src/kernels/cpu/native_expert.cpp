@@ -26,10 +26,18 @@
 namespace strata::kernels::cpu {
 namespace {
 
-// PTQ1_0 (ternary, id 143) is Strata's own: the vendored ggml stops at GGML_TYPE_COUNT 43, so it must never see 143.
+// PTQ1_0 (ternary, id 143) exists in two dialects (include/strata/kernels/cpu/ptq1_0.hpp):
+//   * the llama-tq dialect (the DeepSeek-V4.1 mixed-tier GSQ): the llama-tq fork's ggml carries PTQ1_0 as a
+//     REAL type (its own vec_dot, Q8_0 activations), so ggml's traits describe it.
+//   * the Scion dialect (this fork's own lane): upstream's ggml stops at GGML_TYPE_COUNT 43, so there the
+//     block is decoded here.
+// Which ggml is linked decides the layout.  With the fork's ggml the mixed tiers work: an expert's gate/up
+// can be PTQ1_0 while its down is Q2_0 or Q3_K, which the GSQ's nine format classes need (the CPU rows
+// decline the mixed case and fall back to ggml's own vec_dot, native_expert.cpp: the `!mixed` guard).
+const bool ggml_has_ptq1_0 = (int) GGML_TYPE_COUNT > kPtq1Type;
 const ggml_type_traits_cpu kPtq1Traits = {nullptr, ptq1_0_vec_dot_q8_0, GGML_TYPE_Q8_0, 1};
 const ggml_type_traits_cpu* traits(int type) {
-    if (type == kPtq1Type) return &kPtq1Traits;
+    if (type == kPtq1Type && !ggml_has_ptq1_0) return &kPtq1Traits;
     return type >= 0 && type < GGML_TYPE_COUNT ? ggml_get_type_traits_cpu((ggml_type) type) : nullptr;
 }
 int64_t blck(int type) { return type == kPtq1Type ? kPtq1Block : ggml_blck_size((ggml_type) type); }
@@ -60,11 +68,13 @@ bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
-    if (gu_type == 143 || d_type == 143) {
+    if ((gu_type == 143 || d_type == 143) && !ggml_has_ptq1_0) {
         // Scion PTQ1_0 (ggml type 143): not in ggml's type table, so its
         // geometry is defined here - 128-value blocks, 28 bytes (qs[24] staged
         // base-3 trits, qh[2], fp16 d).  The activation is ggml Q8_K (256
         // values); one activation block covers two weight blocks.
+        // With the llama-tq ggml linked PTQ1_0 is a real ggml type (see ggml_has_ptq1_0) and the generic path
+        // below describes it - Q8_0 activations, and the mixed tiers the GSQ's classes use.
         if (gu_type != 143 || d_type != 143) {
             err = "native experts: PTQ1_0 must be the type of both gate/up and down";
             return false;

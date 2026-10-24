@@ -276,6 +276,10 @@ std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& pat
 /// (72.6 GiB).  `arena_gib` is a budget, not a promise: the arena fills in profile order up to it and everything
 /// past it is read from the blob source on demand (the file tier).
 struct Ds41MoeConfig {
+    /// The device this tier runs on (CUDA/HIP device index; -1 = the current one).  The two-card split gives each
+    /// card its own tier, so each holds its own layers' experts: the two together hold about twice what one card
+    /// holds, which is where the decode speed comes from (the expert tier is ~78% of a decode step).
+    int device = -1;
     int64_t slots = 2150;         ///< VRAM expert slots (6.75 MiB each); 0 or `no_cache` = none
     double pcie_frac = 0.25;      ///< share of the (non-prefetched) misses computed on the GPU
     int threads = 0;              ///< CPU pool workers; 0 = every physical core but the first

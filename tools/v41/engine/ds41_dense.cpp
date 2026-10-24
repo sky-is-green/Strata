@@ -106,6 +106,15 @@ bool is_routed(const std::string & n) {
     return n.find("_exps.") != std::string::npos || n.find("ffn_exps_") != std::string::npos;
 }
 
+// The layer a tensor belongs to: "blk.<n>.<suffix>" -> n; -1 for the model's own tensors (the embedding, the head).
+int64_t tensor_layer(const std::string & n) {
+    if (n.compare(0, 4, "blk.") != 0) return -1;
+    size_t j = 4;
+    while (j < n.size() && n[j] >= '0' && n[j] <= '9') ++j;
+    if (j == 4 || j >= n.size() || n[j] != '.') return -1;
+    return std::atoll(n.substr(4, j - 4).c_str());
+}
+
 }  // namespace
 
 // ================================================================== Impl
@@ -117,6 +126,8 @@ struct Ds41Dense::Impl {
     std::unique_ptr<GgufModel> model;
     std::vector<int64_t> layers;          // blocks in the file (0..nl-1)
     int64_t nl = 0;
+    int64_t lo = 0, hi = 0;              // the stage's layer range [lo, hi); hi == nl means every layer
+    bool own_head = true, own_embed = true;
     ggml_backend_t backend = nullptr;
     bool own_backend = false, cpu = true;
     WStore w;
@@ -250,8 +261,15 @@ static bool load_weights(Ds41Dense::Impl & im, std::string & err) {
         ggml_set_name(t, ti.name.c_str());
         return t;
     };
-    // routed experts never reach ggml (PTQ1_0 = 143 is past GGML_TYPE_COUNT); the I32 maps are read by the geometry
-    auto skip = [&](const std::string & n) { return is_routed(n) || n == "token_embd.weight"; };
+    // routed experts never reach ggml (PTQ1_0 = 143 is past GGML_TYPE_COUNT); the I32 maps are read by the geometry.
+    // A stage also leaves out the layers it does not own and the head it does not own: that is the split's "the
+    // weights live in two places" - each card holds only its own layers' matrices.
+    auto skip = [&](const std::string & n) {
+        if (is_routed(n) || n == "token_embd.weight") return true;
+        if (!im.own_head && (n == "output.weight" || n == "output_norm.weight")) return true;
+        const int64_t l = tensor_layer(n);
+        return l >= 0 && (l < im.lo || l >= im.hi);
+    };
     if (im.cpu) {
         for (size_t s = 0; s < model.size(); ++s) {
             const GgufFile & sh = model.shard(s);
@@ -593,10 +611,10 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
                     ggml_tensor * lb = ggml_reshape_2d(gc, b.v1(im.i_lastblk, n, (size_t) col0 * 4), 1, n);
                     ggml_tensor * eq = ggml_step(gc, ggml_scale_bias(gc, ggml_abs(gc, ggml_sub(gc, ggml_repeat(gc, br, bm), lb)), -1.0f, 0.5f));
                     bm = ggml_add(gc, bm, ggml_scale(gc, eq, 1e30f));
-                    ggml_tensor * cb = ggml_cont(gc, ggml_top_k(gc, bm, (int) ncb));                     // I32 [ncb, n]
+                    ggml_tensor * cb = ggml_cont(gc, ggml_argsort_top_k(gc, bm, (int) ncb));                     // I32 [ncb, n]
                     outs.push_back(ggml_cpy(gc, cb, ggml_view_2d(gc, im.cand, ncb, n, im.cand->nb[1], (size_t) col0 * im.cand->nb[1])));
                 }
-                sel = ggml_cont(gc, ggml_top_k(gc, sc, (int) K));                                     // I32 [K, n]
+                sel = ggml_cont(gc, ggml_argsort_top_k(gc, sc, (int) K));                                     // I32 [K, n]
                 // Canonicalise the top-k order.  ggml_cuda_op_top_k asks CUB's DeviceTopK for
                 // output_ordering::unsorted, and CUB hands the k ids back in an order its atomically assigned
                 // output slots produce - run-to-run unstable, while the SET is stable (measured: order-only on
@@ -905,6 +923,20 @@ Ds41Dense::~Ds41Dense() = default;
 const Ds41Geometry & Ds41Dense::geom() const { return p_->g; }
 ggml_tensor * Ds41Dense::weight(const std::string & name) const { return p_->w.get(name); }
 int64_t Ds41Dense::n_layer() const { return p_->nl; }
+int64_t Ds41Dense::layer_lo() const { return p_->lo; }
+int64_t Ds41Dense::layer_hi() const { return p_->hi; }
+
+bool Ds41Dense::write_state(const std::vector<float> & x, const std::vector<float> & pre) {
+    Impl & im = *p_;
+    const size_t nx = (size_t) (im.D * im.HC * im.n), np = (size_t) (im.HC * im.n);
+    if (x.size() != nx || pre.size() != np) {
+        im.err = "write_state: the hand-off sizes do not match the pass";
+        return false;
+    }
+    ggml_backend_tensor_set(im.x_state, x.data(), 0, nx * 4);
+    ggml_backend_tensor_set(im.pre_state, pre.data(), 0, np * 4);
+    return true;
+}
 ggml_backend_t Ds41Dense::backend() const { return p_->backend; }
 const std::string & Ds41Dense::last_error() const { return p_->err; }
 
@@ -1005,6 +1037,27 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
         if (im.layers[i] != (int64_t) i) { err = "the file's blocks must be 0..k"; return false; }
     im.nl = (int64_t) im.layers.size();
     const Ds41Geometry & G = im.g;
+    // the stage's layer range: [lo, hi).  The default is every layer, which is the single-card path unchanged.
+    im.lo = std::max<int64_t>(0, cfg.layer_lo);
+    im.hi = cfg.layer_hi < 0 ? im.nl : std::min<int64_t>(im.nl, cfg.layer_hi);
+    im.own_head = cfg.own_head;
+    im.own_embed = cfg.own_embed;
+    if (im.hi <= im.lo) { err = "the layer range is empty"; return false; }
+    // A source and the layers that read it have to be on one card: a layer reads the compressed KV and the top-k of
+    // the latest source at or before it, and a split that put the two on different cards would make the reader
+    // fetch the source's state across the bus on every layer.
+    for (int64_t l = 0; l < im.nl; ++l) {
+        const bool mine = l >= im.lo && l < im.hi;
+        for (int64_t s : { G.kv_src(l), G.idx_src(l) }) {
+            if (s < 0) continue;
+            const bool src_mine = s >= im.lo && s < im.hi;
+            if (mine != src_mine) {
+                err = "the layer range [" + std::to_string(im.lo) + ", " + std::to_string(im.hi) +
+                      ") splits the source at layer " + std::to_string(s) + " from the layers that read it";
+                return false;
+            }
+        }
+    }
     im.D = G.n_embd; im.HC = G.hc; im.DH = G.d_head; im.DHR = G.d_rope; im.NH = G.n_head; im.OG = G.o_groups;
     im.OL = G.o_lora; im.OGD = G.n_head * G.d_head / G.o_groups; im.RQ = G.r_q; im.SWA = G.n_swa;
     im.IH = G.idx_heads; im.ID = G.idx_dim; im.ITOP = G.idx_topk; im.NE = G.n_expert; im.NU = G.n_used; im.NFF = G.n_ff;
@@ -1064,6 +1117,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     };
     const int64_t D = im.D, NCM = im.NCmax;
     for (int64_t l = 0; l < im.nl; ++l) {
+        if (l < im.lo || l >= im.hi) continue;   // another stage's layer: its state is not ours to keep
         auto & L = im.ly[(size_t) l];
         L.raw = T(kvt, { im.DH, im.RAW });
         L.raw_snap = T(kvt, { im.DH, im.RAW });
@@ -1175,14 +1229,17 @@ static bool engram_ready(Ds41Dense::Impl & im) {
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     Impl & im = *this;
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
-    // embeddings (F16 rows on the mmap)
-    im.host_emb.resize((size_t) (D * n));
-    for (int t = 0; t < n; ++t) {
-        if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
-        const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
-        for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
+    // embeddings (F16 rows on the mmap).  A stage that does not own the embeddings (the first one does) leaves the
+    // rows out: its state comes from the hand-off instead, and the init graph's write of it is overwritten.
+    if (im.own_embed) {
+        im.host_emb.resize((size_t) (D * n));
+        for (int t = 0; t < n; ++t) {
+            if (tids[t] < 0 || tids[t] >= im.g.vocab) { im.err = "token id out of range"; return false; }
+            const uint16_t * row = reinterpret_cast<const uint16_t *>(im.embd) + (size_t) tids[t] * (size_t) D;
+            for (int64_t i = 0; i < D; ++i) im.host_emb[(size_t) (t * D + i)] = ggml_fp16_to_fp32(row[i]);
+        }
+        ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
     }
-    ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
     std::vector<int32_t> pos(n);
     for (int t = 0; t < n; ++t) pos[t] = pos0 + t;
     ggml_backend_tensor_set(im.i_pos, pos.data(), 0, (size_t) n * 4);

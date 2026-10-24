@@ -52,6 +52,29 @@
 
 namespace cpu = strata::kernels::cpu;
 
+#if defined(DS4_MOE_CUDA)
+/// The device this tier runs on (cfg.device; -1 = the current one).  The split's second card: the tier's buffers
+/// are allocated there and its kernels run there, so every device call has to happen with it current.  The runtime's
+/// current device is per host thread, so this is a save/restore around the call.
+struct TierDev {
+    int dev, prev = 0;
+    explicit TierDev(int d) : dev(d) {
+        if (dev < 0) return;
+        if (cudaGetDevice(&prev) != cudaSuccess) { (void) cudaGetLastError(); prev = 0; }
+        if (dev != prev) (void) cudaSetDevice(dev);
+    }
+    ~TierDev() {
+        if (dev < 0 || dev == prev) return;
+        (void) cudaSetDevice(prev);
+    }
+};
+#else
+/// The CPU-only flavour: no device to switch to.
+struct TierDev {
+    explicit TierDev(int) {}
+};
+#endif
+
 namespace strata::v41 {
 
 namespace {
@@ -1258,6 +1281,7 @@ bool Ds41MoeTier::init(const std::string& gguf, const Ds41MoeConfig& cfg, std::s
 }
 
 bool Ds41MoeTier::init(const Ds41MoeGeom& geom, Ds41BlobSource* blobs, const Ds41MoeConfig& cfg, std::string& err) {
+    const TierDev dev_guard(im_->cfg.device);
     close();
     im_->g = geom;
     im_->cfg = cfg;
@@ -1415,6 +1439,7 @@ std::vector<std::pair<int32_t, int32_t>> arena_order(const Ds41MoeImpl& im, cons
 }
 
 bool Ds41MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    const TierDev dev_guard(im_->cfg.device);
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
     (void) err;
@@ -1582,6 +1607,7 @@ std::vector<std::pair<int32_t, int32_t>> warm_first(Ds41MoeImpl& im, const std::
 }
 
 bool Ds41MoeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
+    const TierDev dev_guard(im_->cfg.device);
     if (im_->cfg.cpu_only) return true;
     return build_arena(arena_order(*im_, drop_excluded(*im_, ranked_all)), err);
 }
@@ -1598,6 +1624,7 @@ void Ds41MoeTier::set_cache_enabled(bool on) {
 }
 
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
+    const TierDev dev_guard(im_->cfg.device);
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
     if (!build_arena(arena_order(*im_, ranked), err)) return false;
@@ -1739,6 +1766,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
 }
 
 void Ds41MoeTier::advise_file(int64_t layer, const int32_t* ids, int n) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !im_->blobs || !ids || n <= 0 || layer < 0 || layer >= im_->g.n_layers || !im_->g.routed(layer)) return;
     for (int i = 0; i < n; ++i) {
         const int32_t e = ids[i];
@@ -1773,6 +1801,7 @@ void Ds41MoeTier::trace_mark(const float* v, int n) {
 }
 
 void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
+    const TierDev dev_guard(im_->cfg.device);
 #if defined(DS4_MOE_CUDA)
     Ds41MoeImpl& im = *im_;
     // d3: the caller is the verify pass, whose FILEG path takes stashed blobs under arena_adapt too (gpu_run's
@@ -1796,6 +1825,7 @@ void Ds41MoeTier::spec_read(int64_t layer, const int32_t* ids, int n, bool d3) {
 }
 
 void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int max_slots) {
+    const TierDev dev_guard(im_->cfg.device);
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.no_cache || !im_->gpu->cache) return;
@@ -1824,6 +1854,7 @@ void Ds41MoeTier::prefetch_multi(int64_t layer, const int32_t* ids, int n, int m
 }
 
 void Ds41MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
+    const TierDev dev_guard(im_->cfg.device);
     im_->pf_n = 0;
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || im_->cfg.cpu_only || im_->cfg.pf_b <= 0 || im_->cfg.no_cache || !im_->gpu->cache) return;
@@ -4364,6 +4395,7 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 #endif
 
 bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out) return false;
     if (!im_->g.routed(layer)) return false;
@@ -4376,6 +4408,7 @@ bool Ds41MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const
 }
 
 bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6, const float* x, void* out_dev) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !im_->pool) return false;
     if (!ids6 || !w6 || !x || !out_dev) return false;
     if (!im_->g.routed(layer) || im_->cfg.cpu_only) return false;
@@ -4387,6 +4420,7 @@ bool Ds41MoeTier::run_to_dev(int64_t layer, const int32_t* ids6, const float* w6
 }
 
 bool Ds41MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
     if (!im_->g.routed(layer)) return false;
@@ -4419,6 +4453,7 @@ void Ds41MoeTier::profiler(bool on) {
 }
 
 bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
     if (!im_->g.routed(layer)) return false;
@@ -4446,6 +4481,7 @@ bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, co
 }
 
 bool Ds41MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
+    const TierDev dev_guard(im_->cfg.device);
     if (im_->cfg.cpu_only) return true;
     std::string e;
     const std::vector<std::pair<int32_t, int32_t>> ranked =
@@ -4461,6 +4497,7 @@ const std::vector<double>& Ds41MoeTier::saliency_sum() const { return im_->sal_s
 const std::vector<int64_t>& Ds41MoeTier::saliency_count() const { return im_->sal_cnt; }
 
 void Ds41MoeTier::release_cache() {
+    const TierDev dev_guard(im_->cfg.device);
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->cache) return;
     cudaDeviceSynchronize();   // no copy or kernel may still read a slot
@@ -4496,6 +4533,7 @@ void Ds41MoeTier::release_cache() {
 }
 
 bool Ds41MoeTier::release_prestage() {
+    const TierDev dev_guard(im_->cfg.device);
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->p_buf) return false;
     Gpu& gp = *im_->gpu;
@@ -4516,6 +4554,7 @@ bool Ds41MoeTier::release_prestage() {
 }
 
 void Ds41MoeTier::release_chunk() {
+    const TierDev dev_guard(im_->cfg.device);
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu) return;
     if (chunk_prof() && g_cprof.calls) {
@@ -4576,6 +4615,7 @@ void Ds41MoeTier::release_chunk() {
 }
 
 bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, float* out) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !ids || !w || !x || !out || n < 1) return false;
     if (!im_->g.routed(layer)) return false;
 #if defined(DS4_MOE_CUDA)
@@ -4589,6 +4629,7 @@ bool Ds41MoeTier::run_chunk(int64_t layer, int n, const int32_t* ids, const floa
 }
 
 bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited || !ids || !w || !x || !out_dev || n < 1) return false;
     if (!im_->g.routed(layer)) return false;
 #if defined(DS4_MOE_CUDA)
@@ -4598,6 +4639,7 @@ bool Ds41MoeTier::run_chunk_dev(int64_t layer, int n, const int32_t* ids, const 
 }
 
 bool Ds41MoeTier::run_dev(int64_t layer, const int32_t* ids6, const float* w6, const void* x_dev, float* out) {
+    const TierDev dev_guard(im_->cfg.device);
     if (!im_->inited) return false;
     if (!ids6 || !w6 || !x_dev || !out) return false;
     if (!im_->g.routed(layer)) return false;
