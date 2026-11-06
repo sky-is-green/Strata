@@ -80,6 +80,15 @@ struct VerifyEp {
     const uint8_t* cache_base1 = nullptr;            ///< the peer's expert arena
     const unsigned long long* slot_off1 = nullptr;   ///< the peer's per-slot offsets, its memory (null: slot * blob1)
     int64_t blob1 = 0;
+    /// EXPERIMENT STRATA_EP_CPU=1 (null: off): experts on neither card, computed by the host's CPU pool inside the
+    /// window.  res1_on0 / res0_on1 then mark them as the other card's, so each card's plan leaves them out.
+    const int32_t* h_res01 = nullptr;     ///< host [n_layers * n_expert]: >= 0 when either card holds the expert
+    const int32_t* res01_on0 = nullptr;   ///< ... a copy in this card's memory
+    /// this card's table with the experts on neither card marked resident (res0_on1's values), in this card's memory:
+    /// the peer's rows are copied only for the peer's own experts (it sends no row for the CPU's)
+    const int32_t* res0n_on0 = nullptr;
+    /// Point the run()'s pool user at h_res01 with no GPU plan (res != null), or put it back (null).
+    void (*cpu_scope)(void* user, const int32_t* res) = nullptr;
 };
 
 struct VerifyHits {
@@ -603,6 +612,8 @@ private:
     uint32_t* h_ep_err0_ = nullptr; uint32_t* ep_err0_ = nullptr;             ///< host words a timed-out wait sets
     uint32_t* h_ep_err1_ = nullptr; uint32_t* ep_err1_ = nullptr;
     uint32_t* h_ep_plan_err1_ = nullptr; uint32_t* ep_plan_err1_ = nullptr;   ///< the peer's plan error (on neither card)
+    uint32_t* h_ep_cpu_ = nullptr; uint32_t* m_ep_cpu_ = nullptr;   ///< STRATA_EP_CPU: the host raises each step's ring once its CPU rows are in h_ymiss_
+    bool ep_cpu() const { return ep_on() && ep_cfg_.h_res01 != nullptr; }
     uint32_t ep_spin_ = 2000000u;                  ///< STRATA_EP_SPIN_MAX: reads before a wait gives up
     size_t ep_slot_bytes_ = 0, ep_xq_off_ = 0;     ///< inbox: bytes per group, offset of the q8_1 rows
     cudaGraphExec_t ep_exec_[9] = {};              ///< the peer's graph per window size

@@ -608,7 +608,7 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     // the words the spin kernels read (wait_flag_ge, wait_flag_ge_or) are mapped host memory, so a store here
     // reaches them with no API call; UINT32_MAX is past every ring.  (E-6's skip words are device memory, but
     // wait_flag_ge_or also returns on its flag.)  A host function raising flag B later only raises.
-    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_})   // + an overlapped split's hand-off wait
+    for (uint32_t* p : {h_flag_, h_flagA_, h_flagB_, hflag_in_h_, h_ep_cpu_})   // + an overlapped split's hand-off wait, STRATA_EP_CPU
         if (p != nullptr) *(volatile uint32_t*) p = UINT32_MAX;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     strata_store_fence();
@@ -1269,7 +1269,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             for (int64_t l = lb_; l < le_ && all_ok; ++l) {
                 for (int64_t e = 0; e < g.n_expert; ++e) {
                     const int64_t i = l * g.n_expert + e;
-                    if (hits.h_res[i] < 0 && !(ep_on() && ep_cfg_.h_res1 != nullptr && ep_cfg_.h_res1[i] >= 0)) {
+                    if (hits.h_res[i] < 0 && !(ep_on() && ep_cfg_.h_res1 != nullptr && ep_cfg_.h_res1[i] >= 0) &&
+                        !(ep_cpu() && ep_cfg_.h_res01[i] < 0)) {   // STRATA_EP_CPU: on neither card by placement
                         all_ok = false;   // with a peer, the table holds what the PEER keeps as well
                         break;
                     }
@@ -1324,8 +1325,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     if (ep_on())
         std::fprintf(stderr, "strata verify: expert parallel with card %d: the peer computes the experts this card "
-                             "does not hold (inbox %.1f KiB per group, spin bound %u)\n",
-                     ep_cfg_.device, ep_slot_bytes_ / 1024.0, ep_spin_);
+                             "does not hold (inbox %.1f KiB per group, spin bound %u)%s\n",
+                     ep_cfg_.device, ep_slot_bytes_ / 1024.0, ep_spin_,
+                     ep_cpu() ? "; STRATA_EP_CPU: the host's CPU pool computes the experts on neither card" : "");
     return true;
 }
 
@@ -2258,6 +2260,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              ep_cfg_.res1_on0 + l * g.n_expert, 1, (int) g.n_expert, hits_.cache_base, slot_off_d_,
                              (long long) hits_.blob, plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
                              (long long) max_t_ * K, cs, m_plan_err_);
+            // STRATA_EP_CPU: the ids (and x when one is on neither card) to the host, a ring every step
+            if (ep_cpu())
+                doorbell_publish_res(xm, ids_ + tb * K, ep_cfg_.res01_on0 + l * g.n_expert, (int) g.n_expert,
+                                     (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
         } else if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -2431,8 +2437,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 20, grp);
             if (ep_on()) {   // the peer's rows are in the mapped region once its flag is up
                 ep_wait((const uint32_t*) ep_ret_d0_ + (size_t) ring * 16, ep_ctr0_, ep_spin_, ep_err0_, ring, cs);
+                stamp(l, 21, grp);   // STRATA_VERIFY_PROFILE: "waitB" is the wait for the peer here
+                // STRATA_EP_CPU: not the rows of the CPU's experts (the peer sends none; the CPU's copy follows)
                 ep_copy_peer_rows(parts_out, (const float*) ep_rows_d0_ + (size_t) tb * K * N, ids_ + tb * K,
-                                  hits_.d_res + l * g.n_expert, (int) cap, N, cs);
+                                  (ep_cpu() ? ep_cfg_.res0n_on0 : hits_.d_res) + l * g.n_expert, (int) cap, N, cs);
+                stamp(l, 22, grp);   // "PCIe grp": the copy of the peer's rows
+                if (ep_cpu()) {   // STRATA_EP_CPU: the CPU's rows (entries on neither card) over what the peer left there
+                    wait_flag_ge(m_ep_cpu_, ring, cs);
+                    stamp(l, 23, grp);   // "waitCPU": what card 0 still waits for the host after the peer
+                    ep_copy_peer_rows(parts_out, m_ymiss_ + (size_t) tb * K * N, ids_ + tb * K,
+                                      ep_cfg_.res01_on0 + l * g.n_expert, (int) cap, N, cs);
+                }
             }
         } else {
             strata::dispatch::notef("experts layer: partial residency, plan from %ld (1 = device plan, 0 = host pool), pcie_mode=%ld, remote_opt=%ld", (long) device_plan_, (long) sink_.pcie_mode, (long) (remote_opt_ != nullptr));
@@ -2788,7 +2803,9 @@ void Verifier::refresh_ar() {
     const int64_t n = (le_ < 0 ? g_->n_layers : le_) * ne - lb_ * ne;
     int32_t lo = 0;
     const int32_t* r1 = ep_on() && ep_cfg_.h_res1 != nullptr ? ep_cfg_.h_res1 + lb_ * ne : nullptr;
-    for (int64_t i = 0; i < n; ++i) lo = std::min(lo, r1 != nullptr && r[i] < 0 ? r1[i] : r[i]);   // the peer's count
+    const int32_t* r01 = ep_cpu() ? ep_cfg_.h_res01 + lb_ * ne : nullptr;   // STRATA_EP_CPU: the CPU's by placement
+    for (int64_t i = 0; i < n; ++i)
+        if (r01 == nullptr || r01[i] >= 0) lo = std::min(lo, r1 != nullptr && r[i] < 0 ? r1[i] : r[i]);   // the peer's count
     const bool off = lo < 0;
     if (off != ar_off_) {
         ar_off_ = off;
@@ -2815,6 +2832,10 @@ bool Verifier::ep_init(std::string& err) {
     }
     if (!all_resident_) {
         err = "verify: expert parallel: some experts are on neither card (every expert must be in one card's VRAM)";
+        return false;
+    }
+    if (ep_cpu() && (ep_cfg_.res01_on0 == nullptr || ep_cfg_.res0n_on0 == nullptr || ep_cfg_.cpu_scope == nullptr)) {
+        err = "verify: expert parallel: STRATA_EP_CPU needs the merged residency table and the pool scope";
         return false;
     }
     if (d1 < 0 || d1 == d0 || ext_stream_ != nullptr) {   // not with pipelined windows
@@ -2848,6 +2869,10 @@ bool Verifier::ep_init(std::string& err) {
     cudaSetDevice(d1);
     ok = ok && mapped(64, (void**) &h_ep_err1_, (void**) &ep_err1_) &&
          mapped(64, (void**) &h_ep_plan_err1_, (void**) &ep_plan_err1_);
+    if (ok && ep_cpu()) {   // STRATA_EP_CPU: the host's per-ring return word, card 0's alias
+        cudaSetDevice(d0);
+        ok = mapped(64, (void**) &h_ep_cpu_, (void**) &m_ep_cpu_);
+    }
     if (!ok) { cudaSetDevice(prev_dev); err = "verify: expert parallel: the mapped error words failed"; return false; }
     // this card's epoch (device memory of card 0)
     cudaSetDevice(d0);
@@ -2894,11 +2919,11 @@ void Verifier::ep_free() {
     } catch (...) {}   // at process exit the context can already be gone (see ~Verifier)
     for (void** h : {&ep_inbox_, &ep_inflag_, &ep_rows_, &ep_ret_})
         if (*h != nullptr) { cudaFreeHost(*h); *h = nullptr; }
-    for (uint32_t** h : {&h_ep_err0_, &h_ep_err1_, &h_ep_plan_err1_})
+    for (uint32_t** h : {&h_ep_err0_, &h_ep_err1_, &h_ep_plan_err1_, &h_ep_cpu_})
         if (*h != nullptr) { cudaFreeHost(*h); *h = nullptr; }
     ep_ctr0_ = ep_ctr1_ = nullptr;
     ep_plan1_ = nullptr; ep_in1_ = nullptr; ep_rows1_ = nullptr; ep_done1_ = nullptr; ep_scratch1_ = nullptr;
-    ep_err0_ = ep_err1_ = ep_plan_err1_ = nullptr;
+    ep_err0_ = ep_err1_ = ep_plan_err1_ = m_ep_cpu_ = nullptr;
     ep_inbox_d0_ = ep_inbox_d1_ = nullptr;
     ep_inflag_d0_ = ep_inflag_d1_ = nullptr;
     ep_rows_d0_ = ep_rows_d1_ = nullptr;
@@ -3286,6 +3311,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
     *(volatile uint32_t*) h_flagB_ = 0;
+    if (h_ep_cpu_ != nullptr) *(volatile uint32_t*) h_ep_cpu_ = 0;
     // the overlapped split: the next stage's graph is launched after this, and must see THIS window's raise
     if (hflag_out_h_ != nullptr) *(volatile uint32_t*) hflag_out_h_ = 0;
     if (herr_h_ != nullptr) *(volatile uint32_t*) herr_h_ = 0;
@@ -3630,6 +3656,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
+    // STRATA_EP_CPU: the all-resident window still has the CPU's experts (on neither card): serve them below
+    const bool ep_host = ep_cpu() && ar_on() && !test_stall;
+    struct EpScope {   // the pool user back as it was on every return
+        void (*f)(void*, const int32_t*) = nullptr;
+        void* u = nullptr;
+        ~EpScope() { if (f != nullptr) f(u, nullptr); }
+    } ep_scope;
+    if (ep_host) {
+        if (pool == nullptr) {
+            err = "verify: expert parallel: STRATA_EP_CPU needs the expert pool" + released_note(release_gpu_waits(5000));
+            return false;
+        }
+        ep_cfg_.cpu_scope(user, ep_cfg_.h_res01);
+        ep_scope.f = ep_cfg_.cpu_scope;
+        ep_scope.u = user;
+    }
     if (ar_on() && !test_stall) {
         if (flag_raised) {
             // up before the launch (early_ple_flag_mode)
@@ -3643,7 +3685,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         } else {
             *flag = 1;
         }
-    } else
+    }
+    if (!(ar_on() && !test_stall) || ep_host)
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
@@ -3703,6 +3746,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
+        if (ep_host) {   // STRATA_EP_CPU: only the entries on neither card; the pool zeroes the rest (card 0 copies none of them)
+            const int32_t* r01 = ep_cfg_.h_res01 + l * g.n_expert;
+            const int32_t* ids = h_ids_ + (size_t) tb * ss.k;
+            bool any = false;
+            for (int64_t i = 0; i < (int64_t) n * ss.k && !any; ++i)
+                any = ids[i] < 0 || ids[i] >= g.n_expert || r01[ids[i]] < 0;
+            if (any)   // else the publish skipped x as well: nothing for the CPU this step
+                pool(user, h_x_ + (size_t) tb * g.n_embd, ids, n, ss.k, h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+            progress_tick();
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata_store_fence();
+            *(volatile uint32_t*) h_ep_cpu_ = want;
+            ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+            ms_pool += ms_since(b);
+            continue;
+        }
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,

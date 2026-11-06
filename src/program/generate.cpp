@@ -1446,6 +1446,22 @@ void drive_pool_multi_invariant(void* u, const float* x, const int32_t* ids, int
     drive_pool_multi_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::WindowInvariant);
 }
 
+/// EXPERIMENT STRATA_EP_CPU: the expert-parallel window's CPU share runs the verify pool with the merged residency
+/// table (an expert on either card is the GPUs' work) and no GPU plan / PCIe share; `res` null puts the Drive back.
+/// ponytail: one Drive at a time (static save slot), fine while expert parallelism refuses batch slots and splits.
+void drive_ep_cpu_scope(void* u, const int32_t* res) {
+    static const int32_t* saved_res = nullptr;
+    static strata::core::GpuPlanSink* saved_plan = nullptr;
+    static int saved_pcie = 0;
+    Drive* t = (Drive*) u;
+    if (res != nullptr) {
+        saved_res = t->d.host_res; saved_plan = t->d.plan; saved_pcie = t->d.pcie_num;
+        t->d.host_res = res; t->d.plan = nullptr; t->d.pcie_num = 0;
+    } else {
+        t->d.host_res = saved_res; t->d.plan = saved_plan; t->d.pcie_num = saved_pcie;
+    }
+}
+
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
 struct SplitDrive {
@@ -7664,6 +7680,20 @@ int main(int argc, char** argv) {
                             (long long) ((floor_b + (1ll << 20) - 1) >> 20));
                         ep_card0_reserve_mib = (floor_b + (1ll << 20) - 1) >> 20;
                         slots = slots_need;
+                    } else if (fit_q0 * g.n_layers > slots && !o.vram_reserve_given && std::getenv("STRATA_EP_CPU") != nullptr &&
+                               std::getenv("STRATA_EP_CPU")[0] == '1') {
+                        // STRATA_EP_CPU=1 and the pair cannot hold every expert even so: this card still goes down to
+                        // the same floor, so the CPU tail is what neither card has room for, not this card's reserve
+                        // (a --vram-reserve-mib given on the command line is kept, as in the other automatic steps)
+                        const int64_t s = std::min<int64_t>(fit_q0 * g.n_layers,
+                                                            profile.empty() ? INT64_MAX : (int64_t) profile.size());
+                        std::fprintf(stderr,
+                            "strata generate: expert cache auto: expert parallelism (STRATA_EP_CPU): the pair cannot hold "
+                            "every expert, so this card takes %lld per layer (cache %lld slots; this card's reserve "
+                            "becomes %lld MiB)\n",
+                            (long long) (s / g.n_layers), (long long) s, (long long) ((floor_b + (1ll << 20) - 1) >> 20));
+                        ep_card0_reserve_mib = (floor_b + (1ll << 20) - 1) >> 20;
+                        slots = s;
                     }
                 }
             }
@@ -8099,6 +8129,12 @@ int main(int argc, char** argv) {
     // The peer's cache is never destroyed: ExpertCache frees through the CURRENT device's queue, which at exit is
     // card 0's, and the process ends right after the last request anyway.
     strata::core::ExpertCache* ep_cache = nullptr;
+    // EXPERIMENT STRATA_EP_CPU=1: the coldest experts may be on neither card; the host's CPU pool computes their rows
+    // inside the expert-parallel window (Verifier: VerifyEp::h_res01).  Unset: the placement and output as before.
+    // ep_cpu: the variable is set AND the pair cannot hold every expert (a pair that can runs the plain EP window:
+    // the tail's host round trip per layer costs ~13% of decode there for nothing)
+    static const bool ep_cpu_env = [] { const char* v = std::getenv("STRATA_EP_CPU"); return v != nullptr && v[0] == '1'; }();
+    bool ep_cpu = false;
     if (o.ep_device >= 0) {
         if (o.expert_cache <= 0 || profile.empty() || !xcache.per_layer_admission()) {
             std::fprintf(stderr, "strata generate: --expert-parallel-device needs the profile and an expert cache "
@@ -8107,7 +8143,34 @@ int main(int argc, char** argv) {
         }
         int64_t lo = 0, hi = 0;
         xcache.layer_slot_range(0, lo, hi);
-        const int64_t q0 = hi - lo, q1 = g.n_expert - q0;
+        const int64_t q0 = hi - lo;
+        int64_t q1 = g.n_expert - q0;
+        if (ep_cpu_env && q1 > 0) {
+            // STRATA_EP_CPU=1: when card 1 cannot take the other q1 beside its reserve (the plain EP check below), it
+            // takes what fits beside that same reserve, which also covers its verifier's buffers as on the plain path;
+            // the coldest rest of each layer is on neither card and the host's CPU pool computes it inside the window
+            size_t fb = 0, tb = 0;
+            {
+                const strata::core::OnDevice on(o.ep_device);
+                if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); fb = 0; }
+            }
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            uint64_t per_slot = 0;   // one slot in every layer (the peer's cache gives each layer the same count)
+            for (int64_t l = 0; l < g.n_layers; ++l) per_slot += (lay.blob_bytes(l) + 255) / 256 * 256;
+            const uint64_t reserve = (uint64_t) ep_peer_reserve_mib << 20;
+            const auto fit = [&](uint64_t keep) {
+                return per_slot > 0 && (uint64_t) fb > keep ? (int64_t) (((uint64_t) fb - keep) / per_slot) : 0;
+            };
+            if (fit(reserve) < q1) {   // the pair cannot hold every expert: the tail
+                ep_cpu = true;
+                q1 = fit(reserve);
+            }
+            if (ep_cpu && q1 <= 0) {
+                std::fprintf(stderr, "strata generate: STRATA_EP_CPU: card %d has no room for experts (%.2f GiB free)\n",
+                             o.ep_device, fb / 1073741824.0);
+                return 1;
+            }
+        }
         if (q1 <= 0) {
             std::fprintf(stderr, "strata generate: --expert-parallel-device: this card holds every expert (%lld per "
                                  "layer): it runs alone\n", (long long) q0);
@@ -8131,6 +8194,7 @@ int main(int argc, char** argv) {
                     int card = ((i & 1) != 0) != pair_odd ? 1 : 0;
                     if (card == 0 && n0 >= q0) card = 1;
                     if (card == 1 && n1 >= q1) card = 0;
+                    if (card == 0 && n0 >= q0) break;   // both full (STRATA_EP_CPU only): the rest is on neither card
                     if (card == 0) { set0.push_back({(int32_t) l, r[i]}); ++n0; }
                     else { ep_set1.push_back({(int32_t) l, r[i]}); ++n1; }
                 }
@@ -8139,6 +8203,11 @@ int main(int argc, char** argv) {
             // found nothing to keep, and the prompt (card 0 alone) read card 1's experts from the files every chunk
             if (profile_all.empty()) profile_all = profile;
             profile = set0;
+            if (ep_cpu)
+                std::fprintf(stderr, "strata generate: expert parallel (STRATA_EP_CPU): per layer card 0 %lld, card %d "
+                                     "%lld, CPU %lld experts\n", (long long) q0, o.ep_device, (long long) q1,
+                             (long long) (g.n_expert - q0 - q1));
+            else
             std::fprintf(stderr, "strata generate: expert parallel: this card holds %lld experts per layer, card %d the "
                                  "other %lld (each layer's traffic dealt evenly between them)\n",
                          (long long) q0, o.ep_device, (long long) q1);
@@ -9338,6 +9407,7 @@ int main(int argc, char** argv) {
     // layer's entries on both cards from the pair), and the peer's slot offsets
     strata::core::VerifyEp ep_cfg;
     std::vector<int32_t> ep_h_res1;
+    std::vector<int32_t> ep_h_res01;   // STRATA_EP_CPU: >= 0 when either card holds the expert (static)
     if (ep_cache != nullptr) {
         if (host_res.empty()) {
             std::fprintf(stderr, "strata generate: --expert-parallel-device needs the device-planned verify window "
@@ -9349,9 +9419,31 @@ int main(int argc, char** argv) {
             for (int64_t e = 0; e < g.n_expert; ++e)
                 ep_h_res1[(size_t) (l * g.n_expert + e)] = ep_cache->slot_of(l, e);
         const size_t nb = host_res.size() * sizeof(int32_t);
+        // STRATA_EP_CPU: each card's "other" table marks an expert on neither card as the other's (>= 0), so each
+        // card's plan leaves it out without a plan error and card 1 sends only its own rows; the CPU computes it
+        std::vector<int32_t> other0 = ep_h_res1, other1(host_res.begin(), host_res.end());
+        int32_t* res01_on0 = nullptr, * res0n_on0 = nullptr;
+        if (ep_cpu) {
+            ep_h_res01.assign(host_res.size(), strata::core::kNotResident);
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] >= 0 || ep_h_res1[i] >= 0) ep_h_res01[i] = 0;
+                else other0[i] = other1[i] = 0;
+            if (cudaMalloc((void**) &res01_on0, nb) != cudaSuccess ||
+                cudaMemcpy(res01_on0, ep_h_res01.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: STRATA_EP_CPU: the merged residency table failed\n");
+                return 1;
+            }
+            // card 0's table with the CPU's experts as resident, on card 0: card 0 copies the peer's rows only for
+            // the peer's own experts (like res0_on1, a snapshot: EP's placement is static)
+            if (cudaMalloc((void**) &res0n_on0, nb) != cudaSuccess ||
+                cudaMemcpy(res0n_on0, other1.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: STRATA_EP_CPU: card 0's copy table failed\n");
+                return 1;
+            }
+        }
         int32_t* res1_on0 = nullptr;
         if (cudaMalloc((void**) &res1_on0, nb) != cudaSuccess ||
-            cudaMemcpy(res1_on0, ep_h_res1.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaMemcpy(res1_on0, other0.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: --expert-parallel-device: the peer's residency table failed\n");
             return 1;
         }
@@ -9361,7 +9453,7 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(o.ep_device);
             if (cudaMalloc((void**) &res1, nb) != cudaSuccess || cudaMalloc((void**) &res0_on1, nb) != cudaSuccess ||
                 cudaMemcpy(res1, ep_h_res1.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess ||
-                cudaMemcpy(res0_on1, host_res.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                cudaMemcpy(res0_on1, other1.data(), nb, cudaMemcpyHostToDevice) != cudaSuccess) {
                 std::fprintf(stderr, "strata generate: --expert-parallel-device: the residency tables on card %d failed\n",
                              o.ep_device);
                 return 1;
@@ -9383,6 +9475,12 @@ int main(int argc, char** argv) {
         ep_cfg.cache_base1 = ep_cache->device_slot(0);
         ep_cfg.slot_off1 = off1;
         ep_cfg.blob1 = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        if (ep_cpu) {
+            ep_cfg.h_res01 = ep_h_res01.data();
+            ep_cfg.res01_on0 = res01_on0;
+            ep_cfg.res0n_on0 = res0n_on0;
+            ep_cfg.cpu_scope = &drive_ep_cpu_scope;
+        }
     }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
         (hit_fn == nullptr || thits.on()) && !native_pack && !multi_gpu) {   // a split's token graph cannot span stages
