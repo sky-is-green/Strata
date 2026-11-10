@@ -12,10 +12,26 @@
 
 namespace strata::kernels::cpu {
 
+// The entry points run the scalar rows by default. STRATA_PTQ1_AVX2=1 (opt-in) selects the AVX2 rows (ptq1_0_avx2.cpp,
+// bit-identical results) where cpu_avx2_ok().
 void ptq1_0_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                     int nt, float* const* ff, int r0, int r1);
 void ptq1_0_down_rows(const uint8_t* blob, size_t d_row, int n, const void* const* hq,
                       int nt, float* const* out, int r0, int r1);
+
+// The two implementations by name (parity test and benchmark); _avx2 exists on x86-64 builds only.
+void ptq1_0_gu_rows_scalar(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                           int nt, float* const* ff, int r0, int r1);
+void ptq1_0_down_rows_scalar(const uint8_t* blob, size_t d_row, int n, const void* const* hq,
+                             int nt, float* const* out, int r0, int r1);
+#if defined(__x86_64__) || defined(_M_X64)
+void ptq1_0_gu_rows_avx2(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                         int nt, float* const* ff, int r0, int r1);
+void ptq1_0_down_rows_avx2(const uint8_t* blob, size_t d_row, int n, const void* const* hq,
+                           int nt, float* const* out, int r0, int r1);
+#endif
+// True when the entry points above run the AVX2 rows.
+bool ptq1_0_avx2_active();
 
 // Decode one 28-byte block to 128 trits in {-1, 0, +1}; exposed for parity tests.
 void ptq1_0_decode128(const uint8_t* block, int8_t* out128);

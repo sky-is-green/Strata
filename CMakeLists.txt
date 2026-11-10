@@ -2124,7 +2124,8 @@ if(STRATA_NATIVE_EXPERTS)
     target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
                                              src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
                                              src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
+                                             src/kernels/cpu/ptq1_0_avx2.cpp)
   else()
     # the trellis dispatcher alone (the DeepSeek engine's CPU lane and Gyro): tq_cpu.cpp runs its scalar rows when the x86 units are
     # not compiled (the Metal build does the same)
@@ -2137,6 +2138,7 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/kernels/cpu/ptq1_0_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     # the router lookahead's AVX1 dot (older CPUs; called behind cpu_avx1_ok): no FMA, no 256-bit integer ops
@@ -2152,6 +2154,8 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    # Scion PTQ1_0 rows: no FMA contraction, so the float line matches the scalar rows bit for bit (ptq1_0_avx2_parity)
+    set_source_files_properties(src/kernels/cpu/ptq1_0_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c;-ffp-contract=off")
     # the trellis kernels: AVX2 + FMA, and AVX-512 F/BW/VL/VBMI/VNNI (exactly what cpu_avx512_ok() checks)
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
@@ -2715,6 +2719,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(ptq1_0_parity src/kernels/ptq1_0_parity.cpp)
     target_include_directories(ptq1_0_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(ptq1_0_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # Scion experts: AVX2 PTQ1_0 rows against the scalar rows, bit for bit, plus a throughput check (no model needed)
+    add_executable(ptq1_0_avx2_parity src/kernels/ptq1_0_avx2_parity.cpp)
+    set_source_files_properties(src/kernels/ptq1_0_avx2_parity.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")   # the membw mode streams with AVX2 loads; guarded by cpu_avx2_ok() at run time
+    target_include_directories(ptq1_0_avx2_parity PRIVATE third_party/ggml)
+    target_link_libraries(ptq1_0_avx2_parity PRIVATE strata_kernels_cpu strata_artifact)
     # Scion corrections: every lora_a/b pair of the artifact against the bit-exact host reduction
     add_executable(lora_corr_parity src/kernels/lora_corr_parity.cpp)
     target_include_directories(lora_corr_parity PRIVATE ${_strata_gpu_include_directories})
