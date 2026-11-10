@@ -327,7 +327,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             for (const auto& tensor : gguf.tensors()) {
                 int block_elements = 0, block_bytes = 0;
                 uint64_t elements = 1;
-                if (tensor.shape.empty() || !strata::block_geometry(tensor.type, block_elements, block_bytes) ||
+                if (tensor.is_q4x160_table()) {   // Scion's PLE table shares type id 146 with TQK7
+                    block_elements = 160;
+                    block_bytes = 82;
+                } else if (tensor.shape.empty() || !strata::block_geometry(tensor.type, block_elements, block_bytes) ||
                     tensor.shape[0] % (uint64_t) block_elements != 0) {
                     err = "native dense: invalid block geometry " + tensor.name; return false;
                 }

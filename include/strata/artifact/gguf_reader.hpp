@@ -286,7 +286,10 @@ struct TensorInfo {
         for (auto d : shape) n *= d;
         return n;
     }
-    const char* type_name() const { return ggml_type_name(type); }
+    // Scion's Q4X160 PLE table reuses ggml type 146 (TQK7 upstream). TQK7 is a 128-wide container, so a [160, rows]
+    // tensor of type 146 can only be the Q4X160 table.
+    bool is_q4x160_table() const { return type == 146 && shape.size() == 2 && shape[0] == 160; }
+    const char* type_name() const { return is_q4x160_table() ? "Q4X160" : ggml_type_name(type); }
 };
 
 // A bounds-checked cursor over the mmapped header region. Every read is checked, so a truncated or
@@ -540,6 +543,7 @@ private:
 // blocks, or the count overflows.
 inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
     int be = 0, bb = 0;
+    if (t.is_q4x160_table()) return t.shape[1] * 82;
     if (t.shape.empty() || !block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
     uint64_t elements = 1;
     for (uint64_t d : t.shape) {

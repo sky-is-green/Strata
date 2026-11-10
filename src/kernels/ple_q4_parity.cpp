@@ -20,7 +20,8 @@ int main(int argc, char** argv) {
     }
     strata::GgufFile gguf(argv[1]);
     const auto* tensor = gguf.find("per_layer_token_embd.weight");
-    if (!tensor || tensor->type != 2 || tensor->shape.size() != 2 || tensor->shape[0] != 160) {
+    const bool q4x160 = tensor && tensor->is_q4x160_table();
+    if (!tensor || (tensor->type != 2 && !q4x160) || tensor->shape.size() != 2 || tensor->shape[0] != 160) {
         std::fprintf(stderr, "expected Q4_0 PLE [160, N]\n");
         return 2;
     }
@@ -31,6 +32,26 @@ int main(int argc, char** argv) {
     if (!table.open(argv[1], err, options)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 1;
+    }
+    if (q4x160) {   // no ggml reference here: print the engine's rows for an independent check (exact hex floats)
+        const uint32_t ps[] = {0, 1, 12345, 20000003, 160000768, (uint32_t) (table.rows() - 1)};
+        for (uint32_t row : ps) {
+            float got[160];
+            table.read_row(row, got);
+            std::printf("R %u", row);
+            for (int i = 0; i < 160; ++i) std::printf(" %a", got[i]);
+            std::printf("\n");
+        }
+        uint32_t brows[16];
+        for (int i = 0; i < 16; ++i) brows[i] = ps[i % 6];
+        float b[16 * 160];
+        if (!table.issue(brows) || !table.collect(b, err)) { std::fprintf(stderr, "collect: %s\n", err.c_str()); return 1; }
+        for (int h = 0; h < 16; ++h) {
+            std::printf("B %u", brows[h]);
+            for (int i = 0; i < 160; ++i) std::printf(" %a", b[h * 160 + i]);
+            std::printf("\n");
+        }
+        return 0;
     }
     const auto* traits = ggml_get_type_traits(GGML_TYPE_Q4_0);
     const uint8_t* bytes = gguf.tensor_data(*tensor);

@@ -181,6 +181,21 @@ void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_ro
 void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
 void dequant_nvfp4(const uint8_t* row, float scale, float* out160) { nvfp4_row_dequant(row, scale, out160); }
+// Scion's Q4X160 table row: one fp16 scale, then 80 bytes of 4-bit codes into a fixed 16-level codebook; byte j holds
+// element j in the low nibble and element j + 80 in the high nibble (ggml-common.h / dequantize_row_q4x160 of the fork).
+void dequant_q4x160(const uint8_t* row, float, float* out160) {
+    static const float kLevels[16] = {
+        -0.830319583f, -0.56551832f, -0.395098478f, -0.278073937f, -0.207071558f, -0.134492248f, -0.105560891f, -0.0803469718f,
+        8.09813901e-06f, 0.0911125243f, 0.129564166f, 0.206828877f, 0.278073341f, 0.395026445f, 0.564443111f, 0.827598035f};
+    uint16_t h;
+    std::memcpy(&h, row, sizeof h);
+    const float d = strata::fp16_to_fp32(h);
+    for (int j = 0; j < PLE_HEAD_DIM / 2; ++j) {
+        const uint8_t b = row[2 + j];
+        out160[j] = kLevels[b & 15] * d;
+        out160[j + PLE_HEAD_DIM / 2] = kLevels[b >> 4] * d;
+    }
+}
 
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
@@ -197,6 +212,8 @@ const PleFormatInfo kPleFormats[] = {
     // NVFP4 x16 (NVIDIA's Qwen3.8-Flash-Next-FP4-Local, tools/nvfp4_local_pack.py ple): 90-byte rows, I8 bytes marked
     // strata.ple.format = nvfp4x16 with strata.ple.scale. The tensor is [90, rows]: ne0 is the row's byte count.
     {PleFormat::NVFP4, "NVFP4", "I8", PLE_ROW_BYTES_NVFP4, true, dequant_nvfp4},
+    // Scion-FlashNext-176B's default file: GGUF type 146, told apart from TQK7 by its shape (TensorInfo::is_q4x160_table)
+    {PleFormat::Q4X160, "Q4X160", "Q4X160", PLE_ROW_BYTES_Q4X160, false, dequant_q4x160},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace
