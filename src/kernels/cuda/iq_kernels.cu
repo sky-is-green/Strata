@@ -3563,6 +3563,89 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     }
 }
 
+// A4 (2026-11-10): PTQ1_0 -> FP16 for the prompt path.  The generic kernels above run ONE warp per 256-value superblock, 32 threads a
+// CUDA block, with an index/branch computation per element and eight scalar 2-byte stores per thread (61 us for the gate/up of one
+// expert, 31 us for the down; writing the FP16 alone would take about 15 and 7 us at 504 GB/s).  Here a CUDA block holds four
+// superblocks and a thread decodes its eight values from ONE source run (they share the trit index n and consecutive source bytes)
+// and writes them with one 16-byte store.  Same arithmetic as dq_ptq1_0: v = uint8(byte * 3^n), value = d * (float)((v * 3 >> 8) - 1),
+// round-to-nearest to half.  The generic kernels stay the default; STRATA_PTQ1_DEQ_NEW=1 (opt-in) selects these.
+__device__ __forceinline__ uint4 ptq1_decode8_half(const block_ptq1_0& x, int part) {
+    const float d = __half2float(x.d);
+    uint32_t w[4];
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+        float f[2];
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const int jj = j + k;
+            uint8_t byte;
+            int n;
+            if (part < 10)      { byte = x.qs[((part & 1) << 3) + jj]; n = part >> 1; }       // e < 80: qs[e % 16] * 3^(e / 16)
+            else if (part < 15) { byte = x.qs[16 + jj];                n = part - 10; }       // e < 120: qs[16 + (e-80) % 8] * 3^((e-80)/8)
+            else                { byte = x.qh[jj & 1];                 n = jj >> 1; }         // e >= 120: qh[(e-120) % 2] * 3^((e-120)/2)
+            const uint8_t pw = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
+            const uint8_t v = (uint8_t) (byte * pw);
+            f[k] = d * (float) (((int) v * 3 >> 8) - 1);
+        }
+        const __half2 h = __floats2half2_rn(f[0], f[1]);
+        w[j >> 1] = *reinterpret_cast<const uint32_t*>(&h);
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+__global__ void dequant_flat_ptq1_kernel(const block_ptq1_0* __restrict__ x, __half* __restrict__ y, int64_t n_super) {
+    const int64_t i = (int64_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (i >= n_super) return;
+    const int lane = threadIdx.x & 31, b = lane >> 4, part = lane & 15;
+    *reinterpret_cast<uint4*>(y + i * 256 + b * 128 + part * 8) = ptq1_decode8_half(x[i * 2 + b], part);
+}
+__global__ void dequant_gu_ptq1_kernel(const block_ptq1_0* __restrict__ gate, const block_ptq1_0* __restrict__ up, int64_t per_row,
+                                       int64_t n_super, __half* __restrict__ y) {
+    const int64_t i = (int64_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (i >= n_super) return;
+    const int parity = blockIdx.y;
+    const int lane = threadIdx.x & 31, b = lane >> 4, part = lane & 15;
+    const int64_t r = i / per_row, c = i % per_row;
+    const block_ptq1_0* x = parity ? up : gate;
+    *reinterpret_cast<uint4*>(y + ((2 * r + parity) * per_row + c) * 256 + b * 128 + part * 8) = ptq1_decode8_half(x[i * 2 + b], part);
+}
+inline bool ptq1_deq_new() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PTQ1_DEQ_NEW"); return e != nullptr && *e != 0 && !(e[0] == '0' && e[1] == 0); }();
+    return on;
+}
+// STRATA_PTQ1_DEQ_VERIFY=1 (measurement only, needs STRATA_PTQ1_DEQ_NEW=1): after every A4 launch the generic kernel writes the same output into a scratch buffer and
+// a compare kernel counts the differing 32-bit words on the device; counts go to stderr (every 2000 calls and at the first mismatch).
+// It synchronizes the stream on every call, so it is slow.
+inline bool ptq1_deq_verify() {
+    static const bool on = std::getenv("STRATA_PTQ1_DEQ_VERIFY") != nullptr;
+    return on;
+}
+__global__ void ptq1_cmp_kernel(const uint32_t* __restrict__ a, const uint32_t* __restrict__ b, int64_t n32, unsigned long long* bad) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n32 && a[i] != b[i]) atomicAdd(bad, 1ull);
+}
+struct Ptq1DeqVerify {
+    void* scratch = nullptr; size_t scratch_bytes = 0; unsigned long long* d_bad = nullptr;
+    long calls = 0, bad_calls = 0; unsigned long long words = 0, bad_words = 0;
+    // compare `dst` (bytes long) with the scratch the caller filled with the generic kernel's output
+    void* ensure(size_t bytes) {
+        if (d_bad == nullptr) cudaMalloc((void**) &d_bad, sizeof(unsigned long long));
+        if (bytes > scratch_bytes) { if (scratch) cudaFree(scratch); cudaMalloc(&scratch, bytes); scratch_bytes = bytes; }
+        cudaMemsetAsync(d_bad, 0, sizeof(unsigned long long), 0);
+        return scratch;
+    }
+    void finish(const void* dst, size_t bytes, cudaStream_t st, const char* what) {
+        const int64_t n32 = (int64_t) (bytes / 4);
+        ptq1_cmp_kernel<<<(unsigned) ((n32 + 255) / 256), 256, 0, st>>>((const uint32_t*) dst, (const uint32_t*) scratch, n32, d_bad);
+        unsigned long long bad = 0;
+        cudaStreamSynchronize(st);
+        cudaMemcpy(&bad, d_bad, sizeof(bad), cudaMemcpyDeviceToHost);
+        ++calls; words += (unsigned long long) n32; bad_words += bad;
+        if (bad != 0) { ++bad_calls; if (bad_calls <= 5) std::fprintf(stderr, "strata ptq1 DEQ VERIFY MISMATCH %s: %llu of %lld words differ\n", what, bad, (long long) n32); }
+        if (calls % 2000 == 0) std::fprintf(stderr, "strata ptq1 DEQ VERIFY: %ld calls, %llu words compared, %llu differing words (%ld calls)\n", calls, words, bad_words, bad_calls);
+    }
+};
+inline Ptq1DeqVerify& ptq1_verifier() { static Ptq1DeqVerify v; return v; }
+
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
@@ -5578,6 +5661,17 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    if (t == 143 && scale == nullptr && ptq1_deq_new()) {   // A4
+        const int64_t n_super = n / 256;
+        dequant_flat_ptq1_kernel<<<(unsigned) ((n_super + 3) / 4), 128, 0, (cudaStream_t) stream>>>((const block_ptq1_0*) src, (__half*) dst, n_super);
+        check("iq_dequant_f16");
+        if (ptq1_deq_verify()) {
+            auto& vf = ptq1_verifier(); const size_t bytes = (size_t) n * 2;
+            dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) vf.ensure(bytes), nullptr);
+            vf.finish(dst, bytes, (cudaStream_t) stream, "flat");
+        }
+        return;
+    }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);
     check("iq_dequant_f16");
 }
@@ -5612,6 +5706,18 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     // checked like the other entry points: an unknown type used to leave `dst` unwritten, a wrong prompt and no error
     if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_gu_f16: type %d / %lld\n", t, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
+    if (t == 143 && tail == nullptr && ptq1_deq_new()) {   // A4
+        const int64_t n_super = n_ff * per_row;
+        dequant_gu_ptq1_kernel<<<dim3((unsigned) ((n_super + 3) / 4), 2), 128, 0, (cudaStream_t) stream>>>(
+            (const block_ptq1_0*) gate, (const block_ptq1_0*) up, per_row, n_super, (__half*) dst);
+        check("iq_dequant_gu_f16");
+        if (ptq1_deq_verify()) {
+            auto& vf = ptq1_verifier(); const size_t bytes = (size_t) n_ff * 2 * (size_t) n_embd * 2;
+            dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row, (__half*) vf.ensure(bytes), nullptr);
+            vf.finish(dst, bytes, (cudaStream_t) stream, "gate/up");
+        }
+        return;
+    }
     dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
                                                                                            (__half*) dst, tail);
     check("iq_dequant_gu_f16");
