@@ -4,7 +4,8 @@
 //      Each expert is resident on card 0, on card 1, on both, or on neither.  Owner: card 0 when it holds the
 //      expert, else card 1.  For each role the plan must be resident_plan's layout over exactly the entries that
 //      card owns: distinct owned experts in routing order, each with its entries ascending, ptr[g] = the slot on
-//      that card, counts[1] = its entries.  An expert on neither card leaves an empty plan and sets *plan_err.
+//      that card, counts[1] = its entries.  An expert on neither card leaves an empty plan and sets *plan_err,
+//      unless each card's other table marks it as the other card's (STRATA_EP_CPU: then neither card plans it).
 //      With every expert on card 0, role 1 is resident_plan's all-resident plan word for word.
 //
 //   B. the mapped row/flag exchange round trip (ep_push, ep_wait, ep_copy_uncached, ep_send_rows,
@@ -242,6 +243,18 @@ int main() {
                         if (r < 45) r0[(size_t) e] = (int) (rng() % 9000);
                         else if (r < 90) r1[(size_t) e] = (int) (rng() % 9000);
                         else { r0[(size_t) e] = (int) (rng() % 9000); r1[(size_t) e] = (int) (rng() % 9000); }
+                    }
+                    if (rep == 4) {
+                        // STRATA_EP_CPU: ids[0] on neither card, marked as the OTHER card's in each card's "other"
+                        // table (what generate.cpp uploads): no plan error, neither card plans it
+                        const size_t e0 = (size_t) ids[0];
+                        r0[e0] = r1[e0] = -1;
+                        std::vector<int32_t> o0 = r0, o1 = r1;
+                        o1[e0] = 0;   // card 0's other table (res1_on0)
+                        o0[e0] = 0;   // card 1's other table (res0_on1)
+                        fails += check_plan(1, ids, r0, o1, d_r00, d_r10, d_ids0, d_plan0, d_err0, 0, false, cases);
+                        fails += check_plan(2, ids, o0, r1, d_r01, d_r11, d_ids1, d_plan1, d_err1, 1, false, cases);
+                        continue;
                     }
                     const bool make_missing = rep == 5;
                     fails += check_plan(1, ids, r0, r1, d_r00, d_r10, d_ids0, d_plan0, d_err0, 0, make_missing, cases);
